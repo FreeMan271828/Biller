@@ -63,17 +63,24 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // .env 只在存在时加载，不覆盖已有的环境变量。
-    let _ = dotenvy::dotenv();
+    // 设置页把连接串写进 .env；这里让它覆盖 shell 里可能存在的同名变量，
+    // 这样「应用里保存的设置」才是最终生效的那个（显式的 --database-url 仍然最优先）。
+    let _ = dotenvy::from_path_override(std::path::Path::new(".env"));
 
     let cli = Cli::parse();
     let url = db::resolve_url(cli.database_url)?;
     let command = cli.command.unwrap_or(Command::Ui);
 
     if matches!(command, Command::Init) {
-        db::ensure_database(&url).await?;
+        let outcome = db::ensure_database(&url).await?;
         let pool = db::connect(&url).await?;
         db::init_schema(&pool).await?;
+
+        let database = db::database_name(&url)?;
+        match outcome {
+            db::DatabaseOutcome::Created => println!("已创建数据库 {database}"),
+            db::DatabaseOutcome::Existed => println!("数据库 {database} 已存在"),
+        }
         println!("表结构已就绪：{}", db::redact(&url));
         return Ok(());
     }
@@ -87,7 +94,7 @@ async fn main() -> Result<()> {
         Command::Init => unreachable!("init 已在上面提前返回"),
         Command::Ui => {
             let month = time::first_day_of_month(Utc::now().date_naive());
-            interactive::run(Services::new(pool), month).await
+            interactive::run(Services::new(pool), month, url).await
         }
         Command::Book { cmd } => book_tui::run(&BookService::new(pool), cmd).await,
         Command::Category { cmd } => category_tui::run(&CategoryService::new(pool), cmd).await,

@@ -10,6 +10,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table, Tabs, Wrap};
 
+use crate::common::db;
 use crate::common::{money, time};
 use crate::tui::app::{App, Form, Modal, Page};
 
@@ -72,7 +73,83 @@ fn render_body(frame: &mut Frame, area: Rect, app: &App) {
         Page::Categories => render_categories(frame, area, app),
         Page::Months => render_months(frame, area, app),
         Page::Years => render_years(frame, area, app),
+        Page::Settings => render_settings(frame, area, app),
     }
+}
+
+fn render_settings(frame: &mut Frame, area: Rect, app: &App) {
+    let rows = Layout::vertical([Constraint::Length(10), Constraint::Min(5)]).split(area);
+
+    let settings = &app.connection;
+    let connection_lines = vec![
+        Line::from(""),
+        kv_text("主机", &settings.host),
+        kv_text("端口", &settings.port.to_string()),
+        kv_text("用户名", &settings.user),
+        kv_text("密码", &settings.masked_password()),
+        kv_text("数据库", &settings.database),
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("  实际连接串：{}", db::redact(&app.connection_url)),
+            Style::default().fg(MUTED),
+        )),
+    ];
+
+    frame.render_widget(
+        Paragraph::new(connection_lines).block(Block::bordered().title(" 数据库连接设置 ")),
+        rows[0],
+    );
+
+    let tips = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(
+                "  e",
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("   编辑主机 / 端口 / 用户名 / 密码 / 数据库，保存后立即尝试切换"),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "  i",
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("   初始化：建库（不存在时创建）+ 幂等建表"),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "  t",
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("   数据迁移：把当前库的全部数据整库搬到目标库"),
+        ]),
+        Line::from(Span::styled(
+            "      源库 = 当前连接；目标库会被先清空再写入，成功后自动切换过去",
+            Style::default().fg(MUTED),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  设置保存在当前目录的 .env；启动时它优先于 shell 里的同名环境变量",
+            Style::default().fg(MUTED),
+        )),
+        Line::from(Span::styled(
+            "  密码以明文写入 .env（该文件已在 .gitignore 里），请勿提交",
+            Style::default().fg(MUTED),
+        )),
+    ];
+
+    frame.render_widget(
+        Paragraph::new(tips).block(Block::bordered().title(" 操作 ")),
+        rows[1],
+    );
+}
+
+/// 左对齐的「标签 + 值」行（设置页只用文本，不做金额格式化）。
+fn kv_text(label: &str, value: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("  {label:<8}"), Style::default().fg(Color::Gray)),
+        Span::styled(value.to_string(), Style::default().fg(Color::White)),
+    ])
 }
 
 fn render_overview(frame: &mut Frame, area: Rect, app: &App) {
@@ -459,8 +536,11 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
     let help = match &app.modal {
         Some(Modal::Picker { .. }) => "↑↓ 选择    Enter 确定    Esc 取消",
         Some(_) => "Tab/↑↓ 切字段    ←/→ 或空格 切选项    Enter 展开选项/提交    Esc 关闭",
+        None if app.page == Page::Settings => {
+            "Tab/←→/1-7 切页    e 编辑连接并应用    i 初始化    t 数据迁移    r 刷新    q 退出"
+        }
         None => {
-            "Tab/←→/1-6 切页    ↑↓ 选择    [ ] 换月/换年    a 新增    e 编辑    d 删除    r 刷新    m 本月    q 退出"
+            "Tab/←→/1-7 切页    ↑↓ 选择    [ ] 换月/换年    a 新增    e 编辑    d 删除    r 刷新    m 本月    q 退出"
         }
     };
     frame.render_widget(
@@ -724,7 +804,10 @@ mod tests {
 
     fn sample_app() -> App {
         let month = NaiveDate::from_ymd_opt(2026, 10, 1).unwrap();
-        let mut app = App::new(month);
+        let mut app = App::new(
+            month,
+            "postgres://postgres:postgres@127.0.0.1:5432/biller",
+        );
 
         app.books = vec![
             BillBook {
@@ -914,6 +997,25 @@ mod tests {
         assert!(screen.contains("按账本 · 收入"), "{screen}");
         assert!(screen.contains("按账本 · 支出"), "{screen}");
         assert!(screen.contains("逐月走势"), "{screen}");
+    }
+
+    #[test]
+    fn settings_page_renders_connection_and_hides_password() {
+        let mut app = sample_app();
+        app.page = Page::Settings;
+        let screen = render_screen(&app, 110, 28);
+
+        assert!(screen.contains("数据库连接设置"), "{screen}");
+        assert!(screen.contains("127.0.0.1"), "{screen}");
+        assert!(screen.contains("5432"), "{screen}");
+        assert!(screen.contains("biller"), "{screen}");
+        assert!(screen.contains("初始化"), "{screen}");
+        assert!(screen.contains("数据迁移"), "{screen}");
+        assert!(screen.contains("***"), "密码应打码显示：\n{screen}");
+        assert!(
+            !screen.contains(":postgres@"),
+            "不应把明文密码拼进连接串：\n{screen}"
+        );
     }
 
     #[test]

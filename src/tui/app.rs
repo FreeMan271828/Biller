@@ -14,6 +14,7 @@ use crate::bill::service::{BillQuery, NewBill};
 use crate::bill_book::model::BillBook;
 use crate::category::model::Category;
 use crate::category::service::{CategoryNode, descendants_of, subtree_of};
+use crate::common::db::ConnectionSettings;
 use crate::common::money;
 use crate::common::types::{AmountType, CategoryId};
 use crate::month::service::{MonthReport, YearReport};
@@ -29,16 +30,18 @@ pub enum Page {
     Categories,
     Months,
     Years,
+    Settings,
 }
 
 impl Page {
-    pub const ALL: [Page; 6] = [
+    pub const ALL: [Page; 7] = [
         Page::Overview,
         Page::Bills,
         Page::Books,
         Page::Categories,
         Page::Months,
         Page::Years,
+        Page::Settings,
     ];
 
     pub fn title(self) -> &'static str {
@@ -49,6 +52,7 @@ impl Page {
             Page::Categories => "分类",
             Page::Months => "月报",
             Page::Years => "年报",
+            Page::Settings => "设置",
         }
     }
 
@@ -219,6 +223,10 @@ pub enum FormKind {
     NewCategory,
     /// 设置某月起始金额（概览页）。
     SetStartBalance,
+    /// 数据库连接设置（设置页）。
+    Connection,
+    /// 数据迁移的目标库（设置页）。
+    MigrateData,
 }
 
 /// 编辑目标：提交表单时据此决定调用哪个 service 的更新方法。
@@ -376,6 +384,37 @@ impl Form {
         }
     }
 
+    /// 数据库连接设置（设置页按 `e`）。
+    pub fn connection(settings: &ConnectionSettings) -> Self {
+        Self {
+            kind: FormKind::Connection,
+            title: "数据库连接",
+            fields: vec![
+                Field::text("主机", settings.host.clone(), "IP 或主机名"),
+                Field::text("端口", settings.port.to_string(), "默认 5432"),
+                Field::text("用户名", settings.user.clone(), "PostgreSQL 用户"),
+                Field::text("密码", settings.password.clone(), "会以明文写进 .env"),
+                Field::text("数据库", settings.database.clone(), "不存在时会自动创建"),
+            ],
+            focus: 0,
+            target: None,
+        }
+    }
+
+    /// 数据迁移的目标库（设置页按 `t`）。源库固定是「当前连接」。
+    pub fn migrate_target(settings: &ConnectionSettings) -> Self {
+        let mut form = Self::connection(settings);
+        form.kind = FormKind::MigrateData;
+        form.title = "数据迁移（源库 = 当前连接）";
+
+        // 字段顺序：主机 / 端口 / 用户名 / 密码 / 数据库
+        if let Some(field) = form.fields.get_mut(4) {
+            field.hint = "目标库：会被清空后写入源库的全部数据";
+        }
+
+        form
+    }
+
     pub fn value(&self, label: &str) -> &str {
         self.fields
             .iter()
@@ -482,6 +521,12 @@ pub enum Action {
         id: u64,
         recursive: bool,
     },
+    /// 保存连接设置并尝试立即切换（连接池由外壳重建）。
+    SaveConnection(ConnectionSettings),
+    /// 建库 + 建表（初始化），由外壳执行。
+    InitDatabase,
+    /// 把当前库的全部数据迁移到目标库，由外壳执行。
+    MigrateData(ConnectionSettings),
 }
 
 /// 整个 TUI 的状态。
@@ -490,6 +535,10 @@ pub struct App {
     pub month: NaiveDate,
     /// 年报页查看的年份。
     pub year: i32,
+    /// 当前生效的连接参数（设置页展示与编辑的就是它）。
+    pub connection: ConnectionSettings,
+    /// 当前生效的完整连接串。
+    pub connection_url: String,
     /// 上次记账用过的日期（跨会话记忆）；`None` 表示还没记过。
     /// 新增表单里留空即今天，按空格才把它填进去。
     pub last_entry_date: Option<NaiveDate>,
@@ -509,11 +558,13 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(month: NaiveDate) -> Self {
+    pub fn new(month: NaiveDate, connection_url: &str) -> Self {
         Self {
             page: Page::Overview,
             month,
             year: month.year(),
+            connection: ConnectionSettings::from_url(connection_url),
+            connection_url: connection_url.to_string(),
             last_entry_date: None,
             last_entry_book: None,
             selected: [0; Page::ALL.len()],
@@ -539,7 +590,7 @@ impl App {
             Page::Books => self.books.len(),
             Page::Categories => self.categories.len(),
             Page::Months => self.month_expense_categories().len(),
-            Page::Overview | Page::Years => 0,
+            Page::Overview | Page::Years | Page::Settings => 0,
         }
     }
 
@@ -683,21 +734,25 @@ impl App {
         let form = match self.page {
             Page::Books => Form::new_book(),
             Page::Categories => Form::new_category(self.parent_options(None)),
+            Page::Settings => Form::connection(&self.connection),
             // 概览/账单/月报/年报都认为你要记账
-            Page::Overview | Page::Bills | Page::Months | Page::Years => {
-                Form::new_bill(
-                    self.book_names(),
-                    self.category_names(),
-                    self.last_entry_book.as_deref(),
-                )
-            }
+            Page::Overview | Page::Bills | Page::Months | Page::Years => Form::new_bill(
+                self.book_names(),
+                self.category_names(),
+                self.last_entry_book.as_deref(),
+            ),
         };
         self.modal = Some(Modal::Form(form));
     }
 
+    /// 设置页按 `t`：打开「数据迁移」表单（目标库默认预填当前连接）。
+    fn open_migrate_form(&mut self) {
+        self.modal = Some(Modal::Form(Form::migrate_target(&self.connection)));
+    }
+
     fn open_edit_form(&mut self) {
         let form = match self.page {
-            // 概览页的「可编辑内容」就是本月起始金额
+            // 概览页的「可编辑内容」就是本月起始金额；设置页就是连接参数
             Page::Overview => {
                 let current = self
                     .report
@@ -706,6 +761,7 @@ impl App {
                     .unwrap_or(0);
                 Some(Form::set_start_balance(self.month, current))
             }
+            Page::Settings => Some(Form::connection(&self.connection)),
             Page::Bills => self
                 .bills
                 .get(self.selected_index(Page::Bills))
@@ -799,7 +855,7 @@ impl App {
                         },
                     )
                 }),
-            Page::Overview | Page::Months | Page::Years => None,
+            Page::Overview | Page::Months | Page::Years | Page::Settings => None,
         };
 
         match request {
@@ -836,7 +892,7 @@ impl App {
         }
 
         match key {
-            Key::Char('1'..='6') => {
+            Key::Char('1'..='7') => {
                 if let Key::Char(digit) = key {
                     let index = digit as usize - '1' as usize;
                     if let Some(page) = Page::ALL.get(index) {
@@ -899,6 +955,21 @@ impl App {
                 self.open_edit_form();
                 Action::None
             }
+            Key::Char('i') => {
+                // 设置页：建库 + 建表（初始化）
+                if self.page == Page::Settings {
+                    Action::InitDatabase
+                } else {
+                    Action::None
+                }
+            }
+            Key::Char('t') => {
+                // 设置页：把当前库的数据整库迁移到另一个库
+                if self.page == Page::Settings {
+                    self.open_migrate_form();
+                }
+                Action::None
+            }
             Key::Char('d') | Key::Delete => {
                 self.request_delete();
                 Action::None
@@ -952,8 +1023,21 @@ impl App {
                 match key {
                     Key::Esc => keep_open = false,
                     Key::Enter => {
-                        // 选择框上回车 = 展开候选列表；文本框上回车 = 提交表单
-                        if form.current_is_choice() {
+                        // 连接设置与数据迁移都要重建连接池，交给外壳执行
+                        if matches!(form.kind, FormKind::Connection | FormKind::MigrateData) {
+                            match connection_from_form(&form) {
+                                Ok(settings) => {
+                                    keep_open = false;
+                                    action = if form.kind == FormKind::Connection {
+                                        Action::SaveConnection(settings)
+                                    } else {
+                                        Action::MigrateData(settings)
+                                    };
+                                }
+                                Err(error) => self.set_error(format!("{error}")),
+                            }
+                        } else if form.current_is_choice() {
+                            // 选择框上回车 = 展开候选列表；文本框上回车 = 提交表单
                             let field = form.focus;
                             let label = form.fields[field].label;
                             let options = form.fields[field].options().to_vec();
@@ -1109,6 +1193,8 @@ impl App {
     async fn apply_inner(&mut self, action: Action, services: &Services) -> Result<()> {
         match action {
             Action::None => {}
+            // 这些动作需要重建连接池，由外壳（tui/mod.rs）处理
+            Action::SaveConnection(_) | Action::InitDatabase | Action::MigrateData(_) => {}
             Action::Refresh => self.reload(services).await?,
             Action::ShiftMonth(delta) => {
                 self.month = shift_month(self.month, delta);
@@ -1326,6 +1412,29 @@ fn parent_from_form(form: &Form) -> Option<String> {
     }
 }
 
+/// 从表单构造连接设置，顺带做基本校验。
+fn connection_from_form(form: &Form) -> Result<ConnectionSettings> {
+    let host = require(form.value("主机"), "主机不能为空")?.to_string();
+    let user = require(form.value("用户名"), "用户名不能为空")?.to_string();
+    let database = require(form.value("数据库"), "数据库名不能为空")?.to_string();
+
+    let port_text = form.value("端口");
+    let port: u16 = port_text
+        .parse()
+        .map_err(|_| anyhow!("端口必须是 1-65535 之间的数字：{port_text}"))?;
+    if port == 0 {
+        bail!("端口必须是 1-65535 之间的数字");
+    }
+
+    Ok(ConnectionSettings {
+        host,
+        port,
+        user,
+        password: form.value("密码").to_string(),
+        database,
+    })
+}
+
 fn require<'a>(value: &'a str, message: &str) -> Result<&'a str> {
     if value.is_empty() {
         bail!("{message}");
@@ -1360,9 +1469,12 @@ mod tests {
     use super::*;
     use crate::month::model::BillMonthCollection;
 
+    /// 测试用连接串：各字段值都便于断言。
+    const TEST_CONNECTION_URL: &str = "postgres://postgres:postgres@127.0.0.1:5432/biller";
+
     fn sample_app() -> App {
         let month = NaiveDate::from_ymd_opt(2026, 10, 1).unwrap();
-        let mut app = App::new(month);
+        let mut app = App::new(month, TEST_CONNECTION_URL);
 
         app.books = vec![
             BillBook {
@@ -1423,7 +1535,11 @@ mod tests {
         app.on_key(Key::BackTab);
         assert_eq!(app.page, Page::Overview);
         app.on_key(Key::BackTab);
-        assert_eq!(app.page, Page::Years);
+        assert_eq!(
+            app.page,
+            *Page::ALL.last().expect("至少有一页"),
+            "从第一页往前应回绕到最后一页"
+        );
     }
 
     #[test]
@@ -1431,8 +1547,10 @@ mod tests {
         let mut app = sample_app();
         app.on_key(Key::Char('4'));
         assert_eq!(app.page, Page::Categories);
+        app.on_key(Key::Char('7'));
+        assert_eq!(app.page, Page::Settings, "第 7 个数字键应跳到设置页");
         app.on_key(Key::Char('9'));
-        assert_eq!(app.page, Page::Categories, "越界数字应被忽略");
+        assert_eq!(app.page, Page::Settings, "越界数字应被忽略");
     }
 
     #[test]
@@ -1474,7 +1592,11 @@ mod tests {
         app.on_key(Key::Left);
         assert_eq!(app.page, Page::Overview);
         app.on_key(Key::Left);
-        assert_eq!(app.page, Page::Years, "应回绕到最后一页");
+        assert_eq!(
+            app.page,
+            *Page::ALL.last().expect("至少有一页"),
+            "从第一页往前应回绕到最后一页"
+        );
 
         assert_eq!(app.month, month, "左右箭头不应改变月份");
     }
@@ -1498,7 +1620,7 @@ mod tests {
 
     #[test]
     fn bill_form_falls_back_to_text_on_empty_database() {
-        let mut app = App::new(NaiveDate::from_ymd_opt(2026, 10, 1).unwrap());
+        let mut app = App::new(NaiveDate::from_ymd_opt(2026, 10, 1).unwrap(), TEST_CONNECTION_URL);
         app.page = Page::Bills;
         app.on_key(Key::Char('a'));
 
@@ -2010,5 +2132,111 @@ mod tests {
             Some(Modal::Form(form)) => assert_eq!(form.value("名称"), "="),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn settings_page_edits_connection() {
+        let mut app = sample_app();
+        app.page = Page::Settings;
+
+        app.on_key(Key::Char('e'));
+        match &app.modal {
+            Some(Modal::Form(form)) => {
+                assert_eq!(form.kind, FormKind::Connection);
+                assert_eq!(form.value("主机"), "127.0.0.1");
+                assert_eq!(form.value("端口"), "5432");
+                assert_eq!(form.value("用户名"), "postgres");
+                assert_eq!(form.value("密码"), "postgres");
+                assert_eq!(form.value("数据库"), "biller");
+            }
+            other => panic!("设置页应打开连接表单，实际 {other:?}"),
+        }
+
+        // 焦点在「主机」，Tab 到「端口」后改成 6543
+        app.on_key(Key::Tab);
+        for _ in 0..4 {
+            app.on_key(Key::Backspace);
+        }
+        for character in "6543".chars() {
+            app.on_key(Key::Char(character));
+        }
+
+        let action = app.on_key(Key::Enter);
+        match action {
+            Action::SaveConnection(settings) => {
+                assert_eq!(settings.host, "127.0.0.1");
+                assert_eq!(settings.port, 6543);
+                assert_eq!(settings.database, "biller");
+            }
+            other => panic!("回车应产出 SaveConnection，实际 {other:?}"),
+        }
+        assert!(app.modal.is_none(), "保存后表单应关闭");
+    }
+
+    #[test]
+    fn connection_form_rejects_bad_port() {
+        let mut app = sample_app();
+        app.page = Page::Settings;
+        app.on_key(Key::Char('e'));
+        app.on_key(Key::Tab);
+
+        for _ in 0..4 {
+            app.on_key(Key::Backspace);
+        }
+        for character in "abc".chars() {
+            app.on_key(Key::Char(character));
+        }
+
+        let action = app.on_key(Key::Enter);
+        assert!(matches!(action, Action::None), "非法端口不应产出动作");
+        assert!(app.modal.is_some(), "表单应保持打开");
+        assert!(
+            app.status.as_ref().is_some_and(|status| status.is_error()),
+            "应给出端口非法的提示"
+        );
+    }
+
+    #[test]
+    fn settings_page_i_requests_database_init() {
+        let mut app = sample_app();
+        app.page = Page::Settings;
+        assert!(matches!(app.on_key(Key::Char('i')), Action::InitDatabase));
+
+        // 其它页面按 i 不触发
+        app.page = Page::Bills;
+        assert!(matches!(app.on_key(Key::Char('i')), Action::None));
+    }
+
+    #[test]
+    fn settings_page_opens_migration_form() {
+        let mut app = sample_app();
+        app.page = Page::Settings;
+
+        app.on_key(Key::Char('t'));
+        match &app.modal {
+            Some(Modal::Form(form)) => {
+                assert_eq!(form.kind, FormKind::MigrateData);
+                assert_eq!(form.value("数据库"), "biller", "默认预填当前连接");
+            }
+            other => panic!("设置页应打开迁移表单，实际 {other:?}"),
+        }
+
+        // 焦点在「主机」，Tab 四次到「数据库」，改成 biller_new
+        for _ in 0..4 {
+            app.on_key(Key::Tab);
+        }
+        for _ in 0.."biller".len() {
+            app.on_key(Key::Backspace);
+        }
+        for character in "biller_new".chars() {
+            app.on_key(Key::Char(character));
+        }
+
+        let action = app.on_key(Key::Enter);
+        match action {
+            Action::MigrateData(settings) => assert_eq!(settings.database, "biller_new"),
+            other => panic!("回车应产出 MigrateData，实际 {other:?}"),
+        }
+        assert!(app.modal.is_none(), "提交后表单应关闭");
     }
 }

@@ -42,8 +42,17 @@ pub async fn connect(url: &str) -> Result<PgPool> {
         })
 }
 
+/// 建库结果。调用方决定怎么提示——TUI 里不能直接 `println!`，会污染界面。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatabaseOutcome {
+    Created,
+    Existed,
+}
+
 /// 目标数据库不存在时创建它（借道维护库 `postgres`，`CREATE DATABASE` 不能放在事务里）。
-pub async fn ensure_database(url: &str) -> Result<()> {
+///
+/// 注意：这里**不打印任何东西**，提示交给调用方。
+pub async fn ensure_database(url: &str) -> Result<DatabaseOutcome> {
     let database = database_name(url)?;
     if !is_safe_identifier(&database) {
         bail!("数据库名只允许字母、数字和下划线，且不能以数字开头：{database}");
@@ -63,18 +72,18 @@ pub async fn ensure_database(url: &str) -> Result<()> {
         .await
         .context("查询 pg_database 失败")?;
 
-    if found.is_some() {
-        println!("数据库 {database} 已存在");
+    let outcome = if found.is_some() {
+        DatabaseOutcome::Existed
     } else {
         sqlx::raw_sql(&format!("CREATE DATABASE \"{database}\""))
             .execute(&admin)
             .await
             .with_context(|| format!("创建数据库 {database} 失败"))?;
-        println!("已创建数据库 {database}");
-    }
+        DatabaseOutcome::Created
+    };
 
     admin.close().await;
-    Ok(())
+    Ok(outcome)
 }
 
 /// 执行建表语句（幂等，可重复运行）。
@@ -96,6 +105,165 @@ pub fn redact(url: &str) -> String {
         Some((user, _)) => format!("{}://{}:***@{}", &url[..scheme_end], user, &url[at + 1..]),
         None => url.to_string(),
     }
+}
+
+/// 连接的各个组成部分：设置页编辑的就是它。
+///
+/// 用结构化字段而不是整串连接串，方便逐项校验（端口范围等）与展示（密码打码）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectionSettings {
+    pub host: String,
+    pub port: u16,
+    pub user: String,
+    pub password: String,
+    pub database: String,
+}
+
+impl Default for ConnectionSettings {
+    fn default() -> Self {
+        Self {
+            host: "127.0.0.1".to_string(),
+            port: 5432,
+            user: "postgres".to_string(),
+            password: "postgres".to_string(),
+            database: "biller".to_string(),
+        }
+    }
+}
+
+impl ConnectionSettings {
+    /// 从 `postgres://user:pass@host:port/db` 解析；解析不了的部分回落到默认值。
+    pub fn from_url(url: &str) -> Self {
+        let mut settings = Self::default();
+        let Some(rest) = url.split_once("://").map(|(_, rest)| rest) else {
+            return settings;
+        };
+
+        // 查询参数（sslmode 之类）不参与设置项
+        let rest = rest.split('?').next().unwrap_or(rest);
+        let (authority, path) = match rest.split_once('/') {
+            Some((authority, path)) => (authority, Some(path)),
+            None => (rest, None),
+        };
+
+        let (credentials, host_port) = match authority.rsplit_once('@') {
+            Some((credentials, host_port)) => (Some(credentials), host_port),
+            None => (None, authority),
+        };
+
+        if let Some(credentials) = credentials {
+            let (user, password) = match credentials.split_once(':') {
+                Some((user, password)) => (user, password),
+                None => (credentials, ""),
+            };
+            settings.user = decode_component(user);
+            settings.password = decode_component(password);
+        }
+
+        match host_port.rsplit_once(':') {
+            Some((host, port)) => {
+                settings.host = host.to_string();
+                if let Ok(port) = port.parse() {
+                    settings.port = port;
+                }
+            }
+            None => settings.host = host_port.to_string(),
+        }
+
+        if let Some(path) = path.filter(|path| !path.is_empty()) {
+            settings.database = path.to_string();
+        }
+
+        settings
+    }
+
+    /// 拼回连接串；用户名与密码会按 URL 规则转义（密码里带 `@ : /` 也不会拼坏）。
+    pub fn to_url(&self) -> String {
+        format!(
+            "postgres://{}:{}@{}:{}/{}",
+            encode_component(&self.user),
+            encode_component(&self.password),
+            self.host,
+            self.port,
+            self.database
+        )
+    }
+
+    /// 展示用：密码只显示星号。
+    pub fn masked_password(&self) -> String {
+        if self.password.is_empty() {
+            "(空)".to_string()
+        } else {
+            "*".repeat(self.password.chars().count().min(10))
+        }
+    }
+}
+
+/// 只保留 URL 里的 unreserved 字符，其余按 `%XX` 转义。
+fn encode_component(value: &str) -> String {
+    let mut out = String::new();
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(byte as char);
+            }
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
+}
+
+/// [`encode_component`] 的逆运算。
+fn decode_component(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            // 用字节切片再转字符串，避免在多字节字符中间切开 &str
+            let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).unwrap_or("");
+            if let Ok(byte) = u8::from_str_radix(hex, 16) {
+                out.push(byte);
+                index += 3;
+                continue;
+            }
+        }
+        out.push(bytes[index]);
+        index += 1;
+    }
+
+    String::from_utf8_lossy(&out).to_string()
+}
+
+/// 把连接串写进 `.env`（保留文件里的其它行），返回写入的路径。
+///
+/// 设置页保存时用；主程序启动时会用它覆盖 shell 里可能存在的同名环境变量，
+/// 因此「应用里保存的设置」才是最终生效的那个。
+pub fn save_database_url(url: &str) -> Result<std::path::PathBuf> {
+    use std::path::PathBuf;
+
+    let path = PathBuf::from(".env");
+    let mut lines: Vec<String> = std::fs::read_to_string(&path)
+        .map(|text| text.lines().map(|line| line.to_string()).collect())
+        .unwrap_or_default();
+
+    let entry = format!("DATABASE_URL={url}");
+    let mut replaced = false;
+    for line in lines.iter_mut() {
+        if line.trim_start().starts_with("DATABASE_URL=") {
+            *line = entry.clone();
+            replaced = true;
+        }
+    }
+    if !replaced {
+        lines.push(entry);
+    }
+
+    let mut content = lines.join("\n");
+    content.push('\n');
+    std::fs::write(&path, content).with_context(|| format!("写入 {} 失败", path.display()))?;
+    Ok(path)
 }
 
 /// 从连接串中取出数据库名。
@@ -214,6 +382,59 @@ mod tests {
         assert!(!is_safe_identifier(""));
         assert!(!is_safe_identifier("2biller"));
         assert!(!is_safe_identifier("biller; DROP DATABASE x"));
+    }
+
+    #[test]
+    fn parses_and_rebuilds_urls() {
+        let settings = ConnectionSettings::from_url("postgres://alice:s3cr3t@10.0.0.5:6543/mydb");
+        assert_eq!(settings.host, "10.0.0.5");
+        assert_eq!(settings.port, 6543);
+        assert_eq!(settings.user, "alice");
+        assert_eq!(settings.password, "s3cr3t");
+        assert_eq!(settings.database, "mydb");
+        assert_eq!(
+            settings.to_url(),
+            "postgres://alice:s3cr3t@10.0.0.5:6543/mydb"
+        );
+
+        // 查询参数不影响设置项
+        let with_query = ConnectionSettings::from_url("postgres://u:p@h:5432/db?sslmode=disable");
+        assert_eq!(with_query.database, "db");
+    }
+
+    #[test]
+    fn escapes_special_characters_in_credentials() {
+        let settings = ConnectionSettings {
+            host: "127.0.0.1".to_string(),
+            port: 5432,
+            user: "user@corp".to_string(),
+            password: "p@ss:w/rd".to_string(),
+            database: "biller".to_string(),
+        };
+
+        let url = settings.to_url();
+        assert!(url.contains("%40"), "URL 里的 @ 必须转义：{url}");
+        assert!(url.contains("%2F"), "URL 里的 / 必须转义：{url}");
+        assert_eq!(
+            ConnectionSettings::from_url(&url),
+            settings,
+            "转义后应能原样往返"
+        );
+    }
+
+    #[test]
+    fn falls_back_when_url_is_unparsable() {
+        let settings = ConnectionSettings::from_url("这不是连接串");
+        assert_eq!(settings, ConnectionSettings::default());
+    }
+
+    #[test]
+    fn masks_password_for_display() {
+        let settings = ConnectionSettings::from_url("postgres://u:secret@h:5432/db");
+        assert_eq!(settings.masked_password(), "******");
+
+        let empty = ConnectionSettings::from_url("postgres://u:@h:5432/db");
+        assert_eq!(empty.masked_password(), "(空)");
     }
 
     /// 需要真实数据库：只有设置 BILLER_TEST_DATABASE_URL 时才会执行。
