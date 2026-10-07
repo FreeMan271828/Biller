@@ -1,21 +1,198 @@
-# BillCount
+# BillCount (biller)
 
-## V1.0.0
+通过账单截图自动化生成记录。
 
-通过账单截图自动化生成记录
+本版本已完成 **PostgreSQL 持久化** 与 **全屏 TUI + CLI 终端交互**：数据模型（账单 / 账本 / 分类 / 月度记账）
+通过 `sqlx` 落到 PostgreSQL，既能用交互式界面操作，也能用命令行子命令脚本化。
 
-## 架构
+## 技术栈
 
-![架构.drawio.png](../%E6%9E%B6%E6%9E%84.drawio.png)
+| 用途 | 选型 |
+| --- | --- |
+| 语言 | Rust（edition 2024） |
+| 数据库 | PostgreSQL + `sqlx` 0.8（运行时 SQL，无需编译期连库） |
+| 异步运行时 | `tokio` |
+| 交互式界面 | `ratatui` 0.30（crossterm 后端，原生支持 Windows 控制台） |
+| 命令行 | `clap` 4（derive） |
+| 时间 / 金额 | `chrono`；金额用自实现的「分」整型，避免浮点误差 |
 
-## 功能
+## 目录结构（按服务拆分）
 
-1. 对于每一家账单，根据特征把识别出的文本转变成账单，包括如下的函数
-   - 数据自定义预处理（多个）
-   - 提取金额函数
-   - 主处理函数
-   - 数据自定义后处理（多个）
-2. 支持微信记账本和hiklink的账单处理
+每个业务领域一个文件夹，内部固定 **`model` → `dao` → `service` → `tui`** 四层：
+
+- `model` 数据结构，`dao` 只写 SQL，`service` 承载业务规则，`tui` 只做终端参数与输出；
+- 领域之间**只允许通过对方的 `service` 交互**（例如账单领域靠 `BookService` / `CategoryService` 解析账本与分类）；
+- 公共能力集中在最小的 `common` 层，交互式界面外壳在 `tui/`。
+
+```
+src/
+├── main.rs              入口：解析参数 → 装配 service → 分发（CLI 或 TUI）
+├── lib.rs
+├── common/              最小化公共服务
+│   ├── db.rs            连接池 / 建库 / 建表 / 约束错误翻译
+│   ├── schema.sql       表结构（幂等，include_str! 编入二进制）
+│   ├── money.rs         金额：分 ↔ 元
+│   ├── time.rs          月份 / 时间解析
+│   ├── table.rs         终端表格（中文按双列宽对齐）
+│   └── types.rs         BillId / BookId / CategoryId / AmountType
+├── bill_book/           账本领域      model｜dao｜service｜tui
+├── category/            分类领域      model｜dao｜service｜tui（树状：父子 + 递归删除）
+├── bill/                账单领域      model｜dao｜service｜tui
+├── month/               记账周期领域  model｜dao｜service｜tui（月报按分类、年报按账本）
+└── tui/                 交互式界面外壳
+    ├── app.rs           状态机（纯逻辑，可脱离终端测试）
+    ├── input.rs         与终端库无关的按键抽象
+    ├── event.rs         crossterm 事件 → 按键
+    ├── view.rs          ratatui 渲染
+    └── mod.rs           事件循环与终端初始化
+```
+
+## 快速开始
+
+```bash
+# 1) 配置连接串（也可用 --database-url，或导出环境变量 DATABASE_URL）
+cp .env.example .env
+
+# 2) 建库 + 建表（幂等，可重复执行）
+cargo run -- init
+
+# 3) 打开交互式界面（不带子命令时也是这个）
+cargo run --
+
+# 4) 或者用命令行
+cargo run -- bill add expense 12.34 --book 微信 --category 餐饮 --remark 午饭
+cargo run -- month show --month 2026-10
+```
+
+连接串优先级：`--database-url` > 环境变量 `DATABASE_URL` > `.env` > 内置默认值
+`postgres://postgres:postgres@127.0.0.1:5432/biller`。
+
+## 交互式界面（TUI）
+
+`biller`（或 `biller ui`）在真实终端中打开全屏界面：顶部页签、中间表格、底部状态栏与快捷键提示。
+**请在真实终端里运行**，不要重定向输出或通过管道调用，否则会给出明确的报错。
+
+### 快捷键
+
+| 按键 | 作用 |
+| --- | --- |
+| `Tab` / `←` `→` / `1`-`6` | 切换页面（概览 / 账单 / 账本 / 分类 / 月报 / 年报） |
+| `↑` `↓` | 在当前页的列表里选择行（月报页用于选择分类看明细） |
+| `[` `]` | 上一个 / 下一个周期：普通页换月，**年报页换年** |
+| `m` | 回到本月（并把年份复位） |
+| `a` | 当前页新增（账单页记一笔，账本页加账本，分类页加分类） |
+| `e` | 编辑当前选中的记录；**概览页按 `e` 改本月起始金额** |
+| `d` | 删除当前选中的记录 |
+| `r` | 重新从数据库读取 |
+| `q` / `Ctrl+C` | 退出 |
+
+表单内：`Tab` / `↑` `↓` 切换字段，`←` `→` 或空格循环切换选项。
+**行尾带 `▾` 的是选择框**，按 `Enter` 展开完整候选列表（`↑` `↓` 移动、`Enter` 确定、`Esc` 取消）；
+普通文本框上按 `Enter` 直接提交表单。
+**「日期」字段留空表示今天，按空格填入上次用过的日期**；
+**「金额」字段可以直接写算式**（`+ - * /` 与括号，如 `12.34+5`、`(10+2)*3`），**按 `=` 求值**
+（忘了按也没关系，直接提交时同样会按算式计算）。
+
+### 三个口径
+
+| 页面 | 口径 |
+| --- | --- |
+| 概览 | 本月汇总 + 支出构成；`e` 可改本月起始金额 |
+| 月报 | **只按分类**：分类支出列表（`↑↓` 选择）+ 该分类本月明细 + 分类收入 |
+| 年报 | **按账本**：账本收入/支出分布 + 12 个月逐月走势 |
+
+### 几个行为说明
+
+- **新增账单时，账本与分类是从数据库自动读取的选择框**（分类带层级缩进），不用手打名称；
+  **焦点默认落在「账本」**，且**账本自动选中上次用过的那本**（上次那本若已被删除，
+  回落到列表第一个）。**「日期」默认留空（即今天）**，把光标移到日期字段后**按空格**
+  才会填入上次用过的日期。两项记忆都记在数据库的 `app_state` 表里，换会话、重启都还在。
+  若库里还没有任何账本/分类，该字段会退化成文本框，直接输入会由 service 自动创建。
+- **分类是树状的**：列表按父子层级缩进显示；新增/编辑分类时，父分类同样是选择框，
+  并且会自动排除「自己与自己的子孙」，从源头上避免形成环（service 层还有一道防环校验）。
+- **删除分类会提示连带影响**：若该分类下有子分类，确认框会列出将被一并删除的子分类名称；
+  只要子树里还有账单，删除会被拒绝并告知账单数量，避免顺手删掉账目。
+- 月报与年报的分工是刻意的：**月份看分类**（哪类花得多），**年份看账本**（钱从哪个账户走），
+  两个口径互补，避免同一屏里塞四张表。
+- 账单列表与月报明细里的**时间只展示到天**（`YYYY-MM-DD`）；具体时刻仍然完整存在数据库里，
+  月报/年报的月份归属也照旧按 UTC 计算。
+
+## 命令一览（CLI）
+
+```
+biller init                                          建库 + 建表
+biller ui                                            打开交互式界面（默认）
+
+biller book list                                     列出账本
+biller book add <名称>                               新增账本
+biller book edit <id|名称> --name <新名称>            重命名账本
+biller book rm <id|名称>                             删除账本（仍有账单时会拒绝）
+
+biller category list                                 按层级列出分类
+biller category add <名称> [--parent <父分类>]       新增分类
+biller category edit <id|名称> [--name <新名称>] \
+       [--parent <父分类> | --root]                   改名 / 调整父分类（--root 移到顶层）
+biller category rm <id|名称> [-r|--recursive]        删除分类；有子分类时必须加 --recursive
+
+biller bill add <income|expense> <金额> \
+       --book <账本> --category <分类> \
+       [--date <时间>] [--remark <备注>]             记一笔账
+biller bill edit <id> [--kind <方向>] [--amount <金额>] \
+       [--book <账本>] [--category <分类>] \
+       [--date <时间>] [--remark <备注>]             改一笔账（未给出的字段保持原值）
+biller bill list [--month YYYY-MM] [--book <账本>] \
+       [--category <分类>] [--kind <方向>] [--limit N]  查询账单
+biller bill rm <id>                                  删除账单
+
+biller month set-start <YYYY-MM> <起始金额>           设置某月起始金额
+biller month show [--month YYYY-MM]                  查看月度报表
+```
+
+约定：
+
+- **金额** 一律按「元」输入（如 `12.34`），内部按「分」存储；
+- **方向** 可用 `income` / `expense`，也接受 `收入` / `支出`；
+- **时间** 默认当前时间，支持 `2026-10-05`、`"2026-10-05 13:20:00"`、`2026-10-05T13:20:00Z`；
+- **月份归属** 按 **UTC** 计算，与 `BillEntity::created_at` 的类型保持一致。
+
+## 表结构
+
+| 表 | 说明 |
+| --- | --- |
+| `bill_books` | 账本，`name` 唯一 |
+| `categories` | 分类，`parent_id` 自引用；同级同名由部分唯一索引约束 |
+| `bills` | 账单：`kind` ∈ (income, expense)、`amount` ≥ 0、外键指向账本与分类 |
+| `month_balances` | 每月起始金额，`month` 固定为该月 1 号 |
+| `app_state` | 应用级键值状态（记住上次记账用的日期等） |
+
+收入 / 支出 / 结余不单独落库，由 `bills` 实时汇总得出，避免数据不一致。
+
+## 测试
+
+```bash
+cargo test          # 金额/时间/宽度、分类树展开与递归子树、TUI 状态机、无头渲染快照
+```
+
+其中包含几条关键回归：
+
+- 月度汇总按 `book.id` / `category.id` 分桶（原实现误用账单 id）；
+- 分类树在「父节点缺失」与「数据成环」两种异常下都不丢数据、不死循环；
+- TUI 用 `TestBackend` 无头渲染每个页面并断言内容。
+
+还有一条**需要真实数据库**的用例（验证外键冲突被翻译成单行友好提示），默认跳过：
+
+```bash
+BILLER_TEST_DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/biller cargo test
+```
+
+## 本机注意事项
+
+`target\` 目录曾出现过 Windows 权限不可写的问题（cargo 连 `.cargo-build-lock` 都打不开）。
+如果再次遇到，可以临时指定构建目录：
+
+```bash
+CARGO_TARGET_DIR=.cargo-target cargo build
+```
 
 ## 疑问
 

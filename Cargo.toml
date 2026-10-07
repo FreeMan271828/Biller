@@ -4,13 +4,12 @@ version = "1.0.0"
 edition = "2024"
 
 [dependencies]
-image = "0.25.10"
-ocr-rs = "2.2.2"
-regex = "1.12.3"
-tokio = { version = "1", features = ["full"] }
-sqlx = { version = "0.8", features = [ "postgres", "runtime-tokio-native-tls", "rust_decimal"] }
+chrono = { version = "0.4", features = ["serde"] }
+sqlx = { version = "0.8.6", features = ["postgres", "runtime-tokio-native-tls", "chrono", "macros"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 dotenvy = "0.15"
-async-trait = "0.1"
-rust_decimal = "1.34"
-futures = "0.3"
-chrono = "0.4"
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+# 用 ratatui 重导出的 crossterm（本机只缓存了 crossterm 0.29，故显式选该后端版本），
+# 不再单独声明 crossterm，避免出现两个版本导致类型不匹配。
+ratatui = { version = "0.30.2", features = ["crossterm_0_29"] }
