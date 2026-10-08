@@ -65,12 +65,26 @@ pub fn parse_amount(input: &str) -> Result<AmountType> {
         .ok_or_else(|| anyhow!("金额超出可表示范围：{input}"))
 }
 
-/// 把「分」格式化成「元」，例如 `1234 -> "12.34"`、`-5 -> "-0.05"`。
+/// 把「分」格式化成「元」，带千分位，例如：
+/// `1234 -> "12.34"`、`-5 -> "-0.05"`、`123456789 -> "1,234,567.89"`。
+///
+/// 千分位只是展示用：`parse_amount` 会把逗号吃掉，所以表单里回填后再提交是安全的。
 pub fn format_amount(cents: AmountType) -> String {
     let value = cents as i128;
     let sign = if value < 0 { "-" } else { "" };
     let abs = value.abs();
-    format!("{sign}{}.{:02}", abs / 100, abs % 100)
+
+    let yuan = (abs / 100).to_string();
+    let mut grouped = String::with_capacity(yuan.len() + yuan.len() / 3);
+    for (index, character) in yuan.chars().enumerate() {
+        // 从右往左每三位插一个逗号
+        if index > 0 && (yuan.len() - index) % 3 == 0 {
+            grouped.push(',');
+        }
+        grouped.push(character);
+    }
+
+    format!("{sign}{grouped}.{:02}", abs % 100)
 }
 
 /// 计算简单算式，返回按「元」格式化的结果（两位小数）。
@@ -262,7 +276,30 @@ mod tests {
         assert_eq!(format_amount(5), "0.05");
         assert_eq!(format_amount(0), "0.00");
         assert_eq!(format_amount(-1234), "-12.34");
-        assert_eq!(format_amount(i64::MIN), "-92233720368547758.08");
+        assert_eq!(format_amount(i64::MIN), "-92,233,720,368,547,758.08");
+    }
+
+    #[test]
+    fn formats_with_thousands_separators() {
+        assert_eq!(format_amount(99_999), "999.99");
+        assert_eq!(format_amount(100_000), "1,000.00");
+        assert_eq!(format_amount(123_456), "1,234.56");
+        assert_eq!(format_amount(123_456_789), "1,234,567.89");
+        assert_eq!(format_amount(-123_456), "-1,234.56");
+    }
+
+    /// 千分位只是展示：格式化出来的字符串必须能被 `parse_amount` 原样吃回去，
+    /// 否则表单回填（起始金额、编辑账单）就会自己报错。
+    #[test]
+    fn formatted_amount_round_trips_through_parser() {
+        for cents in [0, 5, 1234, 100_000, 123_456_789, 999_999_999] {
+            let text = format_amount(cents);
+            assert_eq!(
+                parse_amount(&text).unwrap(),
+                cents,
+                "{text} 应能解析回 {cents}"
+            );
+        }
     }
 
     #[test]
@@ -275,7 +312,11 @@ mod tests {
         assert_eq!(evaluate_expression("(2+3)*4").unwrap(), "20.00");
         assert_eq!(evaluate_expression("100/3").unwrap(), "33.33");
         assert_eq!(evaluate_expression("-4/2").unwrap(), "-2.00");
-        assert_eq!(evaluate_expression("1,000+234").unwrap(), "1234.00", "千分位");
+        assert_eq!(
+            evaluate_expression("1,000+234").unwrap(),
+            "1,234.00",
+            "千分位"
+        );
         assert_eq!(evaluate_expression("12 ＋ 3").unwrap(), "15.00", "全角与空格");
         assert_eq!(evaluate_expression("2×3").unwrap(), "6.00");
         assert_eq!(evaluate_expression(".5+0.5").unwrap(), "1.00");

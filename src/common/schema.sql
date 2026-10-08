@@ -30,8 +30,14 @@ CREATE TABLE IF NOT EXISTS bills (
     book_id     BIGINT NOT NULL REFERENCES bill_books (id) ON DELETE RESTRICT,
     category_id BIGINT NOT NULL REFERENCES categories (id) ON DELETE RESTRICT,
     created_at  TIMESTAMPTZ NOT NULL,
-    remark      TEXT
+    remark      TEXT,
+    -- 不纳入统计：报销、代付、走账这类过手钱不该算进收支与开销计划
+    excluded    BOOLEAN NOT NULL DEFAULT FALSE
 );
+
+-- 老库升级：CREATE TABLE IF NOT EXISTS 不会给已存在的表补列，必须单独 ALTER。
+-- 幂等，可重复执行 —— 这就是本项目「迁移 = 幂等 DDL」的用法。
+ALTER TABLE bills ADD COLUMN IF NOT EXISTS excluded BOOLEAN NOT NULL DEFAULT FALSE;
 
 CREATE INDEX IF NOT EXISTS bills_created_at_idx  ON bills (created_at);
 CREATE INDEX IF NOT EXISTS bills_book_id_idx     ON bills (book_id);

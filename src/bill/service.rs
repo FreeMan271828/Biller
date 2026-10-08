@@ -133,6 +133,8 @@ impl BillService {
                 category,
                 created_at: new.created_at,
                 remark: new.remark,
+                // 新账单默认纳入统计
+                excluded: false,
             },
             auto_created,
         ))
@@ -163,6 +165,14 @@ impl BillService {
             bail!("账单 id={id} 不存在");
         }
 
+        // 编辑账单不动「是否纳入统计」：取原值带上，免得返回值误导调用方
+        let excluded = self
+            .dao
+            .get(id)
+            .await?
+            .map(|bill| bill.excluded)
+            .unwrap_or(false);
+
         Ok(BillEntity {
             id,
             kind: new.kind,
@@ -171,6 +181,7 @@ impl BillService {
             category,
             created_at: new.created_at,
             remark: new.remark,
+            excluded,
         })
     }
 
@@ -209,6 +220,16 @@ impl BillService {
 
     pub async fn remove(&self, id: BillId) -> Result<()> {
         if self.dao.delete(id).await? == 0 {
+            bail!("账单 id={id} 不存在");
+        }
+        Ok(())
+    }
+
+    /// 切换一条账单「是否纳入统计」。
+    ///
+    /// 不纳入统计的账单仍然存在、仍能在列表里看到，只是不参与收支汇总与开销计划。
+    pub async fn set_excluded(&self, id: BillId, excluded: bool) -> Result<()> {
+        if self.dao.set_excluded(id, excluded).await? == 0 {
             bail!("账单 id={id} 不存在");
         }
         Ok(())

@@ -9,4 +9,5 @@ pub mod bill_book;
 pub mod category;
 pub mod common;
 pub mod month;
+pub mod plan;
 pub mod tui;

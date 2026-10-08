@@ -13,6 +13,8 @@ use biller::category::tui::{self as category_tui, CategoryCmd};
 use biller::common::{db, time};
 use biller::month::service::MonthService;
 use biller::month::tui::{self as month_tui, MonthCmd};
+use biller::plan::service::PlanService;
+use biller::plan::tui::{self as plan_tui, PlanCmd};
 use biller::tui::{self as interactive, Services};
 
 #[derive(Parser)]
@@ -59,6 +61,11 @@ enum Command {
         #[command(subcommand)]
         cmd: MonthCmd,
     },
+    /// 开销计划（预计金额 / 攒钱金额 → 上限开销）
+    Plan {
+        #[command(subcommand)]
+        cmd: PlanCmd,
+    },
 }
 
 #[tokio::main]
@@ -100,5 +107,6 @@ async fn main() -> Result<()> {
         Command::Category { cmd } => category_tui::run(&CategoryService::new(pool), cmd).await,
         Command::Bill { cmd } => bill_tui::run(&BillService::new(pool), cmd).await,
         Command::Month { cmd } => month_tui::run(&MonthService::new(pool), cmd).await,
+        Command::Plan { cmd } => plan_tui::run(&PlanService::new(pool), cmd).await,
     }
 }

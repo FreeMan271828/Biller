@@ -33,6 +33,7 @@ struct BillRow {
     category_parent_id: Option<i64>,
     created_at: DateTime<Utc>,
     remark: Option<String>,
+    excluded: bool,
 }
 
 impl TryFrom<BillRow> for BillEntity {
@@ -56,6 +57,7 @@ impl TryFrom<BillRow> for BillEntity {
             },
             created_at: row.created_at,
             remark: row.remark,
+            excluded: row.excluded,
         })
     }
 }
@@ -71,7 +73,8 @@ SELECT b.id,
        c.name      AS category_name,
        c.parent_id AS category_parent_id,
        b.created_at,
-       b.remark
+       b.remark,
+       b.excluded
   FROM bills b
   JOIN bill_books bk ON bk.id = b.book_id
   JOIN categories c  ON c.id = b.category_id
@@ -97,7 +100,8 @@ SELECT b.id,
        c.name      AS category_name,
        c.parent_id AS category_parent_id,
        b.created_at,
-       b.remark
+       b.remark,
+       b.excluded
   FROM bills b
   JOIN bill_books bk ON bk.id = b.book_id
   JOIN categories c  ON c.id = b.category_id
@@ -194,6 +198,16 @@ impl BillDao {
 
     pub async fn delete(&self, id: BillId) -> Result<u64> {
         let result = sqlx::query("DELETE FROM bills WHERE id = $1")
+            .bind(id as i64)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// 只切换「是否纳入统计」，不动账单本身。
+    pub async fn set_excluded(&self, id: BillId, excluded: bool) -> Result<u64> {
+        let result = sqlx::query("UPDATE bills SET excluded = $1 WHERE id = $2")
+            .bind(excluded)
             .bind(id as i64)
             .execute(&self.pool)
             .await?;

@@ -54,6 +54,8 @@ pub struct BillEntity {
     pub category: Category,
     pub created_at: DateTime<Utc>,
     pub remark: Option<String>,
+    /// 不纳入统计：报销、代付、走账这类过手钱，不该算进收支与开销计划。
+    pub excluded: bool,
 }
 
 impl BillEntity {
@@ -87,6 +89,7 @@ mod tests {
             },
             created_at: Utc.with_ymd_and_hms(2026, 10, 5, 12, 30, 0).unwrap(),
             remark: Some("午饭".to_string()),
+            excluded: false,
         }
     }
 

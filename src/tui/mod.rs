@@ -25,6 +25,7 @@ use crate::bill_book::service::BookService;
 use crate::category::service::CategoryService;
 use crate::common::{db, migrate};
 use crate::month::service::MonthService;
+use crate::plan::service::PlanService;
 use crate::tui::app::{Action, App};
 
 /// TUI 需要的各领域 service，由 main 装配一次后共享。
@@ -34,6 +35,7 @@ pub struct Services {
     pub books: BookService,
     pub categories: CategoryService,
     pub months: MonthService,
+    pub plans: PlanService,
     /// 当前连接池：数据迁移这类跨领域操作需要直接读源库。
     pool: PgPool,
 }
@@ -45,6 +47,7 @@ impl Services {
             books: BookService::new(pool.clone()),
             categories: CategoryService::new(pool.clone()),
             months: MonthService::new(pool.clone()),
+            plans: PlanService::new(pool.clone()),
             pool,
         }
     }

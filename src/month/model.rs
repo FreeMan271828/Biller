@@ -20,6 +20,12 @@ pub struct BillMonthCollection {
 
     pub income_by_category: HashMap<CategoryId, AmountType>,
     pub expense_by_category: HashMap<CategoryId, AmountType>,
+
+    /// 支出按「分类 + 账本」成对累计。
+    ///
+    /// 只看分类会把「钱从哪本账走」抹平：日常开销分散在多本账上时，
+    /// 单看分类看不出某本账才是大头，只有成对比较才真实。
+    pub expense_by_category_book: HashMap<(CategoryId, BookId), AmountType>,
 }
 
 impl BillMonthCollection {
@@ -33,6 +39,7 @@ impl BillMonthCollection {
             expense_by_book: HashMap::new(),
             income_by_category: HashMap::new(),
             expense_by_category: HashMap::new(),
+            expense_by_category_book: HashMap::new(),
         }
     }
 
@@ -46,6 +53,11 @@ impl BillMonthCollection {
         self.total_income - self.total_expense
     }
 
+    /// 支出按「分类 + 账本」拆分的排行：金额从多到少。
+    pub fn expense_pairs(&self) -> Vec<(CategoryId, BookId, AmountType)> {
+        rank_pairs(self.expense_by_category_book.clone())
+    }
+
     pub fn from_bills(
         month: NaiveDate,
         start_balance: AmountType,
@@ -57,22 +69,26 @@ impl BillMonthCollection {
             if !Self::same_month(b.created_at.date_naive(), month) {
                 continue;
             }
-            let (total, by_book, by_cat) = match b.kind {
-                BillKind::Income => (
-                    &mut acc.total_income,
-                    &mut acc.income_by_book,
-                    &mut acc.income_by_category,
-                ),
-                BillKind::Expense => (
-                    &mut acc.total_expense,
-                    &mut acc.expense_by_book,
-                    &mut acc.expense_by_category,
-                ),
-            };
-            *total += b.amount;
-            // 按账本/分类维度汇总，键分别取 book.id 与 category.id
-            *by_book.entry(b.book.id).or_default() += b.amount;
-            *by_cat.entry(b.category.id).or_default() += b.amount;
+            // 注意：月报/年报**始终全额计入**。
+            // bills.excluded 只影响「支出日历」与「开销计划」，不影响报表口径。
+
+            match b.kind {
+                BillKind::Income => {
+                    acc.total_income += b.amount;
+                    *acc.income_by_book.entry(b.book.id).or_default() += b.amount;
+                    *acc.income_by_category.entry(b.category.id).or_default() += b.amount;
+                }
+                BillKind::Expense => {
+                    acc.total_expense += b.amount;
+                    // 按账本 / 分类维度汇总，键分别取 book.id 与 category.id
+                    *acc.expense_by_book.entry(b.book.id).or_default() += b.amount;
+                    *acc.expense_by_category.entry(b.category.id).or_default() += b.amount;
+                    // 再按「分类 + 账本」成对累计
+                    *acc.expense_by_category_book
+                        .entry((b.category.id, b.book.id))
+                        .or_default() += b.amount;
+                }
+            }
         }
 
         acc
@@ -81,6 +97,29 @@ impl BillMonthCollection {
     fn same_month(a: NaiveDate, b: NaiveDate) -> bool {
         a.year() == b.year() && a.month() == b.month()
     }
+}
+
+/// 把「分类 + 账本」的累计表排成金额降序的排行。
+///
+/// 月报（整月）与概览（今天）共用，保证两处排序口径一致：金额相同时按分类、
+/// 账本 id 排序，终端里的顺序才稳定可比。
+pub fn rank_pairs(
+    totals: HashMap<(CategoryId, BookId), AmountType>,
+) -> Vec<(CategoryId, BookId, AmountType)> {
+    let mut rows: Vec<(CategoryId, BookId, AmountType)> = totals
+        .into_iter()
+        .map(|((category, book), amount)| (category, book, amount))
+        .collect();
+
+    rows.sort_by(|left, right| {
+        right
+            .2
+            .cmp(&left.2)
+            .then(left.0.cmp(&right.0))
+            .then(left.1.cmp(&right.1))
+    });
+
+    rows
 }
 
 /// 年度汇总：总额 + **按账本**分布 + 逐月走势。
@@ -127,6 +166,7 @@ impl YearCollection {
             if date.year() != year {
                 continue;
             }
+            // 年报同样全额计入，不看 bills.excluded
             let index = (date.month() - 1) as usize;
 
             match bill.kind {
@@ -178,6 +218,7 @@ mod tests {
             },
             created_at: Utc.with_ymd_and_hms(2026, month, day, 12, 0, 0).unwrap(),
             remark: None,
+            excluded: false,
         }
     }
 
@@ -207,6 +248,50 @@ mod tests {
         assert_eq!(collection.expense_by_category.get(&3), Some(&1000));
         assert_eq!(collection.expense_by_category.get(&4), Some(&500));
         assert_eq!(collection.income_by_category.get(&5), Some(&2000));
+    }
+
+    /// 回归测试：支出必须能按「分类 + 账本」拆开比较。
+    #[test]
+    fn splits_expense_by_category_and_book() {
+        let month = NaiveDate::from_ymd_opt(2026, 10, 1).unwrap();
+        let bills = vec![
+            // 同一个分类，钱却是从两本不同的账走的
+            bill(1, BillKind::Expense, 5000, 9, 3, 10, 1),
+            bill(2, BillKind::Expense, 1000, 7, 3, 10, 2),
+            bill(3, BillKind::Expense, 200, 7, 4, 10, 3),
+            // 收入不进支出排行
+            bill(4, BillKind::Income, 8000, 7, 5, 10, 4),
+        ];
+
+        let collection = BillMonthCollection::from_bills(month, 0, &bills);
+
+        assert_eq!(
+            collection.expense_pairs(),
+            vec![(3, 9, 5000), (3, 7, 1000), (4, 7, 200)],
+            "同一分类要按账本拆开，并按金额降序"
+        );
+
+        // 分类口径仍然并存：它是两本账的合计
+        assert_eq!(collection.expense_by_category.get(&3), Some(&6000));
+        assert_eq!(collection.expense_by_book.get(&7), Some(&1200));
+        assert_eq!(collection.expense_by_book.get(&9), Some(&5000));
+    }
+
+    /// 回归测试：`excluded` 只影响日历与计划，报表口径必须全额计入。
+    #[test]
+    fn reports_always_include_excluded_bills() {
+        let month = NaiveDate::from_ymd_opt(2026, 10, 1).unwrap();
+        let mut excluded = bill(1, BillKind::Expense, 1234, 7, 3, 10, 2);
+        excluded.excluded = true;
+
+        let bills = vec![excluded, bill(2, BillKind::Income, 500, 7, 3, 10, 3)];
+
+        let collection = BillMonthCollection::from_bills(month, 0, &bills);
+        assert_eq!(collection.total_expense, 1234, "月报不看 excluded");
+        assert_eq!(collection.expense_by_category.get(&3), Some(&1234));
+
+        let year = YearCollection::from_bills(2026, &bills);
+        assert_eq!(year.total_expense, 1234, "年报同样不看 excluded");
     }
 
     /// 年度汇总按账本 + 逐月分桶，且只统计当年。
