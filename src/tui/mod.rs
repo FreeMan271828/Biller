@@ -18,15 +18,15 @@ use chrono::NaiveDate;
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event as ct;
 use ratatui::crossterm::event::Event;
-use sqlx::PgPool;
+use crate::common::db::Pool;
 
 use crate::bill::service::BillService;
 use crate::bill_book::service::BookService;
 use crate::category::service::CategoryService;
-use crate::common::{db, migrate};
+use crate::common::{config, db, migrate};
 use crate::month::service::MonthService;
 use crate::plan::service::PlanService;
-use crate::tui::app::{Action, App};
+use crate::tui::app::{Action, App, ConnectionTarget};
 
 /// TUI 需要的各领域 service，由 main 装配一次后共享。
 #[derive(Clone)]
@@ -37,11 +37,11 @@ pub struct Services {
     pub months: MonthService,
     pub plans: PlanService,
     /// 当前连接池：数据迁移这类跨领域操作需要直接读源库。
-    pool: PgPool,
+    pool: Pool,
 }
 
 impl Services {
-    pub fn new(pool: PgPool) -> Self {
+    pub fn new(pool: Pool) -> Self {
         Self {
             bills: BillService::new(pool.clone()),
             books: BookService::new(pool.clone()),
@@ -53,7 +53,7 @@ impl Services {
     }
 
     /// 当前连接池。
-    pub fn pool(&self) -> &PgPool {
+    pub fn pool(&self) -> &Pool {
         &self.pool
     }
 }
@@ -62,7 +62,12 @@ impl Services {
 ///
 /// 终端初始化失败（例如输出被重定向、不是真实终端）时返回可读错误，
 /// 而不是把终端留在 raw 模式。
-pub async fn run(services: Services, month: NaiveDate, connection_url: String) -> Result<()> {
+pub async fn run(
+    services: Option<Services>,
+    month: NaiveDate,
+    connection_url: String,
+    sqlite_path: String,
+) -> Result<()> {
     let mut terminal = match ratatui::try_init() {
         Ok(terminal) => terminal,
         Err(error) => bail!(
@@ -71,8 +76,12 @@ pub async fn run(services: Services, month: NaiveDate, connection_url: String) -
     };
 
     let result = async {
-        let mut app = App::new(month, &connection_url);
-        app.reload(&services).await?;
+        let mut app = App::new(month, &connection_url, &sqlite_path);
+        match services.as_ref() {
+            Some(services) => app.reload(services).await?,
+            // 连不上也照样进界面：先让用户看到引导页，去设置里配好库
+            None => app.mark_needs_setup(),
+        }
         event_loop(&mut terminal, &mut app, services, &connection_url).await
     }
     .await;
@@ -85,7 +94,7 @@ pub async fn run(services: Services, month: NaiveDate, connection_url: String) -
 async fn event_loop(
     terminal: &mut DefaultTerminal,
     app: &mut App,
-    mut services: Services,
+    mut services: Option<Services>,
     connection_url: &str,
 ) -> Result<()> {
     let mut dirty = true;
@@ -117,24 +126,48 @@ async fn event_loop(
 async fn apply_action(
     action: Action,
     app: &mut App,
-    services: &mut Services,
+    services: &mut Option<Services>,
     connection_url: &str,
 ) {
     match action {
-        Action::SaveConnection(settings) => {
-            let new_url = settings.to_url();
-            // 先落地设置：即使连不上，下次启动也会用这套参数
-            let saved = db::save_database_url(&new_url);
+        Action::SaveConnection(target) => {
+            // 先把设置落地：即使这次连不上，下次启动也会用这套参数。
+            // 本地模式写进 config.toml，远程模式沿用原来的 .env（兼容已有习惯）。
+            let (new_url, saved) = match &target {
+                ConnectionTarget::Local { path } => {
+                    let path = std::path::PathBuf::from(path);
+                    let mut config = config::AppConfig::load().unwrap_or_default();
+                    config.mode = config::DbMode::Local;
+                    config.sqlite_path = path.clone();
+                    let saved = config.save().map(|()| config::AppConfig::path());
+                    (db::sqlite_url(&path), saved)
+                }
+                ConnectionTarget::Remote(settings) => {
+                    let url = settings.to_url();
+                    let saved = db::save_database_url(&url);
+
+                    let mut config = config::AppConfig::load().unwrap_or_default();
+                    config.mode = config::DbMode::Postgres;
+                    config.postgres_url = url.clone();
+                    let _ = config.save();
+
+                    (url, saved)
+                }
+            };
 
             match initialize_database(&new_url).await {
                 Ok((outcome, pool)) => {
-                    *services = Services::new(pool);
-                    app.connection = settings;
+                    *services = Some(Services::new(pool));
                     app.connection_url = new_url;
+
+                    match &target {
+                        ConnectionTarget::Local { path } => app.sqlite_path = path.clone(),
+                        ConnectionTarget::Remote(settings) => app.connection = settings.clone(),
+                    }
 
                     let mut message = match &saved {
                         Ok(path) => format!("设置已保存到 {}", path.display()),
-                        Err(error) => format!("连接已切换，但写 .env 失败：{error:#}"),
+                        Err(error) => format!("连接已切换，但写配置失败：{error:#}"),
                     };
                     match outcome {
                         db::DatabaseOutcome::Created => message.push_str("；并已建库建表"),
@@ -142,8 +175,10 @@ async fn apply_action(
                     }
                     app.set_info(message);
 
-                    if let Err(error) = app.reload(services).await {
-                        app.set_error(format!("{error:#}"));
+                    if let Some(services) = services.as_ref() {
+                        if let Err(error) = app.reload(services).await {
+                            app.set_error(format!("{error:#}"));
+                        }
                     }
                 }
                 Err(error) => {
@@ -155,25 +190,34 @@ async fn apply_action(
             Ok((outcome, pool)) => {
                 pool.close().await;
 
-                let database = db::database_name(connection_url).unwrap_or_default();
+                let target = match db::DbKind::from_url(connection_url) {
+                    db::DbKind::Sqlite => db::sqlite_file_path(connection_url)
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_default(),
+                    db::DbKind::Postgres => db::database_name(connection_url).unwrap_or_default(),
+                };
                 let message = match outcome {
-                    db::DatabaseOutcome::Created => format!("已创建数据库 {database} 并建好表结构"),
-                    db::DatabaseOutcome::Existed => {
-                        format!("数据库 {database} 已存在，表结构已就绪")
-                    }
+                    db::DatabaseOutcome::Created => format!("已创建 {target} 并建好表结构"),
+                    db::DatabaseOutcome::Existed => format!("{target} 已就绪，表结构已同步"),
                 };
                 app.set_info(message);
 
-                if let Err(error) = app.reload(services).await {
-                    app.set_error(format!("{error:#}"));
+                if let Some(services) = services.as_ref() {
+                    if let Err(error) = app.reload(services).await {
+                        app.set_error(format!("{error:#}"));
+                    }
                 }
             }
             Err(error) => app.set_error(format!("{error:#}")),
         },
         Action::MigrateData(settings) => {
+            // 迁移要有源库：还没连上就先让用户把连接配好
+            let Some(source) = services.as_ref().map(|services| services.pool().clone()) else {
+                app.set_error("还没有连上数据库，先在设置里配置好再迁移");
+                return;
+            };
+
             let target_url = settings.to_url();
-            // 源库就是当前连接；先把池克隆出来，稍后要整体替换 services
-            let source = services.pool().clone();
 
             let migration = async {
                 let (_, target) = initialize_database(&target_url).await?;
@@ -184,7 +228,7 @@ async fn apply_action(
 
             match migration {
                 Ok((target, report)) => {
-                    *services = Services::new(target);
+                    *services = Some(Services::new(target));
                     // 迁移完成后目标库就是新的家，顺手把设置也落地并切过去
                     let _ = db::save_database_url(&target_url);
                     app.connection = settings;
@@ -201,8 +245,10 @@ async fn apply_action(
                         report.total()
                     ));
 
-                    if let Err(error) = app.reload(services).await {
-                        app.set_error(format!("{error:#}"));
+                    if let Some(services) = services.as_ref() {
+                        if let Err(error) = app.reload(services).await {
+                            app.set_error(format!("{error:#}"));
+                        }
                     }
                 }
                 Err(error) => {
@@ -210,7 +256,12 @@ async fn apply_action(
                 }
             }
         }
-        other => app.apply(other, services).await,
+        // 还没连上库时，其余动作一律忽略：界面正显示引导页，用户该去设置里配库
+        other => {
+            if let Some(services) = services.as_ref() {
+                app.apply(other, services).await;
+            }
+        }
     }
 }
 
@@ -218,7 +269,7 @@ async fn apply_action(
 ///
 /// 表结构语句本身幂等，所以「初始化」与「迁移」是同一个动作：
 /// 后加的表/索引会在启动或点一次初始化时自动补齐。
-async fn initialize_database(url: &str) -> Result<(db::DatabaseOutcome, PgPool)> {
+async fn initialize_database(url: &str) -> Result<(db::DatabaseOutcome, Pool)> {
     // 先直接连目标库：能连上就只补表结构，不必去碰维护库
     match db::connect(url).await {
         Ok(pool) => {

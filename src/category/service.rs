@@ -6,7 +6,7 @@
 use std::collections::{HashMap, HashSet};
 
 use anyhow::{Result, bail};
-use sqlx::PgPool;
+use crate::common::db::Pool;
 
 use crate::category::dao::CategoryDao;
 use crate::category::model::Category;
@@ -112,7 +112,7 @@ pub struct CategoryService {
 }
 
 impl CategoryService {
-    pub fn new(pool: PgPool) -> Self {
+    pub fn new(pool: Pool) -> Self {
         Self {
             dao: CategoryDao::new(pool),
         }

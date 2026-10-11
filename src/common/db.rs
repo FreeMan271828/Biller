@@ -2,17 +2,173 @@
 //!
 //! 各领域的 `dao` 只依赖这里给出的连接池，不关心连接从哪来。
 
+use std::path::{Path as FsPath, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
-use sqlx::PgPool;
-use sqlx::postgres::PgPoolOptions;
+use sqlx::AnyPool;
+use sqlx::any::AnyPoolOptions;
 
 /// 未配置连接串时使用的默认值（本地开发）。
 const DEFAULT_DATABASE_URL: &str = "postgres://postgres:postgres@127.0.0.1:5432/biller";
 
-/// 建表语句，随二进制一起编译。
-const SCHEMA_SQL: &str = include_str!("schema.sql");
+/// 建表语句，随二进制一起编译；按后端各一份。
+const SCHEMA_POSTGRES_SQL: &str = include_str!("schema.sql");
+const SCHEMA_SQLITE_SQL: &str = include_str!("schema_sqlite.sql");
+
+/// 后端类型：SQL 文本要按它分叉。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DbKind {
+    Postgres,
+    Sqlite,
+}
+
+impl DbKind {
+    /// 从连接串推断后端。
+    pub fn from_url(url: &str) -> Self {
+        if url.trim_start().to_ascii_lowercase().starts_with("sqlite:") {
+            DbKind::Sqlite
+        } else {
+            DbKind::Postgres
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            DbKind::Postgres => "PostgreSQL",
+            DbKind::Sqlite => "本地 SQLite",
+        }
+    }
+}
+
+/// 连接池 + 后端类型。
+///
+/// 两个后端都走 `sqlx::Any`：占位符统一 `?`，**bind 链只写一遍**，
+/// 只有 SQL 文本按 [`DbKind`] 分叉。
+///
+/// 注意：`Any` **不支持 chrono 类型**（`Encode<'_, Any>` 没实现），所以
+/// 时间戳 / 日期一律以 ISO 文本往返，各 dao 里负责字符串 ↔ chrono 的转换。
+#[derive(Clone)]
+pub struct Pool {
+    inner: AnyPool,
+    kind: DbKind,
+}
+
+impl Pool {
+    pub fn new(inner: AnyPool, kind: DbKind) -> Self {
+        Self { inner, kind }
+    }
+
+    /// 交给 sqlx 执行的原始池。
+    pub fn any(&self) -> &AnyPool {
+        &self.inner
+    }
+
+    pub fn kind(&self) -> DbKind {
+        self.kind
+    }
+
+    /// 把 `?` 占位符改写成 PostgreSQL 的 `$n`（SQLite 原样返回）。
+    ///
+    /// **`sqlx::Any` 不做这件事**：PostgreSQL 只认 `$n`，SQLite 只认 `?`
+    /// （实测过：把 `?` 直接发给 PG 会报 `syntax error at end of input`）。
+    /// 所以全项目的 SQL 统一写成 `?`，发起前按后端改写。
+    pub fn placeholders(&self, query: &str) -> String {
+        match self.kind {
+            DbKind::Sqlite => query.to_string(),
+            DbKind::Postgres => {
+                let mut index = 0;
+                let mut out = String::with_capacity(query.len() + 8);
+
+                for character in query.chars() {
+                    if character == '?' {
+                        index += 1;
+                        out.push('$');
+                        out.push_str(&index.to_string());
+                    } else {
+                        out.push(character);
+                    }
+                }
+
+                out
+            }
+        }
+    }
+
+    /// 两个后端同一条 SQL（只差占位符写法）。
+    pub fn shared(&self, query: &str) -> String {
+        self.placeholders(query)
+    }
+
+    /// 按后端挑一条 SQL，并改写占位符 —— 分叉点集中在这里。
+    pub fn sql(&self, postgres: &str, sqlite: &str) -> String {
+        match self.kind {
+            DbKind::Postgres => self.placeholders(postgres),
+            DbKind::Sqlite => self.placeholders(sqlite),
+        }
+    }
+
+    pub async fn close(&self) {
+        self.inner.close().await;
+    }
+}
+
+/// `Any` 的驱动表是全局一次性的，注册多次无害但没必要。
+fn install_drivers() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(sqlx::any::install_default_drivers);
+}
+
+/// 本地模式的默认库文件：`%USERPROFILE%\.biller\biller.db`。
+pub fn default_sqlite_path() -> PathBuf {
+    let home = std::env::var_os("USERPROFILE")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    home.join(".biller").join("biller.db")
+}
+
+/// 把本地文件路径变成 SQLite 连接串（统一用正斜杠）。
+///
+/// `mode=rwc` 是必需的：sqlx 的 SQLite 默认 `create_if_missing = false`，
+/// 不带这个参数首次运行会直接报 `unable to open database file (code 14)`。
+pub fn sqlite_url(path: &FsPath) -> String {
+    let text = path.to_string_lossy().replace('\\', "/");
+    format!("sqlite:{text}?mode=rwc")
+}
+
+/// 从 `sqlite:` 连接串里取出文件路径；内存库返回 `None`。
+pub fn sqlite_file_path(url: &str) -> Option<PathBuf> {
+    let rest = url.trim().strip_prefix("sqlite:")?;
+    let rest = rest.split('?').next().unwrap_or(rest);
+
+    if rest.is_empty() || rest.contains(":memory:") {
+        return None;
+    }
+
+    // `sqlite:foo.db`、`sqlite://foo.db`、`sqlite:///C:/foo.db` 都要吃
+    let path = rest.trim_start_matches("//");
+    let path = if path.len() > 2 && path.starts_with('/') && path.as_bytes()[2] == b':' {
+        &path[1..]
+    } else {
+        path
+    };
+
+    Some(PathBuf::from(path))
+}
+
+/// 建 SQLite 文件所在的目录（文件本身由连接时创建）。
+fn ensure_sqlite_parent(url: &str) -> Result<()> {
+    let Some(path) = sqlite_file_path(url) else {
+        return Ok(());
+    };
+    if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("创建目录 {} 失败", parent.display()))?;
+    }
+    Ok(())
+}
 
 /// 解析连接串：命令行参数 > 环境变量 `DATABASE_URL` > 内置默认值。
 pub fn resolve_url(cli_value: Option<String>) -> Result<String> {
@@ -27,19 +183,30 @@ pub fn resolve_url(cli_value: Option<String>) -> Result<String> {
     Ok(DEFAULT_DATABASE_URL.to_string())
 }
 
-/// 建立连接池。
-pub async fn connect(url: &str) -> Result<PgPool> {
-    PgPoolOptions::new()
+/// 建立连接池（PostgreSQL 或本地 SQLite，看连接串前缀）。
+pub async fn connect(url: &str) -> Result<Pool> {
+    install_drivers();
+
+    let kind = DbKind::from_url(url);
+    // 本地模式顺手把目录建出来：用户随手填个新路径也应该能用
+    if kind == DbKind::Sqlite {
+        ensure_sqlite_parent(url)?;
+    }
+
+    let pool = AnyPoolOptions::new()
         .max_connections(5)
         .acquire_timeout(Duration::from_secs(10))
         .connect(url)
         .await
         .with_context(|| {
             format!(
-                "连接 PostgreSQL 失败：{}\n请确认数据库已启动，或用 --database-url 指定连接串",
+                "连接{}失败：{}\n请确认数据库可用，或用 --database-url 指定连接串",
+                kind.label(),
                 redact(url)
             )
-        })
+        })?;
+
+    Ok(Pool::new(pool, kind))
 }
 
 /// 建库结果。调用方决定怎么提示——TUI 里不能直接 `println!`，会污染界面。
@@ -53,19 +220,28 @@ pub enum DatabaseOutcome {
 ///
 /// 注意：这里**不打印任何东西**，提示交给调用方。
 pub async fn ensure_database(url: &str) -> Result<DatabaseOutcome> {
+    // 本地模式：库就是那个文件，保证父目录存在即可，文件由连接时创建
+    if DbKind::from_url(url) == DbKind::Sqlite {
+        ensure_sqlite_parent(url)?;
+        return Ok(DatabaseOutcome::Existed);
+    }
+
     let database = database_name(url)?;
     if !is_safe_identifier(&database) {
         bail!("数据库名只允许字母、数字和下划线，且不能以数字开头：{database}");
     }
 
+    install_drivers();
+
     let admin_url = with_database(url, "postgres")?;
-    let admin = PgPoolOptions::new()
+    let admin = AnyPoolOptions::new()
         .max_connections(1)
         .acquire_timeout(Duration::from_secs(10))
         .connect(&admin_url)
         .await
         .with_context(|| format!("连接维护库失败：{}", redact(&admin_url)))?;
 
+    // 这条只跑在 PostgreSQL 上，直接用 `$1`
     let found: Option<(i32,)> = sqlx::query_as("SELECT 1 FROM pg_database WHERE datname = $1")
         .bind(&database)
         .fetch_optional(&admin)
@@ -86,12 +262,17 @@ pub async fn ensure_database(url: &str) -> Result<DatabaseOutcome> {
     Ok(outcome)
 }
 
-/// 执行建表语句（幂等，可重复运行）。
-pub async fn init_schema(pool: &PgPool) -> Result<()> {
-    sqlx::raw_sql(SCHEMA_SQL)
-        .execute(pool)
+/// 执行建表语句（幂等，可重复运行）；按后端选对应的 schema。
+pub async fn init_schema(pool: &Pool) -> Result<()> {
+    let schema = match pool.kind() {
+        DbKind::Postgres => SCHEMA_POSTGRES_SQL,
+        DbKind::Sqlite => SCHEMA_SQLITE_SQL,
+    };
+
+    sqlx::raw_sql(schema)
+        .execute(pool.any())
         .await
-        .context("初始化表结构失败")?;
+        .with_context(|| format!("初始化{}表结构失败", pool.kind().label()))?;
     Ok(())
 }
 
@@ -305,14 +486,26 @@ pub fn with_database(url: &str, database: &str) -> Result<String> {
     Ok(result)
 }
 
-/// 外键冲突（PostgreSQL 23503）。
+/// 外键冲突：PostgreSQL 报 SQLSTATE `23503`，SQLite 报扩展码 787 / 消息文本。
 pub fn is_foreign_key_violation(error: &sqlx::Error) -> bool {
-    matches!(error, sqlx::Error::Database(db) if db.code().as_deref() == Some("23503"))
+    match error {
+        sqlx::Error::Database(db) => {
+            db.code().as_deref() == Some("23503")
+                || db.message().to_ascii_lowercase().contains("foreign key")
+        }
+        _ => false,
+    }
 }
 
-/// 唯一约束冲突（PostgreSQL 23505）。
+/// 唯一约束冲突：PostgreSQL 报 SQLSTATE `23505`，SQLite 报扩展码 2067 / 消息文本。
 pub fn is_unique_violation(error: &sqlx::Error) -> bool {
-    matches!(error, sqlx::Error::Database(db) if db.code().as_deref() == Some("23505"))
+    match error {
+        sqlx::Error::Database(db) => {
+            matches!(db.code().as_deref(), Some("23505") | Some("2067"))
+                || db.message().to_ascii_lowercase().contains("unique constraint")
+        }
+        _ => false,
+    }
 }
 
 /// 把约束冲突翻译成可读提示，其余错误保留原始信息并附上提示。
@@ -452,7 +645,7 @@ mod tests {
             "INSERT INTO bills (kind, amount, book_id, category_id, created_at)
              VALUES ('expense', 100, 999999999, 999999999, now())",
         )
-        .execute(&pool)
+        .execute(pool.any())
         .await
         .expect_err("指向不存在的账本，应当触发外键冲突");
 
@@ -468,5 +661,155 @@ mod tests {
             1,
             "友好提示不应再挂带底层原因链"
         );
+    }
+
+    /// 本地 SQLite 模式跑一遍真实流程：建表 → 记账 → 按月查询 → 起始金额 → 外键约束。
+    ///
+    /// 不需要任何外部数据库：临时文件，跑完就删。这是「SQLite 模式真的能用」的证明。
+    #[tokio::test]
+    async fn sqlite_mode_works_end_to_end() {
+        use chrono::{NaiveDate, TimeZone};
+
+        use crate::bill::dao::{BillDao, BillFilter};
+        use crate::bill::model::BillKind;
+        use crate::bill_book::dao::BookDao;
+        use crate::category::dao::CategoryDao;
+        use crate::month::dao::MonthDao;
+
+        let dir = std::env::temp_dir().join(format!("biller-sqlite-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let url = sqlite_url(&dir.join("biller.db"));
+
+        let pool = connect(&url).await.expect("连接本地 SQLite");
+        assert_eq!(pool.kind(), DbKind::Sqlite, "应识别成本地模式");
+        assert_eq!(pool.kind().label(), "本地 SQLite");
+        init_schema(&pool).await.expect("建表");
+
+        let books = BookDao::new(pool.clone());
+        let categories = CategoryDao::new(pool.clone());
+        let bills = BillDao::new(pool.clone());
+        let months = MonthDao::new(pool.clone());
+
+        let book_id = books.insert("微信").await.expect("建账本");
+        let category_id = categories.insert(None, "餐饮").await.expect("建分类");
+
+        let created_at = chrono::Utc.with_ymd_and_hms(2026, 10, 5, 12, 0, 0).unwrap();
+        let bill_id = bills
+            .insert(
+                BillKind::Expense,
+                1234,
+                book_id,
+                category_id,
+                created_at,
+                Some("午饭"),
+            )
+            .await
+            .expect("记账");
+
+        // 时间戳往返 + 月份筛选：这两条正是两个后端的方言差异所在
+        let month = NaiveDate::from_ymd_opt(2026, 10, 1).unwrap();
+        let list = bills
+            .list(&BillFilter {
+                month: Some(month),
+                ..Default::default()
+            })
+            .await
+            .expect("按月查询");
+        assert_eq!(list.len(), 1, "SQLite 下按月筛选必须能查到");
+        assert_eq!(list[0].id, bill_id);
+        assert_eq!(list[0].created_at, created_at, "时间戳应原样往返");
+        assert_eq!(list[0].book.name, "微信");
+        assert_eq!(list[0].category.name, "餐饮");
+
+        let other = bills
+            .list(&BillFilter {
+                month: Some(NaiveDate::from_ymd_opt(2026, 9, 1).unwrap()),
+                ..Default::default()
+            })
+            .await
+            .expect("按月查询");
+        assert!(other.is_empty(), "别的月份不该查出来");
+
+        let by_year = bills
+            .list(&BillFilter {
+                year: Some(2026),
+                ..Default::default()
+            })
+            .await
+            .expect("按年查询");
+        assert_eq!(by_year.len(), 1, "SQLite 下按年筛选也要能查到");
+
+        // 每月起始金额：upsert 与读回
+        months
+            .set_start_balance(month, 100_000)
+            .await
+            .expect("写起始金额");
+        assert_eq!(
+            months.start_balance(month).await.expect("读起始金额"),
+            100_000
+        );
+        assert_eq!(
+            months
+                .start_balance(NaiveDate::from_ymd_opt(2026, 9, 1).unwrap())
+                .await
+                .expect("读起始金额"),
+            0,
+            "没设过的月份应为 0"
+        );
+
+        // 「计入日历」开关与更新
+        bills.set_excluded(bill_id, true).await.expect("标记不计入");
+        let reloaded = bills.get(bill_id).await.expect("取单条").expect("应存在");
+        assert!(reloaded.excluded, "排除标记应落库");
+
+        bills
+            .update(
+                bill_id,
+                BillKind::Income,
+                5000,
+                book_id,
+                category_id,
+                created_at,
+                None,
+            )
+            .await
+            .expect("更新");
+        let updated = bills.get(bill_id).await.expect("取单条").expect("应存在");
+        assert_eq!(updated.amount, 5000);
+        assert_eq!(updated.kind, BillKind::Income);
+        assert!(updated.excluded, "更新不应动「计入日历」");
+
+        // 外键约束在 SQLite 下同样生效，且要能被识别成友好提示
+        let error = bills
+            .insert(
+                BillKind::Expense,
+                1,
+                999_999,
+                category_id,
+                created_at,
+                None,
+            )
+            .await
+            .expect_err("指向不存在的账本，应触发外键冲突");
+        let sqlx_error = error
+            .downcast_ref::<sqlx::Error>()
+            .expect("DAO 应把 sqlx 错误原样往上抛");
+        assert!(
+            is_foreign_key_violation(sqlx_error),
+            "SQLite 的外键错误也要能识别：{error:?}"
+        );
+
+        // 唯一约束（账本重名）
+        let error = books.insert("微信").await.expect_err("重名账本应被拒绝");
+        let sqlx_error = error
+            .downcast_ref::<sqlx::Error>()
+            .expect("DAO 应把 sqlx 错误原样往上抛");
+        assert!(
+            is_unique_violation(sqlx_error),
+            "SQLite 的唯一约束错误也要能识别：{error:?}"
+        );
+
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

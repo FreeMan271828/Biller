@@ -79,6 +79,12 @@ fn render_tabs(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_body(frame: &mut Frame, area: Rect, app: &App) {
+    // 还没连上库时先显示引导页；但设置页照常放行，否则用户没有配库的入口
+    if app.needs_setup && app.page != Page::Settings {
+        render_setup(frame, area, app);
+        return;
+    }
+
     match app.page {
         Page::Overview => render_overview(frame, area, app),
         Page::Bills => render_bills(frame, area, app),
@@ -88,25 +94,99 @@ fn render_body(frame: &mut Frame, area: Rect, app: &App) {
     }
 }
 
-/// 设置页：上面「连接 | 账本」，中间「分类」，下面操作提示。
+/// 连不上数据库时的引导页：告诉用户去哪儿配、配成什么样。
+fn render_setup(frame: &mut Frame, area: Rect, app: &App) {
+    let lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "  ⚠ 还没有可用的数据库连接",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  当前目标   ", Style::default().fg(MUTED)),
+            Span::styled(
+                db::redact(&app.connection_url),
+                Style::default().fg(Color::White),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  按 5 进入「设置 → 数据库连接」，把连接串改对：",
+            Style::default().fg(Color::White),
+        )),
+        Line::from(vec![
+            Span::styled("    · 本地文件（零配置）  ", Style::default().fg(ACCENT)),
+            Span::raw("sqlite:C:/Users/你/.biller/biller.db"),
+        ]),
+        Line::from(vec![
+            Span::styled("    · 远程 PostgreSQL     ", Style::default().fg(ACCENT)),
+            Span::raw("postgres://user:pass@127.0.0.1:5432/biller"),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  改完回车保存，界面会立刻切过去；数据也都还在。",
+            Style::default().fg(MUTED),
+        )),
+    ];
+
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::bordered()
+                .title(" 首次使用 · 配置数据库 ")
+                .border_style(Style::default().fg(Color::Yellow)),
+        ),
+        area,
+    );
+}
+
+/// 设置页：**左边一级菜单、右边二级内容**。
 ///
-/// `←` `→` 在三个分区之间切焦点，当前分区的边框会高亮 —— `a` / `e` / `d` 只作用于它。
+/// 三块并排太挤，改成两级：`←` `→` 切菜单项，右边只画当前那一项的面板，
+/// `a` / `e` / `d` 就作用在右边这块上。
 fn render_settings(frame: &mut Frame, area: Rect, app: &App) {
-    let rows = Layout::vertical([
-        Constraint::Length(8),
-        Constraint::Min(5),
-        Constraint::Length(5),
-    ])
-    .split(area);
+    let cols = Layout::horizontal([Constraint::Length(20), Constraint::Min(30)]).split(area);
 
-    let top =
-        Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)]).split(rows[0]);
+    render_settings_menu(frame, cols[0], app);
 
-    let focus = app.settings_section;
-    render_connection_panel(frame, top[0], app, focus == SettingsSection::Connection);
-    render_books_panel(frame, top[1], app, focus == SettingsSection::Books);
-    render_categories_panel(frame, rows[1], app, focus == SettingsSection::Categories);
-    render_settings_tips(frame, rows[2], app);
+    let rows = Layout::vertical([Constraint::Min(6), Constraint::Length(5)]).split(cols[1]);
+    match app.settings_section {
+        SettingsSection::Connection => render_connection_panel(frame, rows[0], app, true),
+        SettingsSection::Books => render_books_panel(frame, rows[0], app, true),
+        SettingsSection::Categories => render_categories_panel(frame, rows[0], app, true),
+    }
+    render_settings_tips(frame, rows[1], app);
+}
+
+/// 一级菜单：数据库连接 / 账本 / 分类。
+fn render_settings_menu(frame: &mut Frame, area: Rect, app: &App) {
+    let mut lines = Vec::new();
+    for section in SettingsSection::ALL {
+        let focused = section == app.settings_section;
+        let marker = if focused { "▶ " } else { "  " };
+
+        lines.push(Line::from(Span::styled(
+            format!(" {marker}{}", section.title()),
+            if focused {
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Gray)
+            },
+        )));
+        // 每条之间空一行，菜单不至于挤成一坨
+        lines.push(Line::from(""));
+    }
+
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::bordered()
+                .title(" 设置 ")
+                .border_style(Style::default().fg(MUTED)),
+        ),
+        area,
+    );
 }
 
 /// 面板边框：当前分区用强调色，其余压暗。
@@ -1238,7 +1318,8 @@ mod tests {
     use crate::month::model::{BillMonthCollection, YearCollection};
     use crate::month::service::{MonthReport, YearReport};
     use crate::plan::model::{PlanProgress, SpendingPlan};
-    use crate::tui::app::{Action, Form, Modal};
+    use crate::tui::app::{Action, Form, Modal, Page, SettingsSection};
+    use crate::tui::input::Key;
     use chrono::{NaiveDate, TimeZone, Utc};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -1248,6 +1329,7 @@ mod tests {
         let mut app = App::new(
             month,
             "postgres://postgres:postgres@127.0.0.1:5432/biller",
+            "C:/Users/test/.biller/biller.db",
         );
 
         app.books = vec![
@@ -1490,6 +1572,53 @@ mod tests {
 
         // 换分区不该改变页面
         assert_eq!(app.page, Page::Settings);
+    }
+
+    #[test]
+    fn connection_form_renders_both_modes() {
+        let mut app = sample_app();
+        app.page = Page::Settings;
+        app.settings_section = SettingsSection::Connection;
+
+        // 远程模式：模式预选 PostgreSQL，PG 各项都在
+        app.on_key(Key::Char('e'));
+        let screen = render_screen(&app, 120, 44);
+        assert!(screen.contains("模式"), "应有模式选择：\n{screen}");
+        assert!(screen.contains("PostgreSQL"), "{screen}");
+        assert!(screen.contains("文件路径"), "本地文件路径也要能填：\n{screen}");
+
+        // 本地模式：预选本地文件，并停在文件路径那一行
+        app.modal = None;
+        app.connection_url = "sqlite:C:/Users/test/.biller/biller.db".to_string();
+        app.on_key(Key::Char('e'));
+        let screen = render_screen(&app, 120, 44);
+        assert!(screen.contains("本地文件"), "{screen}");
+        assert!(screen.contains("biller.db"), "{screen}");
+    }
+
+    #[test]
+    fn setup_screen_shows_when_no_database() {
+        let mut app = sample_app();
+        app.mark_needs_setup();
+
+        let screen = render_screen(&app, 110, 24);
+        assert!(
+            screen.contains("还没有可用的数据库连接"),
+            "没库时应显示引导页：\n{screen}"
+        );
+        assert!(
+            screen.contains("sqlite:C:/Users"),
+            "应给出本地文件的写法示例：\n{screen}"
+        );
+
+        // 设置页必须放行，否则用户连配库的入口都没有
+        app.page = Page::Settings;
+        let screen = render_screen(&app, 110, 24);
+        assert!(
+            !screen.contains("还没有可用的数据库连接"),
+            "设置页不该被引导页挡住：\n{screen}"
+        );
+        assert!(screen.contains("数据库连接"), "{screen}");
     }
 
     #[test]

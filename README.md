@@ -49,23 +49,37 @@ src/
 
 ## 快速开始
 
+**零配置**：不带任何参数跑起来就行，默认用本地 SQLite 文件
+`%USERPROFILE%\.biller\biller.db`（目录和文件都会自动创建）。
+
 ```bash
-# 1) 配置连接串（也可用 --database-url，或导出环境变量 DATABASE_URL）
-cp .env.example .env
-
-# 2) 建库 + 建表（幂等，可重复执行）
-cargo run -- init
-
-# 3) 打开交互式界面（不带子命令时也是这个）
+# 直接用（首次运行会自动建好本地库）
 cargo run --
 
-# 4) 或者用命令行
+# 或者用命令行
 cargo run -- bill add expense 12.34 --book 微信 --category 餐饮 --remark 午饭
 cargo run -- month show --month 2026-10
 ```
 
-连接串优先级：`--database-url` > `.env`（**设置页保存的就是它**）> 环境变量 `DATABASE_URL`
-> 内置默认值 `postgres://postgres:postgres@127.0.0.1:5432/biller`。
+想换库的话，三种方式任选：
+
+```bash
+# 1) 只这一次：命令行参数（postgres:// 或 sqlite: 开头都行）
+cargo run -- --database-url "postgres://postgres:postgres@127.0.0.1:5432/biller" init
+cargo run -- --database-url "sqlite:D:/我的账单/biller.db" init
+
+# 2) 写进 %USERPROFILE%\.biller\config.toml（推荐，界面里改的也是它）
+#    mode = "local" / "postgres"、sqlite_path、postgres_url
+
+# 3) 界面里改：按 5 进设置 → 选「数据库连接」→ e
+#    第一项「模式」在 本地文件 / PostgreSQL 之间切，回车保存后界面立刻切过去
+```
+
+连接串优先级：`--database-url` > `DATABASE_URL` 环境变量（含 `.env`）
+> `%USERPROFILE%\.biller\config.toml` > 内置默认（**本地 SQLite**）。
+
+> **连不上也进得去界面。** 数据库没起来时不会直接退出，而是显示一张引导页，
+> 告诉你当前目标是什么、该怎么填；按 `5` 进设置改好连接串，回车保存就切过去了。
 
 ### 设置页（数据库连接）
 
@@ -273,6 +287,25 @@ biller month show [--month YYYY-MM]                  查看月度报表
 
 收入 / 支出 / 结余不单独落库，由 `bills` 实时汇总得出，避免数据不一致。
 
+### 两个后端怎么共存的
+
+一套代码同时支持 PostgreSQL 与本地 SQLite，做法是：
+
+- **连接池**统一用 `sqlx::Any`（`common/db.rs` 的 `Pool`），`connect()` 看连接串前缀
+  自动认后端（`postgres://…` 或 `sqlite:…`），SQLite 会顺手把父目录建出来；
+- **建表语句两份**：`common/schema.sql`、`common/schema_sqlite.sql`，
+  `init_schema()` 按后端挑；
+- **占位符**：全项目统一写 `?`，发起前由 `Pool::shared()/sql()` 改写成 PostgreSQL 的 `$n`
+  —— `Any` **不会**替你做这件事（直接发 `?` 给 PG 会报 `syntax error at end of input`）；
+- **时间戳**：`Any` 不支持 chrono 类型，所以时间/月份全程以 ISO 文本进出：
+  PG 侧读用 `to_char(... 'YYYY-MM-DD HH24:MI:SS')`、写用 `?::timestamptz`，
+  SQLite 侧就是普通 TEXT 列；月份筛选两边绑同一个 `YYYY-MM-DD` 文本，
+  SQLite 侧用 `substr(?, 1, 7)` 取前缀比对，这样绑定链不用分叉；
+- **SQLite 的差异点**：布尔是 0/1 的 INTEGER（读出来按整数处理，写用 `(? = 1)`）、
+  `IS NOT DISTINCT FROM` 要换成 `IS`、`ANY(?)` 绑不了数组（改成 `IN (?, ?, …)`）、
+  URL 必须带 `?mode=rwc`（否则 sqlx 不会创建文件，报 `unable to open database file (code 14)`）；
+- **整库数据迁移**目前只支持 PostgreSQL → PostgreSQL，碰到 SQLite 会明确报错而不是悄悄跑一半。
+
 ## 测试
 
 ```bash
@@ -283,7 +316,10 @@ cargo test          # 金额/时间/宽度、分类树展开与递归子树、TU
 
 - 月度汇总按 `book.id` / `category.id` 分桶（原实现误用账单 id）；
 - 分类树在「父节点缺失」与「数据成环」两种异常下都不丢数据、不死循环；
-- TUI 用 `TestBackend` 无头渲染每个页面并断言内容。
+- TUI 用 `TestBackend` 无头渲染每个页面并断言内容；
+- **本地 SQLite 端到端**：临时文件上建表 → 记账 → 按月/按年查询 → 时间戳往返 →
+  起始金额 upsert → 「计入日历」开关 → 外键与唯一约束都被识别成友好提示；
+- 连不上数据库时**仍然进界面**并显示引导页（设置页必须放行，否则用户没有配库入口）。
 
 还有一条**需要真实数据库**的用例（验证外键冲突被翻译成单行友好提示），默认跳过：
 

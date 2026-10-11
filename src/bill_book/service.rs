@@ -1,7 +1,7 @@
 //! 账本业务规则：本领域对外的唯一入口，账单领域通过它解析账本。
 
 use anyhow::{Context, Result, bail};
-use sqlx::PgPool;
+use crate::common::db::Pool;
 
 use crate::bill_book::dao::BookDao;
 use crate::bill_book::model::BillBook;
@@ -14,7 +14,7 @@ pub struct BookService {
 }
 
 impl BookService {
-    pub fn new(pool: PgPool) -> Self {
+    pub fn new(pool: Pool) -> Self {
         Self {
             dao: BookDao::new(pool),
         }

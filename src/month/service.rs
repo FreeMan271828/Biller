@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use anyhow::Result;
 use chrono::NaiveDate;
-use sqlx::PgPool;
+use crate::common::db::Pool;
 
 use crate::bill::service::BillService;
 use crate::bill_book::service::BookService;
@@ -40,7 +40,7 @@ pub struct MonthService {
 }
 
 impl MonthService {
-    pub fn new(pool: PgPool) -> Self {
+    pub fn new(pool: Pool) -> Self {
         Self {
             dao: MonthDao::new(pool.clone()),
             bills: BillService::new(pool.clone()),

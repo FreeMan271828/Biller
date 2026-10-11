@@ -454,11 +454,24 @@ impl Form {
     }
 
     /// 数据库连接设置（设置页按 `e`）。
-    pub fn connection(settings: &ConnectionSettings) -> Self {
-        Self {
+    ///
+    /// 第一项是模式：本地文件 / PostgreSQL。选本地时只用到「文件路径」，
+    /// 选远程时才用到下面那五个。
+    pub fn connection(settings: &ConnectionSettings, sqlite_path: &str, local: bool) -> Self {
+        let modes = vec!["本地文件".to_string(), "PostgreSQL".to_string()];
+        let initial = if local { "本地文件" } else { "PostgreSQL" };
+
+        let mut form = Self {
             kind: FormKind::Connection,
             title: "数据库连接",
             fields: vec![
+                Field::choice_with(
+                    "模式",
+                    modes,
+                    initial.to_string(),
+                    "本地文件 = 零配置；PostgreSQL = 远程库",
+                ),
+                Field::text("文件路径", sqlite_path.to_string(), "本地库文件，目录会自动创建"),
                 Field::text("主机", settings.host.clone(), "IP 或主机名"),
                 Field::text("端口", settings.port.to_string(), "默认 5432"),
                 Field::text("用户名", settings.user.clone(), "PostgreSQL 用户"),
@@ -467,20 +480,27 @@ impl Form {
             ],
             focus: 0,
             target: None,
-        }
+        };
+
+        form.focus = if local { 1 } else { 2 };
+        form
     }
 
-    /// 数据迁移的目标库（设置页按 `t`）。源库固定是「当前连接」。
-    pub fn migrate_target(settings: &ConnectionSettings) -> Self {        let mut form = Self::connection(settings);
-        form.kind = FormKind::MigrateData;
-        form.title = "数据迁移（源库 = 当前连接）";
-
-        // 字段顺序：主机 / 端口 / 用户名 / 密码 / 数据库
-        if let Some(field) = form.fields.get_mut(4) {
-            field.hint = "目标库：会被清空后写入源库的全部数据";
+    /// 数据迁移的目标库（设置页按 `t`）。源库固定是「当前连接」，只支持远程。
+    pub fn migrate_target(settings: &ConnectionSettings) -> Self {
+        Self {
+            kind: FormKind::MigrateData,
+            title: "数据迁移（源库 = 当前连接）",
+            fields: vec![
+                Field::text("主机", settings.host.clone(), "IP 或主机名"),
+                Field::text("端口", settings.port.to_string(), "默认 5432"),
+                Field::text("用户名", settings.user.clone(), "PostgreSQL 用户"),
+                Field::text("密码", settings.password.clone(), "会以明文写进 .env"),
+                Field::text("数据库", settings.database.clone(), "目标库：会被清空后写入源库的全部数据"),
+            ],
+            focus: 0,
+            target: None,
         }
-
-        form
     }
 
     pub fn value(&self, label: &str) -> &str {
@@ -590,7 +610,7 @@ pub enum Action {
         recursive: bool,
     },
     /// 保存连接设置并尝试立即切换（连接池由外壳重建）。
-    SaveConnection(ConnectionSettings),
+    SaveConnection(ConnectionTarget),
     /// 建库 + 建表（初始化），由外壳执行。
     InitDatabase,
     /// 把当前库的全部数据迁移到目标库，由外壳执行。
@@ -599,6 +619,17 @@ pub enum Action {
     UndoDelete,
     /// 切换一条账单是否纳入统计（账单页 `x`）。
     ToggleExcluded(u64),
+}
+
+/// 设置页保存的连接目标：本地文件还是远程库。
+#[derive(Debug, Clone)]
+pub enum ConnectionTarget {
+    /// 本地 SQLite 文件（默认，零配置）。
+    Local {
+        path: String,
+    },
+    /// 远程 PostgreSQL。
+    Remote(ConnectionSettings),
 }
 
 /// 最近一次删除的内容，供 `u` 撤销。
@@ -631,6 +662,8 @@ pub struct App {
     pub connection: ConnectionSettings,
     /// 当前生效的完整连接串。
     pub connection_url: String,
+    /// 本地模式的库文件路径（来自配置文件，设置页可改）。
+    pub sqlite_path: String,
     /// 最近一次删除，按 `u` 撤销。
     pub last_deleted: Option<DeletedRecord>,
     /// 设置页当前焦点所在的分区。
@@ -643,6 +676,8 @@ pub struct App {
     pub progress: Option<PlanProgress>,
     /// 概览页正在查看的那一天（1..=当月天数），`←` `→` 移动。
     pub selected_day: u32,
+    /// 还没连上数据库：界面显示配置引导页，而不是直接不给进。
+    pub needs_setup: bool,
     /// 上次记账用过的日期（跨会话记忆）；`None` 表示还没记过。
     /// 新增表单里留空即今天，按空格才把它填进去。
     pub last_entry_date: Option<NaiveDate>,
@@ -662,7 +697,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(month: NaiveDate, connection_url: &str) -> Self {
+    pub fn new(month: NaiveDate, connection_url: &str, sqlite_path: &str) -> Self {
         let today = Self::today();
 
         Self {
@@ -671,6 +706,7 @@ impl App {
             year: month.year(),
             connection: ConnectionSettings::from_url(connection_url),
             connection_url: connection_url.to_string(),
+            sqlite_path: sqlite_path.to_string(),
             last_deleted: None,
             settings_section: SettingsSection::Connection,
             settings_selected: [0; SettingsSection::ALL.len()],
@@ -682,6 +718,7 @@ impl App {
             } else {
                 1
             },
+            needs_setup: false,
             last_entry_date: None,
             last_entry_book: None,
             selected: [0; Page::ALL.len()],
@@ -1032,7 +1069,11 @@ impl App {
         let form = match self.page {
             // 设置页按 `a` 新建的，是当前分区里的东西
             Page::Settings => match self.settings_section {
-                SettingsSection::Connection => Form::connection(&self.connection),
+                SettingsSection::Connection => Form::connection(
+                    &self.connection,
+                    &self.sqlite_path,
+                    self.connection_url.starts_with("sqlite:"),
+                ),
                 SettingsSection::Books => Form::new_book(),
                 SettingsSection::Categories => Form::new_category(self.parent_options(None)),
             },
@@ -1064,7 +1105,11 @@ impl App {
             }
             // 设置页按 `e`：改的是当前分区里的东西
             Page::Settings => match self.settings_section {
-                SettingsSection::Connection => Some(Form::connection(&self.connection)),
+                SettingsSection::Connection => Some(Form::connection(
+                    &self.connection,
+                    &self.sqlite_path,
+                    self.connection_url.starts_with("sqlite:"),
+                )),
                 SettingsSection::Books => self.selected_book().map(Form::edit_book),
                 SettingsSection::Categories => self.selected_category().and_then(|node| {
                     let options = self.parent_options(Some(node.category.id));
@@ -1398,13 +1443,23 @@ impl App {
                         // 连接设置与数据迁移都要重建连接池，交给外壳执行
                         if matches!(form.kind, FormKind::Connection | FormKind::MigrateData) {
                             match connection_from_form(&form) {
-                                Ok(settings) => {
+                                // 迁移只支持远程库：本地模式只在「数据库连接」里可选
+                                Ok(ConnectionTarget::Local { path })
+                                    if form.kind == FormKind::Connection =>
+                                {
+                                    keep_open = false;
+                                    action = Action::SaveConnection(ConnectionTarget::Local { path });
+                                }
+                                Ok(ConnectionTarget::Remote(settings)) => {
                                     keep_open = false;
                                     action = if form.kind == FormKind::Connection {
-                                        Action::SaveConnection(settings)
+                                        Action::SaveConnection(ConnectionTarget::Remote(settings))
                                     } else {
                                         Action::MigrateData(settings)
                                     };
+                                }
+                                Ok(ConnectionTarget::Local { .. }) => {
+                                    keep_open = true;
                                 }
                                 Err(error) => self.set_error(format!("{error}")),
                             }
@@ -1683,8 +1738,25 @@ impl App {
         Ok(())
     }
 
+    /// 没有可用连接时进入引导状态：清空数据并标记，让界面显示配置引导页。
+    ///
+    /// 关键是**仍然把 UI 交给用户**——不然连不上库就进不去，连改设置的入口都没有。
+    pub fn mark_needs_setup(&mut self) {
+        self.needs_setup = true;
+        self.books.clear();
+        self.categories.clear();
+        self.bills.clear();
+        self.report = None;
+        self.year_report = None;
+        self.progress = None;
+        self.modal = None;
+    }
+
     /// 重新读取当前页需要的数据。
     pub async fn reload(&mut self, services: &Services) -> Result<()> {
+        // 能读到数据就说明连接是通的，引导页可以收起来了
+        self.needs_setup = false;
+
         self.books = services.books.list().await?;
         self.categories = services.categories.tree().await?;
         self.bills = services.bills.list_in_month(self.month).await?;
@@ -1888,7 +1960,13 @@ fn parent_from_form(form: &Form) -> Option<String> {
 }
 
 /// 从表单构造连接设置，顺带做基本校验。
-fn connection_from_form(form: &Form) -> Result<ConnectionSettings> {
+fn connection_from_form(form: &Form) -> Result<ConnectionTarget> {
+    // 第一项是模式；选本地时只读文件路径
+    if form.value("模式") == "本地文件" {
+        let path = require(form.value("文件路径"), "本地库文件路径不能为空")?.to_string();
+        return Ok(ConnectionTarget::Local { path });
+    }
+
     let host = require(form.value("主机"), "主机不能为空")?.to_string();
     let user = require(form.value("用户名"), "用户名不能为空")?.to_string();
     let database = require(form.value("数据库"), "数据库名不能为空")?.to_string();
@@ -1901,13 +1979,13 @@ fn connection_from_form(form: &Form) -> Result<ConnectionSettings> {
         bail!("端口必须是 1-65535 之间的数字");
     }
 
-    Ok(ConnectionSettings {
+    Ok(ConnectionTarget::Remote(ConnectionSettings {
         host,
         port,
         user,
         password: form.value("密码").to_string(),
         database,
-    })
+    }))
 }
 
 fn require<'a>(value: &'a str, message: &str) -> Result<&'a str> {
@@ -1946,10 +2024,11 @@ mod tests {
 
     /// 测试用连接串：各字段值都便于断言。
     const TEST_CONNECTION_URL: &str = "postgres://postgres:postgres@127.0.0.1:5432/biller";
+    const TEST_SQLITE_PATH: &str = "C:/Users/test/.biller/biller.db";
 
     fn sample_app() -> App {
         let month = NaiveDate::from_ymd_opt(2026, 10, 1).unwrap();
-        let mut app = App::new(month, TEST_CONNECTION_URL);
+        let mut app = App::new(month, TEST_CONNECTION_URL, TEST_SQLITE_PATH);
 
         app.books = vec![
             BillBook {
@@ -2126,7 +2205,11 @@ mod tests {
 
     #[test]
     fn bill_form_falls_back_to_text_on_empty_database() {
-        let mut app = App::new(NaiveDate::from_ymd_opt(2026, 10, 1).unwrap(), TEST_CONNECTION_URL);
+        let mut app = App::new(
+            NaiveDate::from_ymd_opt(2026, 10, 1).unwrap(),
+            TEST_CONNECTION_URL,
+            TEST_SQLITE_PATH,
+        );
         app.page = Page::Bills;
         app.on_key(Key::Char('a'));
 
@@ -2466,6 +2549,22 @@ mod tests {
         assert_eq!(app.settings_index(), 0);
     }
 
+    #[test]
+    fn mark_needs_setup_clears_data_and_flags() {
+        let mut app = sample_app();
+        assert!(!app.needs_setup, "有连接时不该进引导状态");
+
+        app.mark_needs_setup();
+
+        assert!(app.needs_setup, "应标记为待配置");
+        assert!(app.books.is_empty());
+        assert!(app.categories.is_empty());
+        assert!(app.bills.is_empty());
+        assert!(app.report.is_none());
+        assert!(app.progress.is_none());
+        assert!(app.modal.is_none());
+    }
+
     fn sample_bill(id: u64, amount: i64) -> BillEntity {
         BillEntity {
             id,
@@ -2731,7 +2830,7 @@ mod tests {
 
         let action = app.on_key(Key::Enter);
         match action {
-            Action::SaveConnection(settings) => {
+            Action::SaveConnection(ConnectionTarget::Remote(settings)) => {
                 assert_eq!(settings.host, "127.0.0.1");
                 assert_eq!(settings.port, 6543);
                 assert_eq!(settings.database, "biller");
@@ -2739,6 +2838,31 @@ mod tests {
             other => panic!("回车应产出 SaveConnection，实际 {other:?}"),
         }
         assert!(app.modal.is_none(), "保存后表单应关闭");
+    }
+
+    #[test]
+    fn connection_form_can_switch_to_local_file() {
+        let mut app = sample_app();
+        app.page = Page::Settings;
+        app.connection_url = "sqlite:C:/Users/test/.biller/biller.db".to_string();
+
+        app.on_key(Key::Char('e'));
+        match &app.modal {
+            Some(Modal::Form(form)) => {
+                assert_eq!(form.value("模式"), "本地文件", "本地连接应预选本地模式");
+                assert_eq!(form.value("文件路径"), TEST_SQLITE_PATH);
+            }
+            other => panic!("应打开连接表单，实际 {other:?}"),
+        }
+
+        // 直接回车提交：本地模式只要文件路径，不缺 PG 那几个必填项
+        let action = app.on_key(Key::Enter);
+        match action {
+            Action::SaveConnection(ConnectionTarget::Local { path }) => {
+                assert_eq!(path, TEST_SQLITE_PATH);
+            }
+            other => panic!("应产出本地目标，实际 {other:?}"),
+        }
     }
 
     #[test]

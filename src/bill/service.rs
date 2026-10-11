@@ -4,7 +4,7 @@
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, NaiveDate, Utc};
-use sqlx::PgPool;
+use crate::common::db::Pool;
 
 use crate::bill::dao::{BillDao, BillFilter};
 use crate::bill::model::{BillEntity, BillKind};
@@ -49,7 +49,7 @@ pub struct BillService {
 }
 
 impl BillService {
-    pub fn new(pool: PgPool) -> Self {
+    pub fn new(pool: Pool) -> Self {
         Self {
             dao: BillDao::new(pool.clone()),
             books: BookService::new(pool.clone()),

@@ -4,34 +4,35 @@
 //! 存数据库而不是本地文件：换机器、重启都还能沿用。
 
 use anyhow::Result;
-use sqlx::PgPool;
+use crate::common::db::Pool;
 
 #[derive(Clone)]
 pub struct StateStore {
-    pool: PgPool,
+    pool: Pool,
 }
 
 impl StateStore {
-    pub fn new(pool: PgPool) -> Self {
+    pub fn new(pool: Pool) -> Self {
         Self { pool }
     }
 
     pub async fn get(&self, key: &str) -> Result<Option<String>> {
-        let row: Option<(String,)> = sqlx::query_as("SELECT value FROM app_state WHERE key = $1")
-            .bind(key)
-            .fetch_optional(&self.pool)
-            .await?;
+        let row: Option<(String,)> =
+            sqlx::query_as(&self.pool.shared("SELECT value FROM app_state WHERE key = ?"))
+                .bind(key)
+                .fetch_optional(self.pool.any())
+                .await?;
         Ok(row.map(|(value,)| value))
     }
 
     pub async fn set(&self, key: &str, value: &str) -> Result<()> {
-        sqlx::query(
-            "INSERT INTO app_state (key, value) VALUES ($1, $2)
+        sqlx::query(&self.pool.shared(
+            "INSERT INTO app_state (key, value) VALUES (?, ?)
              ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
-        )
+        ))
         .bind(key)
         .bind(value)
-        .execute(&self.pool)
+        .execute(self.pool.any())
         .await?;
         Ok(())
     }
