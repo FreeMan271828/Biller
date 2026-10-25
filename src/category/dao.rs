@@ -45,11 +45,14 @@ impl CategoryDao {
     }
 
     /// 顶层在前，同层按 id。
+    ///
+    /// 两个后端都支持 `NULLS FIRST`（SQLite 3.30+），所以这条不必分叉；
+    /// 但 SQL 仍然经过 `shared()`，保持「所有 SQL 都走统一入口」的约定。
     pub async fn list(&self) -> Result<Vec<Category>> {
-        let rows = sqlx::query_as::<_, CategoryRow>(
+        let rows = sqlx::query_as::<_, CategoryRow>(&self.pool.shared(
             "SELECT id, parent_id, name FROM categories
              ORDER BY parent_id NULLS FIRST, id",
-        )
+        ))
         .fetch_all(self.pool.any())
         .await?;
         Ok(rows.into_iter().map(Category::from).collect())

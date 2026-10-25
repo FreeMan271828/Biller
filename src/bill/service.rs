@@ -4,11 +4,13 @@
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, NaiveDate, Utc};
-use crate::common::db::Pool;
+use crate::common::db::{Pool, Tx};
 
 use crate::bill::dao::{BillDao, BillFilter};
 use crate::bill::model::{BillEntity, BillKind};
+use crate::bill_book::model::BillBook;
 use crate::bill_book::service::BookService;
+use crate::category::model::Category;
 use crate::category::service::CategoryService;
 use crate::common::types::{AmountType, BillId};
 
@@ -92,12 +94,7 @@ impl BillService {
     ///
     /// 返回账单本体，以及本次自动创建了哪些账本/分类（供终端提示）。
     pub async fn add(&self, new: NewBill) -> Result<(BillEntity, Vec<String>)> {
-        if new.amount <= 0 {
-            bail!("金额必须大于 0（收入/支出方向由 kind 决定）");
-        }
-
-        let (book, book_created) = self.books.resolve_or_create(&new.book).await?;
-        let (category, category_created) = self.categories.resolve_or_create(&new.category).await?;
+        let (book, category, auto_created) = self.prepare_entry(&new).await?;
 
         let id = self
             .dao
@@ -116,6 +113,25 @@ impl BillService {
             .await?;
         self.remember_entry_book(&book.name).await?;
 
+        Ok((entity(id, &new, book, category), auto_created))
+    }
+
+    /// 入账前的准备：校验金额，并把「账本 / 分类名称」解析成实体（不存在则自动创建）。
+    ///
+    /// 银行同步要在**一个事务**里写「账单 + 导入标记 + 记忆」，因此把解析与插入拆开：
+    /// 解析可能写库（自动建账本/分类），放在事务外更稳妥；插入走
+    /// [`BillService::insert_prepared`] 进入调用方的事务。
+    pub async fn prepare_entry(&self, new: &NewBill) -> Result<(BillBook, Category, Vec<String>)> {
+        if new.amount <= 0 {
+            bail!("金额必须大于 0（收入/支出方向由 kind 决定）");
+        }
+
+        let (book, book_created) = self.books.resolve_or_create(&new.book).await?;
+        let (category, category_created) = self
+            .categories
+            .resolve_or_create(&new.category)
+            .await?;
+
         let mut auto_created = Vec::new();
         if book_created {
             auto_created.push(format!("账本「{}」", book.name));
@@ -124,20 +140,38 @@ impl BillService {
             auto_created.push(format!("分类「{}」", category.name));
         }
 
-        Ok((
-            BillEntity {
-                id,
-                kind: new.kind,
-                amount: new.amount,
-                book,
-                category,
-                created_at: new.created_at,
-                remark: new.remark,
-                // 新账单默认纳入统计
-                excluded: false,
-            },
-            auto_created,
-        ))
+        Ok((book, category, auto_created))
+    }
+
+    /// 在调用方的事务里插入一笔已解析好账本/分类的账单。
+    ///
+    /// 与 [`BillService::add`] 的区别：不碰 `app_state`（「上次用的日期/账本」
+    /// 由调用方在提交后自行补记），账单插入参与调用方的事务。
+    pub async fn insert_prepared(
+        &self,
+        tx: &mut Tx<'_>,
+        new: &NewBill,
+        book: BillBook,
+        category: Category,
+    ) -> Result<BillEntity> {
+        if new.amount <= 0 {
+            bail!("金额必须大于 0（收入/支出方向由 kind 决定）");
+        }
+
+        let id = self
+            .dao
+            .insert_in(
+                tx,
+                new.kind,
+                new.amount,
+                book.id,
+                category.id,
+                new.created_at,
+                new.remark.as_deref(),
+            )
+            .await?;
+
+        Ok(entity(id, new, book, category))
     }
 
     /// 修改一笔账单（整体覆盖，未变的字段由调用方沿用原值）。
@@ -258,6 +292,137 @@ impl BillService {
     }
 }
 
+/// 由插入结果拼出账单实体（新账单默认纳入统计）。
+fn entity(id: BillId, new: &NewBill, book: BillBook, category: Category) -> BillEntity {
+    BillEntity {
+        id,
+        kind: new.kind,
+        amount: new.amount,
+        book,
+        category,
+        created_at: new.created_at,
+        remark: new.remark.clone(),
+        excluded: false,
+    }
+}
+
 fn non_empty(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|text| !text.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    use crate::common::db;
+
+    /// 临时 SQLite 文件 + 建表；返回池与目录（测试结束删目录）。
+    async fn setup() -> (Pool, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "biller-bill-svc-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let pool = db::connect(&db::sqlite_url(&dir.join("biller.db")))
+            .await
+            .expect("连接临时 SQLite");
+        db::init_schema(&pool).await.expect("建表");
+
+        (pool, dir)
+    }
+
+    fn new_bill(amount: AmountType) -> NewBill {
+        NewBill {
+            kind: BillKind::Expense,
+            amount,
+            book: "微信".to_string(),
+            category: "餐饮".to_string(),
+            created_at: Utc.with_ymd_and_hms(2026, 10, 5, 12, 0, 0).unwrap(),
+            remark: Some("午饭".to_string()),
+        }
+    }
+
+    /// 事务内插入：提交才可见，未提交必须整体回滚（银行同步的原子性靠它）。
+    #[tokio::test]
+    async fn insert_prepared_obeys_the_callers_transaction() {
+        let (pool, dir) = setup().await;
+        let service = BillService::new(pool.clone());
+
+        // 提交路径
+        let input = new_bill(1234);
+        let (book, category, _) = service.prepare_entry(&input).await.unwrap();
+        let mut tx = pool.any().begin().await.unwrap();
+        let bill = service
+            .insert_prepared(&mut tx, &input, book, category)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(service.get(bill.id).await.unwrap().amount, 1234);
+
+        // 回滚路径：不提交直接丢弃事务，账单不能留下
+        let input = new_bill(999);
+        let (book, category, _) = service.prepare_entry(&input).await.unwrap();
+        let mut tx = pool.any().begin().await.unwrap();
+        let ghost = service
+            .insert_prepared(&mut tx, &input, book, category)
+            .await
+            .unwrap();
+        drop(tx);
+        assert!(
+            service.get(ghost.id).await.is_err(),
+            "未提交的账单必须随事务回滚，不能出现「半笔」入账"
+        );
+
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 按非 1 号日期筛月份也必须命中（PG 侧是 `= 'YYYY-MM-01'::date`，不归一会查不到）。
+    #[tokio::test]
+    async fn month_filter_accepts_any_day_of_the_month() {
+        let (pool, dir) = setup().await;
+        let service = BillService::new(pool.clone());
+
+        let (bill, _) = service.add(new_bill(500)).await.unwrap();
+
+        let by_fifteenth = service
+            .list(BillQuery {
+                month: Some(NaiveDate::from_ymd_opt(2026, 10, 15).unwrap()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(by_fifteenth.len(), 1, "传当月任意一天都应筛出整月");
+        assert_eq!(by_fifteenth[0].id, bill.id);
+
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 负数 / 0 的 limit 视为不限条数（两个后端对负 LIMIT 的处理不同，必须归一）。
+    #[tokio::test]
+    async fn non_positive_limit_means_no_limit() {
+        let (pool, dir) = setup().await;
+        let service = BillService::new(pool.clone());
+
+        service.add(new_bill(100)).await.unwrap();
+        service.add(new_bill(200)).await.unwrap();
+
+        for limit in [-1, 0] {
+            let bills = service
+                .list(BillQuery {
+                    limit: Some(limit),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert_eq!(bills.len(), 2, "limit={limit} 应视为不限");
+        }
+
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

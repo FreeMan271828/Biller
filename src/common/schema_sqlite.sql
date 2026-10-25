@@ -5,7 +5,8 @@
 --   * 没有 TIMESTAMPTZ / DATE，时间与月份统一存 **ISO 文本（UTC）**，
 --     这也是 `sqlx::Any` 能同时喂两个后端的前提（Any 不支持 chrono 类型）；
 --   * 布尔用 INTEGER 0/1 存；
---   * 没有 `ADD COLUMN IF NOT EXISTS`，升级列的迁移要走别的路子（见 README）。
+--   * 没有 `ADD COLUMN IF NOT EXISTS`：后加的列（如 bills.excluded）由 `init_schema`
+--     里的 `migrate_sqlite_columns` 按 `pragma_table_info` 检查后补上（见 common/db.rs）。
 
 CREATE TABLE IF NOT EXISTS bill_books (
     id   INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -49,4 +50,40 @@ CREATE TABLE IF NOT EXISTS month_balances (
 CREATE TABLE IF NOT EXISTS app_state (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
+);
+
+-- ===== 银行流水同步 =====
+-- 与 PostgreSQL 版一一对应：时间戳仍是 ISO 文本，布尔是 0/1。
+
+CREATE TABLE IF NOT EXISTS bank_accounts (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_uid    TEXT NOT NULL UNIQUE,
+    sub_account_no TEXT NOT NULL,
+    alias          TEXT NOT NULL DEFAULT '',
+    is_default     INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS bank_imports (
+    fingerprint TEXT PRIMARY KEY,
+    txn_date    TEXT   NOT NULL,
+    txn_money   INTEGER NOT NULL,
+    memo        TEXT   NOT NULL,
+    bill_id     INTEGER REFERENCES bills (id) ON DELETE SET NULL,
+    -- 与 PG 版 DEFAULT now() 对齐：CURRENT_TIMESTAMP 也是 UTC 的 ISO 文本
+    imported_at TEXT   NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS merchant_memory (
+    memo_key     TEXT PRIMARY KEY,
+    book_id      INTEGER NOT NULL REFERENCES bill_books (id) ON DELETE CASCADE,
+    category_id  INTEGER NOT NULL REFERENCES categories (id) ON DELETE CASCADE,
+    hits         INTEGER NOT NULL DEFAULT 1,
+    last_used_at TEXT    NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS keyword_rules (
+    keyword      TEXT PRIMARY KEY,
+    category_id  INTEGER NOT NULL REFERENCES categories (id) ON DELETE CASCADE,
+    hits         INTEGER NOT NULL DEFAULT 1,
+    last_used_at TEXT    NOT NULL DEFAULT CURRENT_TIMESTAMP
 );

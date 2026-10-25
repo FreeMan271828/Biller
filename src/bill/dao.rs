@@ -14,7 +14,7 @@ use chrono::{DateTime, NaiveDate, Utc};
 use crate::bill::model::{BillEntity, BillKind};
 use crate::bill_book::model::BillBook;
 use crate::category::model::Category;
-use crate::common::db::Pool;
+use crate::common::db::{Pool, Tx};
 use crate::common::time;
 use crate::common::types::{AmountType, BillId, BookId, CategoryId};
 
@@ -183,6 +183,18 @@ impl BillDao {
         Self { pool }
     }
 
+    /// 插入语句；[`BillDao::insert`] 与 [`BillDao::insert_in`] 共用，避免两份 SQL 漂移。
+    fn insert_sql(&self) -> String {
+        self.pool.sql(
+            "INSERT INTO bills (kind, amount, book_id, category_id, created_at, remark)
+             VALUES (?, ?, ?, ?, ?::timestamptz, ?)
+             RETURNING id",
+            "INSERT INTO bills (kind, amount, book_id, category_id, created_at, remark)
+             VALUES (?, ?, ?, ?, ?, ?)
+             RETURNING id",
+        )
+    }
+
     pub async fn insert(
         &self,
         kind: BillKind,
@@ -192,14 +204,7 @@ impl BillDao {
         created_at: DateTime<Utc>,
         remark: Option<&str>,
     ) -> Result<BillId> {
-        let sql = self.pool.sql(
-            "INSERT INTO bills (kind, amount, book_id, category_id, created_at, remark)
-             VALUES (?, ?, ?, ?, ?::timestamptz, ?)
-             RETURNING id",
-            "INSERT INTO bills (kind, amount, book_id, category_id, created_at, remark)
-             VALUES (?, ?, ?, ?, ?, ?)
-             RETURNING id",
-        );
+        let sql = self.insert_sql();
 
         let (id,): (i64,) = sqlx::query_as(&sql)
             .bind(kind.as_str())
@@ -214,17 +219,54 @@ impl BillDao {
         Ok(id as BillId)
     }
 
+    /// 在调用方的事务里插入账单。
+    ///
+    /// 银行同步要把「账单 + 导入标记 + 店家记忆」原子提交，避免出现
+    /// 「账记上了、导入标记没写成 → 下次同步再记一遍」的重复入账。
+    pub async fn insert_in(
+        &self,
+        tx: &mut Tx<'_>,
+        kind: BillKind,
+        amount: AmountType,
+        book_id: BookId,
+        category_id: CategoryId,
+        created_at: DateTime<Utc>,
+        remark: Option<&str>,
+    ) -> Result<BillId> {
+        let sql = self.insert_sql();
+
+        let (id,): (i64,) = sqlx::query_as(&sql)
+            .bind(kind.as_str())
+            .bind(amount)
+            .bind(book_id as i64)
+            .bind(category_id as i64)
+            .bind(timestamp_text(created_at))
+            .bind(remark)
+            .fetch_one(&mut **tx)
+            .await?;
+
+        Ok(id as BillId)
+    }
+
     pub async fn list(&self, filter: &BillFilter) -> Result<Vec<BillEntity>> {
         let sql = self.pool.sql(SELECT_BILLS_PG, SELECT_BILLS_SQLITE);
 
         // 月份/年份都绑 ISO 文本。
         // 注意绑定个数要跟 SQL 里的 `?` 一一对应：每个条件都出现两次
         // （一次判空、一次比较），所以 book/category/kind 也要各绑两次。
-        let month = filter.month.map(|value| value.to_string());
+        // 月份统一归一到 1 号：SQLite 用前缀比较看不出差别，但 PG 侧是
+        // `date_trunc(...)::date = ?::date`，传「当月 15 号」会一笔都查不到。
+        let month = filter
+            .month
+            .map(time::first_day_of_month)
+            .map(|value| value.to_string());
         let year = filter.year.map(|value| value.to_string());
         let book = filter.book_id.map(|id| id as i64);
         let category = filter.category_id.map(|id| id as i64);
         let kind = filter.kind.map(|value| value.as_str());
+        // 0 / 负数等价于「不限制」：PG 的 LIMIT 不接受负数，SQLite 把负数当无限，
+        // 两边行为必须一致。
+        let limit = filter.limit.filter(|value| *value > 0);
 
         let rows = sqlx::query_as::<_, BillRow>(&sql)
             .bind(&month)
@@ -237,7 +279,7 @@ impl BillDao {
             .bind(category)
             .bind(kind)
             .bind(kind)
-            .bind(filter.limit)
+            .bind(limit)
             .fetch_all(self.pool.any())
             .await?;
 
@@ -294,7 +336,7 @@ impl BillDao {
     }
 
     pub async fn delete(&self, id: BillId) -> Result<u64> {
-        let result = sqlx::query("DELETE FROM bills WHERE id = ?")
+        let result = sqlx::query(&self.pool.shared("DELETE FROM bills WHERE id = ?"))
             .bind(id as i64)
             .execute(self.pool.any())
             .await?;
@@ -304,12 +346,17 @@ impl BillDao {
     /// 只切换「是否计入日历」，不动账单本身。
     pub async fn set_excluded(&self, id: BillId, excluded: bool) -> Result<u64> {
         // `(? = 1)` 让 PostgreSQL 的 boolean 与 SQLite 的 0/1 INTEGER 都吃得下，
-        // 不必为「绑 bool 还是绑整数」分叉
-        let result = sqlx::query("UPDATE bills SET excluded = (? = 1) WHERE id = ?")
-            .bind(if excluded { 1_i64 } else { 0_i64 })
-            .bind(id as i64)
-            .execute(self.pool.any())
-            .await?;
+        // 不必为「绑 bool 还是绑整数」分叉。
+        // SQL 必须走 `pool.shared()`：占位符要由它改写成 PG 的 `$n`。
+        let result = sqlx::query(
+            &self
+                .pool
+                .shared("UPDATE bills SET excluded = (? = 1) WHERE id = ?"),
+        )
+        .bind(if excluded { 1_i64 } else { 0_i64 })
+        .bind(id as i64)
+        .execute(self.pool.any())
+        .await?;
         Ok(result.rows_affected())
     }
 }

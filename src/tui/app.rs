@@ -9,6 +9,8 @@ use std::collections::{HashMap, HashSet};
 use anyhow::{Result, anyhow, bail};
 use chrono::{Datelike, Months, NaiveDate, Utc};
 
+use crate::bank::model::BankTransaction;
+use crate::bank::service::{BankService, Suggestion, SyncKind};
 use crate::bill::model::{BillEntity, BillKind};
 use crate::bill::service::{BillQuery, NewBill};
 use crate::bill_book::model::BillBook;
@@ -70,7 +72,7 @@ impl Page {
     }
 }
 
-/// 设置页里的三个分区，`←` `→` 切换焦点。
+/// 设置页里的三个分区，焦点在菜单上时用 `↑` `↓` 切换。
 ///
 /// 账本与分类以前是顶级页签，现在收进设置页：页签少两个，改数据的地方集中在一处。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,6 +113,20 @@ impl SettingsSection {
         let index = self.index();
         Self::ALL[(index + Self::ALL.len() - 1) % Self::ALL.len()]
     }
+}
+
+/// 设置页的焦点层级：左侧分区菜单，还是右侧条目列表。
+///
+/// 全局约定是「`↑` `↓` 管页内、`←` `→` 翻页签」，所以设置页里换分区只能用 `↑` `↓`；
+/// 分区里的账本/分类又是一份列表，为了两者不打架，把页面拆成两级：
+/// 菜单里 `↑` `↓` 换分区，`Enter` 进列表，列表里 `↑` `↓` 选条目、`Esc` 退回菜单。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SettingsFocus {
+    /// 焦点在左侧分区菜单上。
+    #[default]
+    Menu,
+    /// 焦点在右侧条目列表上（数据库连接分区没有列表，永远停在菜单）。
+    Detail,
 }
 
 /// 表单字段类型。
@@ -294,7 +310,7 @@ impl Form {
     /// 这样空库也能记第一笔账。
     ///
     /// 「日期」默认留空表示今天，需要在字段上按空格才填入上次用过的日期；
-    /// 焦点默认落在「账本」——记账时它是最常用的选择项。
+    /// 焦点默认落在「金额」——打开表单第一件事就是输钱，输完再挑账本和分类。
     pub fn new_bill(
         book_options: Vec<String>,
         category_options: Vec<String>,
@@ -325,7 +341,7 @@ impl Form {
                 Field::date("日期", "留空即今天；按空格填入上次使用的时间"),
                 Field::text("备注", "", "可留空"),
             ],
-            focus: 2,
+            focus: 1,
             target: None,
         }
     }
@@ -597,6 +613,10 @@ impl Status {
 #[derive(Debug, Clone)]
 pub enum Action {
     None,
+    /// 概览页「同步今日 / 同步本周」。
+    SyncRequest(SyncKind),
+    /// 继续核对上次没核对完的流水（概览页按 `Enter`，或同步中途 `Esc` 后回来）。
+    ResumeSync,
     Refresh,
     ShiftMonth(i32),
     /// 年报页换年。
@@ -630,6 +650,13 @@ pub enum ConnectionTarget {
     },
     /// 远程 PostgreSQL。
     Remote(ConnectionSettings),
+}
+
+/// 一条待核对的同步流水：银行流水 + 记忆系统给出的预选建议。
+#[derive(Debug, Clone)]
+pub struct PendingSync {
+    pub transaction: BankTransaction,
+    pub suggestion: Suggestion,
 }
 
 /// 最近一次删除的内容，供 `u` 撤销。
@@ -668,6 +695,8 @@ pub struct App {
     pub last_deleted: Option<DeletedRecord>,
     /// 设置页当前焦点所在的分区。
     pub settings_section: SettingsSection,
+    /// 设置页焦点在菜单上还是在条目列表上。
+    pub settings_focus: SettingsFocus,
     /// 三个分区各自的选中行。
     settings_selected: [usize; SettingsSection::ALL.len()],
     /// 开销计划（预计金额 / 攒钱金额），全局生效。
@@ -678,6 +707,10 @@ pub struct App {
     pub selected_day: u32,
     /// 还没连上数据库：界面显示配置引导页，而不是直接不给进。
     pub needs_setup: bool,
+    /// 待逐条核对的银行流水（同步拉下来后排队）。
+    pub pending_sync: Vec<PendingSync>,
+    /// 本轮同步一共拉到多少条（用于「第 2/7 条」这类提示）。
+    pub sync_total: usize,
     /// 上次记账用过的日期（跨会话记忆）；`None` 表示还没记过。
     /// 新增表单里留空即今天，按空格才把它填进去。
     pub last_entry_date: Option<NaiveDate>,
@@ -709,6 +742,7 @@ impl App {
             sqlite_path: sqlite_path.to_string(),
             last_deleted: None,
             settings_section: SettingsSection::Connection,
+            settings_focus: SettingsFocus::Menu,
             settings_selected: [0; SettingsSection::ALL.len()],
             plan: SpendingPlan::default(),
             progress: None,
@@ -719,6 +753,8 @@ impl App {
                 1
             },
             needs_setup: false,
+            pending_sync: Vec::new(),
+            sync_total: 0,
             last_entry_date: None,
             last_entry_book: None,
             selected: [0; Page::ALL.len()],
@@ -989,6 +1025,42 @@ impl App {
         self.selected[page.index()] = next as usize;
     }
 
+    /// 翻页签。离开设置页时把两级焦点归位到菜单：
+    /// 下次进来先看到「有哪几个分区」，而不是直接落在某个列表里。
+    fn switch_page(&mut self, page: Page) -> Action {
+        self.page = page;
+        self.settings_focus = SettingsFocus::Menu;
+        Action::Refresh
+    }
+
+    /// 页内上下移动：设置页要看焦点在哪一级，其余页就是选行。
+    fn move_in_page(&mut self, delta: i32) {
+        if self.page == Page::Settings && self.settings_focus == SettingsFocus::Menu {
+            self.move_settings_section(delta);
+        } else {
+            self.move_selection(delta);
+        }
+    }
+
+    /// 菜单态换分区。`PageUp/PageDown` 传的是 ±10，这里只当成「上一 / 下一」。
+    fn move_settings_section(&mut self, delta: i32) {
+        let step = delta.signum();
+        if step == 0 {
+            return;
+        }
+        let count = SettingsSection::ALL.len() as i32;
+        let next = (self.settings_section.index() as i32 + step).rem_euclid(count);
+        self.settings_section = SettingsSection::ALL[next as usize];
+    }
+
+    /// 跳到第一行 / 最后一行。菜单态下没有行可选，直接忽略。
+    fn jump_in_page(&mut self, index: usize) {
+        if self.page == Page::Settings && self.settings_focus == SettingsFocus::Menu {
+            return;
+        }
+        self.jump_selection(index);
+    }
+
     fn clamp_selection(&mut self) {
         for page in Page::ALL {
             let count = self.row_count(page);
@@ -1094,8 +1166,8 @@ impl App {
 
     fn open_edit_form(&mut self) {
         let form = match self.page {
-            // 概览页的「可编辑内容」是起始金额 + 开销计划；设置页就是连接参数
-            Page::Overview => {
+            // 概览 / 月报 / 年报的「可编辑内容」都是本月起始金额 + 开销计划
+            Page::Overview | Page::Months | Page::Years => {
                 let current = self
                     .report
                     .as_ref()
@@ -1124,9 +1196,7 @@ impl App {
                 .bills
                 .get(self.selected_index(Page::Bills))
                 .map(|bill| Form::edit_bill(bill, self.book_names(), self.category_names())),
-            Page::Months | Page::Years => None,
         };
-
         match form {
             Some(form) => self.modal = Some(Modal::Form(form)),
             None => self.set_info("当前页没有可编辑的内容"),
@@ -1262,8 +1332,28 @@ impl App {
 
     /// 处理一次按键，返回外壳需要执行的动作。
     pub fn on_key(&mut self, key: Key) -> Action {
+        // 弹窗优先：表单里的 s/w 是普通字符，不能被下面的快捷键吃掉
         if self.modal.is_some() {
             return self.on_key_modal(key);
+        }
+
+        // 还没连上数据库：只放行「切页 / 退出」。否则用户对着表单填完才发现写不进去。
+        if self.needs_setup {
+            match key {
+                Key::Char('1'..='5') | Key::Tab | Key::BackTab | Key::Left | Key::Right => {}
+                Key::Ctrl('c') | Key::Char('q') => {}
+                _ => return Action::None,
+            }
+        }
+
+        // 概览页那两个「同步」按钮的快捷键：s = 今日、w = 本周。
+        // 只在概览页生效——在别的页面按一下 s 就开始连银行，那是惊吓不是快捷。
+        if self.page == Page::Overview {
+            match key {
+                Key::Char('s') => return Action::SyncRequest(SyncKind::Today),
+                Key::Char('w') => return Action::SyncRequest(SyncKind::Week),
+                _ => {}
+            }
         }
 
         // Ctrl+C / q 退出
@@ -1273,31 +1363,24 @@ impl App {
         }
 
         match key {
-            Key::Char('1'..='7') => {
+            Key::Char('1'..='5') => {
                 if let Key::Char(digit) = key {
                     let index = digit as usize - '1' as usize;
                     if let Some(page) = Page::ALL.get(index) {
-                        self.page = *page;
-                        return Action::Refresh;
+                        return self.switch_page(*page);
                     }
                 }
                 Action::None
             }
-            Key::Tab => {
-                self.page = self.page.next();
-                Action::Refresh
-            }
-            Key::BackTab => {
-                self.page = self.page.previous();
-                Action::Refresh
-            }
+            Key::Tab => self.switch_page(self.page.next()),
+            Key::BackTab => self.switch_page(self.page.previous()),
             Key::Up => {
                 if self.page == Page::Overview {
                     // 概览页用 ↑↓ 换查看的日期
                     self.move_inspected_day(-1);
                     Action::Refresh
                 } else {
-                    self.move_selection(-1);
+                    self.move_in_page(-1);
                     Action::None
                 }
             }
@@ -1306,48 +1389,100 @@ impl App {
                     self.move_inspected_day(1);
                     Action::Refresh
                 } else {
-                    self.move_selection(1);
+                    self.move_in_page(1);
                     Action::None
                 }
             }
             Key::PageUp => {
-                self.move_selection(-10);
-                Action::None
+                // 概览页往前一周，列表页往上翻 10 行
+                if self.page == Page::Overview {
+                    self.move_inspected_day(-7);
+                    Action::Refresh
+                } else {
+                    self.move_in_page(-10);
+                    Action::None
+                }
             }
             Key::PageDown => {
-                self.move_selection(10);
-                Action::None
+                if self.page == Page::Overview {
+                    self.move_inspected_day(7);
+                    Action::Refresh
+                } else {
+                    self.move_in_page(10);
+                    Action::None
+                }
             }
             Key::Home => {
-                self.jump_selection(0);
-                Action::None
+                if self.page == Page::Overview {
+                    self.selected_day = 1;
+                    Action::Refresh
+                } else {
+                    self.jump_in_page(0);
+                    Action::None
+                }
             }
             Key::End => {
-                let count = self.current_row_count();
-                self.jump_selection(count.saturating_sub(1));
+                if self.page == Page::Overview {
+                    self.selected_day = days_in_month(self.month).max(1);
+                    Action::Refresh
+                } else {
+                    let count = self.current_row_count();
+                    self.jump_in_page(count.saturating_sub(1));
+                    Action::None
+                }
+            }
+            // ←/→ 永远翻页签（设置页也一样）。页签是横向维度、页内一律交给 ↑↓，
+            // 两套方向键各管一维，就不会出现「同一个键在这个页面干另一件事」。
+            Key::Left => self.switch_page(self.page.previous()),
+            Key::Right => self.switch_page(self.page.next()),
+            // 设置页没有「月份」这个概念，`[` `]` 不做事，免得误以为换了月份
+            Key::Char('[') => {
+                if self.page == Page::Settings {
+                    Action::None
+                } else {
+                    self.shift_period(-1)
+                }
+            }
+            Key::Char(']') => {
+                if self.page == Page::Settings {
+                    Action::None
+                } else {
+                    self.shift_period(1)
+                }
+            }
+            // 设置页：Enter 进列表 / 在列表里编辑；概览页：继续核对没核完的流水
+            Key::Enter => {
+                if self.page == Page::Settings {
+                    match self.settings_focus {
+                        SettingsFocus::Menu => {
+                            // 数据库连接分区没有列表，Enter 就没什么可进的
+                            if self.settings_row_count() > 0 {
+                                self.settings_focus = SettingsFocus::Detail;
+                            }
+                            Action::None
+                        }
+                        SettingsFocus::Detail => {
+                            self.open_edit_form();
+                            Action::None
+                        }
+                    }
+                } else if self.page == Page::Overview && !self.pending_sync.is_empty() {
+                    Action::ResumeSync
+                } else if self.page == Page::Bills {
+                    // 列表里 Enter = 打开选中那条，和大多数终端工具一致
+                    self.open_edit_form();
+                    Action::None
+                } else {
+                    Action::None
+                }
+            }
+            // 设置页列表里按 Esc 退回菜单；其余情况 Esc 不做事（弹窗的 Esc 在 on_key_modal 里）
+            Key::Esc => {
+                if self.page == Page::Settings && self.settings_focus == SettingsFocus::Detail {
+                    self.settings_focus = SettingsFocus::Menu;
+                }
                 Action::None
             }
-            // ←/→ 切换页面（与 Tab 一致）；**设置页里改成切换三个分区**
-            Key::Left => {
-                if self.page == Page::Settings {
-                    self.settings_section = self.settings_section.previous();
-                    Action::None
-                } else {
-                    self.page = self.page.previous();
-                    Action::Refresh
-                }
-            }
-            Key::Right => {
-                if self.page == Page::Settings {
-                    self.settings_section = self.settings_section.next();
-                    Action::None
-                } else {
-                    self.page = self.page.next();
-                    Action::Refresh
-                }
-            }
-            Key::Char('[') => self.shift_period(-1),
-            Key::Char(']') => self.shift_period(1),
             Key::Char('r') => Action::Refresh,
             Key::Char('a') => {
                 self.open_default_form();
@@ -1407,12 +1542,8 @@ impl App {
         };
 
         match modal {
-            Modal::Notice { title, message } => {
-                // 除 Esc 外的任意键都关掉提示
-                if key != Key::Esc {
-                    return Action::None;
-                }
-                self.modal = Some(Modal::Notice { title, message });
+            Modal::Notice { .. } => {
+                // 提示框不拦人：任意键（含 Esc / Enter）关掉，别让用户猜哪个键能用
                 Action::None
             }
             Modal::Confirm {
@@ -1631,9 +1762,25 @@ impl App {
                 self.year += delta;
                 self.reload(services).await?;
             }
+            Action::SyncRequest(kind) => {
+                self.sync_from_bank(kind, services).await?;
+            }
+            Action::ResumeSync => {
+                // 概览页提示「待核对 N 条 · 按 Enter 继续」对应的落地动作
+                if self.pending_sync.is_empty() {
+                    self.set_info("没有待核对的流水");
+                } else {
+                    self.open_next_reconcile(services);
+                }
+            }
             Action::SubmitForm(form) => {
-                let message = submit(form, services).await?;
-                self.set_info(message);
+                if !self.pending_sync.is_empty() && form.kind == FormKind::NewBill {
+                    // 核对流程里，提交表单就是「确认这一条」
+                    self.confirm_reconcile(&form, services).await?;
+                } else {
+                    let message = submit(form, services).await?;
+                    self.set_info(message);
+                }
                 self.reload(services).await?;
             }
             Action::DeleteBill(id) => {
@@ -1735,6 +1882,148 @@ impl App {
                 }
             },
         }
+        Ok(())
+    }
+
+    /// 从银行拉流水 → 去重 → 逐条核对（复用「新增账单」表单预填）。
+    async fn sync_from_bank(&mut self, kind: SyncKind, services: &Services) -> Result<()> {
+        let bank = BankService::new(services.pool().clone());
+        let today = BankService::today();
+
+        let Some(window) = bank.window(kind, today).await? else {
+            self.set_info("本周本地已经记到最新，没有需要同步的日子。");
+            return Ok(());
+        };
+
+        self.set_info(format!(
+            "正在同步{}流水（{}）：启动/连接浏览器并监听会话…",
+            window.label,
+            window.describe()
+        ));
+
+        let session =
+            crate::bank::sync::ensure_session(crate::bank::browser::DEFAULT_PORT).await?;
+
+        // 账户优先用监听到的；监听不到才用数据库里保存的兜底
+        let account = match session.account() {
+            Some(account) => account,
+            None => match crate::bank::sync::stored_account(&bank).await? {
+                Some(account) => account,
+                None => {
+                    self.set_error(
+                        "没从页面请求里读到账户信息：请在弹出的窗口里登录招商银行网银并刷新一次",
+                    );
+                    return Ok(());
+                }
+            },
+        };
+
+        let fetched = crate::bank::sync::fetch_with(&session, &account, &window).await?;
+        let fresh = bank.new_transactions(fetched).await?;
+
+        if fresh.is_empty() {
+            self.set_info(format!("{}流水都已导入过，没有新的。", window.label));
+            return Ok(());
+        }
+
+        let mut pending = Vec::with_capacity(fresh.len());
+        for transaction in fresh {
+            let suggestion = bank.suggest(&transaction.memo).await?;
+            pending.push(PendingSync {
+                transaction,
+                suggestion,
+            });
+        }
+
+        self.sync_total = pending.len();
+        self.pending_sync = pending;
+        self.set_info(format!(
+            "{}：拉到 {} 条新流水，逐条核对（Esc 放弃剩余）",
+            window.label, self.sync_total
+        ));
+
+        self.open_next_reconcile(services);
+        Ok(())
+    }
+
+    /// 打开下一条待核对流水；队列空了就收尾。
+    fn open_next_reconcile(&mut self, services: &Services) {
+        let Some(item) = self.pending_sync.first().cloned() else {
+            self.modal = None;
+            self.set_info("核对完成，全部导入。");
+            return;
+        };
+
+        let books: Vec<String> = self.books.iter().map(|book| book.name.clone()).collect();
+        let categories: Vec<String> = self
+            .categories
+            .iter()
+            .map(|node| node.category.name.clone())
+            .collect();
+
+        let mut form = Form::new_bill(books, categories, Some(item.suggestion.book.as_str()));
+        set_field(
+            &mut form,
+            "方向",
+            match item.transaction.kind {
+                BillKind::Income => "收入",
+                BillKind::Expense => "支出",
+            },
+        );
+        set_field(&mut form, "金额", &yuan_text(item.transaction.amount));
+        set_field(&mut form, "分类", &item.suggestion.category);
+        set_field(&mut form, "日期", &item.transaction.date().to_string());
+        set_field(&mut form, "备注", &item.transaction.memo);
+
+        let index = self.sync_total.saturating_sub(self.pending_sync.len()) + 1;
+        let _ = services;
+        self.set_info(format!(
+            "核对 {index}/{}：{}　建议来源：{}",
+            self.sync_total,
+            item.transaction.describe(),
+            item.suggestion.source.describe()
+        ));
+        self.modal = Some(Modal::Form(form));
+    }
+
+    /// 确认核对队列里的第一条（按表单里可能改过的方向/金额/日期/备注入账）。
+    async fn confirm_reconcile(&mut self, form: &Form, services: &Services) -> Result<()> {
+        let Some(item) = self.pending_sync.first().cloned() else {
+            return Ok(());
+        };
+
+        let mut transaction = item.transaction.clone();
+        transaction.kind = if form.value("方向") == "收入" {
+            BillKind::Income
+        } else {
+            BillKind::Expense
+        };
+        if let Ok(amount) = money::parse_amount(form.value("金额")) {
+            transaction.amount = amount;
+        }
+        if let Ok(date) = NaiveDate::parse_from_str(form.value("日期"), "%Y-%m-%d") {
+            transaction.date_time = date.and_time(transaction.date_time.time());
+        }
+        let memo = form.value("备注");
+        if !memo.is_empty() {
+            transaction.memo = memo.to_string();
+        }
+
+        let bank = BankService::new(services.pool().clone());
+        let bill = bank
+            .confirm(&transaction, form.value("账本"), form.value("分类"))
+            .await?;
+
+        self.pending_sync.remove(0);
+        self.set_info(format!(
+            "已导入 {} {} → {} / {}",
+            bill.created_at.format("%Y-%m-%d"),
+            yuan_text(bill.amount),
+            bill.book.name,
+            bill.category.name
+        ));
+
+        self.open_next_reconcile(services);
         Ok(())
     }
 
@@ -1988,6 +2277,20 @@ fn connection_from_form(form: &Form) -> Result<ConnectionTarget> {
     }))
 }
 
+/// 往表单的某个字段里填值（按标签找）。
+fn set_field(form: &mut Form, label: &str, value: &str) {
+    if let Some(field) = form.fields.iter_mut().find(|field| field.label == label) {
+        field.value = value.to_string();
+    }
+}
+
+/// 分 → `12.34`（不带千分位：金额字段的解析器不认逗号）。
+fn yuan_text(cents: AmountType) -> String {
+    let sign = if cents < 0 { "-" } else { "" };
+    let absolute = cents.abs();
+    format!("{sign}{}.{:02}", absolute / 100, absolute % 100)
+}
+
 fn require<'a>(value: &'a str, message: &str) -> Result<&'a str> {
     if value.is_empty() {
         bail!("{message}");
@@ -2223,11 +2526,11 @@ mod tests {
     }
 
     #[test]
-    fn new_bill_form_focuses_book_and_leaves_date_empty() {
+    fn new_bill_form_focuses_amount_and_leaves_date_empty() {
         let form = Form::new_bill(vec!["微信".to_string()], vec!["餐饮".to_string()], None);
 
-        assert_eq!(form.focus, 2, "焦点应默认落在「账本」");
-        assert_eq!(form.fields[2].label, "账本");
+        assert_eq!(form.focus, 1, "焦点应默认落在「金额」");
+        assert_eq!(form.fields[1].label, "金额");
         assert_eq!(form.value("账本"), "微信");
         assert_eq!(form.fields[4].value, "", "日期默认留空，留空即今天");
         assert_eq!(
@@ -2258,7 +2561,8 @@ mod tests {
         app.page = Page::Bills;
         app.on_key(Key::Char('a'));
 
-        // 焦点：账本(2) → 分类(3) → 日期(4)
+        // 焦点：金额(1) → 账本(2) → 分类(3) → 日期(4)
+        app.on_key(Key::Tab);
         app.on_key(Key::Tab);
         app.on_key(Key::Tab);
         match &app.modal {
@@ -2294,6 +2598,7 @@ mod tests {
         app.last_entry_date = None;
         app.page = Page::Bills;
         app.on_key(Key::Char('a'));
+        app.on_key(Key::Tab);
         app.on_key(Key::Tab);
         app.on_key(Key::Tab);
         app.on_key(Key::Char(' '));
@@ -2358,8 +2663,7 @@ mod tests {
             other => panic!("应打开新增账单表单，实际 {other:?}"),
         }
 
-        // 焦点默认在「账本」，先移到「金额」
-        app.on_key(Key::BackTab);
+        // 焦点默认就在「金额」，打开表单直接输钱
         app.on_key(Key::Char('1'));
         app.on_key(Key::Char('2'));
         app.on_key(Key::Char('.'));
@@ -2387,8 +2691,7 @@ mod tests {
     fn choice_field_cycles_without_typing() {
         let mut app = sample_app();
         app.on_key(Key::Char('a'));
-        // 焦点默认在「账本」，退回两格到「方向」再切换
-        app.on_key(Key::BackTab);
+        // 焦点默认在「金额」，退一格到「方向」再切换
         app.on_key(Key::BackTab);
         app.on_key(Key::Left);
         match &app.modal {
@@ -2407,8 +2710,7 @@ mod tests {
     fn submit_action_is_emitted_on_enter() {
         let mut app = sample_app();
         app.on_key(Key::Char('a'));
-        // 焦点默认在「账本」选择框上，回车会展开列表；先退到文本框再回车提交
-        app.on_key(Key::BackTab);
+        // 焦点默认在「金额」文本框上，回车就是提交
         let action = app.on_key(Key::Enter);
         match action {
             Action::SubmitForm(form) => assert_eq!(form.kind, FormKind::NewBill),
@@ -2461,6 +2763,8 @@ mod tests {
         let mut app = sample_app();
         app.page = Page::Settings;
         app.settings_section = SettingsSection::Books;
+        // 先按 Enter 进列表：↑↓ 在菜单态是换分区，不换条目
+        app.settings_focus = SettingsFocus::Detail;
         app.books = vec![
             BillBook { id: 1, name: "微信".into() },
             BillBook { id: 2, name: "支付宝".into() },
@@ -2497,27 +2801,222 @@ mod tests {
     }
 
     #[test]
-    fn settings_sections_switch_with_arrows() {
+    fn left_right_always_switch_pages() {
         let mut app = sample_app();
         app.page = Page::Settings;
 
-        assert_eq!(app.settings_section, SettingsSection::Connection);
-        // 设置页里 ←→ 切分区，不换页面
-        assert!(matches!(app.on_key(Key::Right), Action::None));
-        assert_eq!(app.settings_section, SettingsSection::Books);
+        // 全局约定：← → 只翻页签，设置页也不例外
+        assert!(matches!(app.on_key(Key::Right), Action::Refresh));
+        assert_eq!(app.page, Page::Overview, "设置页是最后一页，应回绕到概览");
+        app.on_key(Key::Left);
+        assert_eq!(app.page, Page::Settings, "应回绕到设置页");
+
+        // Tab / BackTab 同义
+        app.on_key(Key::Tab);
+        assert_eq!(app.page, Page::Overview);
+        app.on_key(Key::BackTab);
         assert_eq!(app.page, Page::Settings);
 
-        app.on_key(Key::Right);
+        // 数字键直达
+        app.on_key(Key::Char('2'));
+        assert_eq!(app.page, Page::Bills);
+    }
+
+    #[test]
+    fn settings_updown_moves_sections_then_rows() {
+        let mut app = sample_app();
+        app.page = Page::Settings;
+        app.settings_focus = SettingsFocus::Menu;
+
+        assert_eq!(app.settings_section, SettingsSection::Connection);
+        assert!(matches!(app.on_key(Key::Down), Action::None));
+        assert_eq!(app.settings_section, SettingsSection::Books, "菜单态 ↓ 换分区");
+        app.on_key(Key::Down);
         assert_eq!(app.settings_section, SettingsSection::Categories);
-        app.on_key(Key::Right);
-        assert_eq!(app.settings_section, SettingsSection::Connection, "应回绕");
-        app.on_key(Key::Left);
+        app.on_key(Key::Down);
+        assert_eq!(
+            app.settings_section,
+            SettingsSection::Connection,
+            "分区也要能回绕"
+        );
+        app.on_key(Key::Up);
         assert_eq!(app.settings_section, SettingsSection::Categories);
 
-        // 别的页面 ←→ 仍然是切页
+        // 菜单态不该动列表选中行
+        app.settings_section = SettingsSection::Books;
+        let before = app.settings_index();
+        app.on_key(Key::Down);
+        assert_eq!(app.settings_index(), before, "菜单态不动条目");
+
+        // Enter 进列表，之后 ↑↓ 才动条目
+        app.settings_focus = SettingsFocus::Menu;
+        app.on_key(Key::Enter);
+        assert_eq!(app.settings_focus, SettingsFocus::Detail);
+        app.on_key(Key::Down);
+        assert_ne!(app.settings_index(), before, "列表态 ↓ 换条目");
+
+        // Esc 回菜单
+        app.on_key(Key::Esc);
+        assert_eq!(app.settings_focus, SettingsFocus::Menu);
+    }
+
+    #[test]
+    fn enter_on_connection_section_stays_in_menu() {
+        let mut app = sample_app();
+        app.page = Page::Settings;
+        app.settings_section = SettingsSection::Connection;
+        app.settings_focus = SettingsFocus::Menu;
+
+        // 连接分区没有列表，Enter 不该把焦点送进一个不存在的列表
+        app.on_key(Key::Enter);
+        assert_eq!(app.settings_focus, SettingsFocus::Menu);
+    }
+
+    #[test]
+    fn switching_pages_resets_settings_focus() {
+        let mut app = sample_app();
+        app.page = Page::Settings;
+        app.settings_section = SettingsSection::Books;
+        app.settings_focus = SettingsFocus::Detail;
+
+        app.on_key(Key::Right);
+        app.on_key(Key::Left);
+        assert_eq!(app.settings_focus, SettingsFocus::Menu, "回来应落在菜单上");
+    }
+
+    #[test]
+    fn sync_shortcuts_only_fire_on_overview() {
+        let mut app = sample_app();
+
+        app.page = Page::Overview;
+        assert!(matches!(
+            app.on_key(Key::Char('s')),
+            Action::SyncRequest(SyncKind::Today)
+        ));
+        assert!(matches!(
+            app.on_key(Key::Char('w')),
+            Action::SyncRequest(SyncKind::Week)
+        ));
+
+        // 别的页面按 s/w 不该意外开始连银行
         app.page = Page::Bills;
-        assert!(matches!(app.on_key(Key::Right), Action::Refresh));
-        assert_eq!(app.page, Page::Months);
+        assert!(matches!(app.on_key(Key::Char('s')), Action::None));
+        assert!(matches!(app.on_key(Key::Char('w')), Action::None));
+        app.page = Page::Settings;
+        assert!(matches!(app.on_key(Key::Char('s')), Action::None));
+    }
+
+    #[test]
+    fn enter_requests_resume_when_reconcile_is_pending() {
+        let mut app = sample_app();
+        app.page = Page::Overview;
+
+        // 没有待核对时 Enter 什么都不做
+        assert!(matches!(app.on_key(Key::Enter), Action::None));
+
+        app.pending_sync.push(PendingSync {
+            transaction: crate::bank::model::BankTransaction {
+                date_time: NaiveDate::from_ymd_opt(2026, 10, 5)
+                    .unwrap()
+                    .and_hms_opt(12, 0, 0)
+                    .unwrap(),
+                kind: BillKind::Expense,
+                amount: 1234,
+                memo: "午饭".to_string(),
+                balance: None,
+                raw_type: "网联协议支付".to_string(),
+                fingerprint: "fp-pending".to_string(),
+            },
+            suggestion: crate::bank::service::Suggestion {
+                book: "微信".to_string(),
+                category: "餐饮".to_string(),
+                source: crate::bank::service::SuggestionSource::Keyword("鸡排".to_string()),
+            },
+        });
+        app.sync_total = 1;
+
+        assert!(
+            matches!(app.on_key(Key::Enter), Action::ResumeSync),
+            "有没核完的流水时 Enter 应恢复核对"
+        );
+    }
+
+    #[test]
+    fn overview_home_end_and_paging_move_the_inspected_day() {
+        let mut app = sample_app();
+        app.page = Page::Overview;
+
+        app.on_key(Key::Home);
+        assert_eq!(app.inspected_day(), 1);
+        app.on_key(Key::End);
+        assert_eq!(app.inspected_day(), 31, "2026-10 有 31 天");
+
+        app.on_key(Key::Home);
+        app.on_key(Key::PageDown);
+        assert_eq!(app.inspected_day(), 8, "PageDown 往后一周");
+        app.on_key(Key::PageUp);
+        assert_eq!(app.inspected_day(), 1, "到头就停住");
+    }
+
+    #[test]
+    fn brackets_are_ignored_on_settings_page() {
+        let mut app = sample_app();
+        app.page = Page::Settings;
+
+        assert!(matches!(app.on_key(Key::Char('[')), Action::None));
+        assert!(matches!(app.on_key(Key::Char(']')), Action::None));
+    }
+
+    #[test]
+    fn months_and_years_open_month_settings_on_e() {
+        for page in [Page::Months, Page::Years] {
+            let mut app = sample_app();
+            app.page = page;
+            app.on_key(Key::Char('e'));
+            match &app.modal {
+                Some(Modal::Form(form)) => assert_eq!(
+                    form.kind,
+                    FormKind::SetStartBalance,
+                    "月报/年报页按 e 应打开本月设置（和底栏提示一致）"
+                ),
+                other => panic!("{page:?} 页按 e 应打开本月设置，实际 {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn enter_on_bills_opens_the_selected_bill() {
+        let mut app = sample_app();
+        app.page = Page::Bills;
+        app.bills = vec![sample_bill(7, 1000)];
+        app.selected[Page::Bills.index()] = 0;
+
+        app.on_key(Key::Enter);
+        match &app.modal {
+            Some(Modal::Form(form)) => {
+                assert_eq!(form.kind, FormKind::NewBill, "编辑账单复用新账单表单");
+                assert_eq!(form.target, Some(EditTarget::Bill(7)));
+                assert_eq!(form.value("金额"), "10.00");
+            }
+            other => panic!("账单页 Enter 应打开编辑表单，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn setup_state_only_allows_navigation() {
+        let mut app = sample_app();
+        app.mark_needs_setup();
+        app.page = Page::Overview;
+
+        // 记账 / 删除 / 同步这些动作在没连上库时都不该开表单或发动作
+        assert!(matches!(app.on_key(Key::Char('a')), Action::None));
+        assert!(matches!(app.on_key(Key::Char('d')), Action::None));
+        assert!(matches!(app.on_key(Key::Char('s')), Action::None));
+        assert!(app.modal.is_none(), "不该弹出任何表单");
+
+        // 但仍能翻到设置页去配库
+        assert!(matches!(app.on_key(Key::Char('5')), Action::Refresh));
+        assert_eq!(app.page, Page::Settings);
     }
 
     #[test]
@@ -2525,6 +3024,7 @@ mod tests {
         let mut app = sample_app();
         app.page = Page::Settings;
         app.settings_section = SettingsSection::Books;
+        app.settings_focus = SettingsFocus::Detail;
 
         assert_eq!(app.settings_row_count(), 2);
         app.on_key(Key::Down);
@@ -2679,9 +3179,14 @@ mod tests {
         app.page = Page::Bills;
         app.on_key(Key::Char('a'));
 
-        // 新增账单时焦点默认就落在「账本」选择框上
+        // 焦点默认在「金额」；移到「账本」选择框上再回车
         match &app.modal {
-            Some(Modal::Form(form)) => assert_eq!(form.focus, 2),
+            Some(Modal::Form(form)) => assert_eq!(form.fields[form.focus].label, "金额"),
+            other => panic!("{other:?}"),
+        }
+        app.on_key(Key::Tab);
+        match &app.modal {
+            Some(Modal::Form(form)) => assert_eq!(form.fields[form.focus].label, "账本"),
             other => panic!("{other:?}"),
         }
 
@@ -2744,8 +3249,7 @@ mod tests {
         app.page = Page::Bills;
         app.on_key(Key::Char('a'));
 
-        // 焦点默认在「账本」，退一格到「金额」
-        app.on_key(Key::BackTab);
+        // 焦点默认就在「金额」上
         for character in "12.5+7.5".chars() {
             app.on_key(Key::Char(character));
         }
@@ -2768,7 +3272,6 @@ mod tests {
         let mut app = sample_app();
         app.page = Page::Bills;
         app.on_key(Key::Char('a'));
-        app.on_key(Key::BackTab);
 
         for character in "12/0".chars() {
             app.on_key(Key::Char(character));

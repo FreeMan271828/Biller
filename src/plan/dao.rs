@@ -48,6 +48,10 @@ impl PlanDao {
     }
 
     pub async fn save(&self, plan: &SpendingPlan) -> Result<()> {
+        // 三个键必须一起生效：中途失败要整体回滚，
+        // 否则会留下「预计金额是新的、模式还是旧的」这种自相矛盾的计划。
+        let mut tx = self.pool.any().begin().await?;
+
         for (key, value) in [
             (KEY_EXPECTED, plan.expected.to_string()),
             (KEY_SAVINGS, plan.savings.to_string()),
@@ -59,10 +63,65 @@ impl PlanDao {
             ))
             .bind(key)
             .bind(value)
-            .execute(self.pool.any())
+            .execute(&mut *tx)
             .await?;
         }
 
+        tx.commit().await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::db;
+
+    use crate::plan::model::PlanMode;
+
+    /// 临时 SQLite 文件 + 建表；返回池与目录（测试结束删目录）。
+    async fn setup() -> (Pool, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "biller-plan-dao-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let pool = db::connect(&db::sqlite_url(&dir.join("biller.db")))
+            .await
+            .expect("连接临时 SQLite");
+        db::init_schema(&pool).await.expect("建表");
+
+        (pool, dir)
+    }
+
+    #[tokio::test]
+    async fn saves_and_reloads_the_whole_plan() {
+        let (pool, dir) = setup().await;
+        let dao = PlanDao::new(pool.clone());
+
+        // 空库：全是默认值
+        assert_eq!(dao.get().await.unwrap(), SpendingPlan::default());
+
+        let plan = SpendingPlan {
+            expected: 12_000,
+            savings: 8_000,
+            mode: PlanMode::DailyOnly,
+        };
+        dao.save(&plan).await.unwrap();
+        assert_eq!(dao.get().await.unwrap(), plan, "三个字段都应落库");
+
+        // 覆盖写：update 路径
+        let updated = SpendingPlan {
+            expected: 15_000,
+            savings: 0,
+            mode: PlanMode::Cumulative,
+        };
+        dao.save(&updated).await.unwrap();
+        assert_eq!(dao.get().await.unwrap(), updated);
+
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -235,13 +235,17 @@ async fn apply_action(
                     app.connection_url = target_url.clone();
 
                     app.set_info(format!(
-                        "已迁移到 {}：账本 {}、分类 {}、账单 {}、月度 {}、设置 {}（共 {} 行）",
+                        "已迁移到 {}：账本 {}、分类 {}、账单 {}、月度 {}、设置 {}、银行账户 {}、已导入流水 {}、店家记忆 {}、关键词 {}（共 {} 行）",
                         db::redact(&target_url),
                         report.books,
                         report.categories,
                         report.bills,
                         report.months,
                         report.settings,
+                        report.bank_accounts,
+                        report.bank_imports,
+                        report.memories,
+                        report.keywords,
                         report.total()
                     ));
 

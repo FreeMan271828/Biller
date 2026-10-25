@@ -54,6 +54,12 @@ pub struct Pool {
     kind: DbKind,
 }
 
+/// 数据库事务。
+///
+/// `dao` 里「必须跟调用方在同一个事务里落库」的方法用它作参数，
+/// 免得每一层都写一遍 `sqlx::Transaction<'_, Any>` 的泛型。
+pub type Tx<'a> = sqlx::Transaction<'a, sqlx::Any>;
+
 impl Pool {
     pub fn new(inner: AnyPool, kind: DbKind) -> Self {
         Self { inner, kind }
@@ -76,22 +82,7 @@ impl Pool {
     pub fn placeholders(&self, query: &str) -> String {
         match self.kind {
             DbKind::Sqlite => query.to_string(),
-            DbKind::Postgres => {
-                let mut index = 0;
-                let mut out = String::with_capacity(query.len() + 8);
-
-                for character in query.chars() {
-                    if character == '?' {
-                        index += 1;
-                        out.push('$');
-                        out.push_str(&index.to_string());
-                    } else {
-                        out.push(character);
-                    }
-                }
-
-                out
-            }
+            DbKind::Postgres => rewrite_placeholders(query),
         }
     }
 
@@ -111,6 +102,95 @@ impl Pool {
     pub async fn close(&self) {
         self.inner.close().await;
     }
+}
+
+/// 把 `?` 改写成 PostgreSQL 的 `$n`，但**只改真正的占位符**。
+///
+/// 字符串字面量、引号标识符和注释里的 `?` 必须原样保留：无脑逐字符替换会把
+/// `remark = '?'` 改成 `remark = '$1'`，在 PostgreSQL 上静默改变语义（还少一个参数）。
+fn rewrite_placeholders(query: &str) -> String {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum State {
+        Normal,
+        SingleQuote,
+        DoubleQuote,
+        LineComment,
+        BlockComment,
+    }
+
+    let mut index = 0;
+    let mut out = String::with_capacity(query.len() + 8);
+    let mut state = State::Normal;
+    let mut chars = query.chars().peekable();
+
+    while let Some(character) = chars.next() {
+        match state {
+            State::Normal => match character {
+                '?' => {
+                    index += 1;
+                    out.push('$');
+                    out.push_str(&index.to_string());
+                }
+                '\'' => {
+                    out.push(character);
+                    state = State::SingleQuote;
+                }
+                '"' => {
+                    out.push(character);
+                    state = State::DoubleQuote;
+                }
+                // `--` 行注释：整行不改写
+                '-' if chars.peek() == Some(&'-') => {
+                    out.push(character);
+                    out.push(chars.next().expect("peek 已确认存在"));
+                    state = State::LineComment;
+                }
+                // `/* ... */` 块注释
+                '/' if chars.peek() == Some(&'*') => {
+                    out.push(character);
+                    out.push(chars.next().expect("peek 已确认存在"));
+                    state = State::BlockComment;
+                }
+                _ => out.push(character),
+            },
+            State::SingleQuote => {
+                out.push(character);
+                if character == '\'' {
+                    // SQL 里连写两个单引号表示转义，不算字符串结束
+                    if chars.peek() == Some(&'\'') {
+                        out.push(chars.next().expect("peek 已确认存在"));
+                    } else {
+                        state = State::Normal;
+                    }
+                }
+            }
+            State::DoubleQuote => {
+                out.push(character);
+                if character == '"' {
+                    if chars.peek() == Some(&'"') {
+                        out.push(chars.next().expect("peek 已确认存在"));
+                    } else {
+                        state = State::Normal;
+                    }
+                }
+            }
+            State::LineComment => {
+                out.push(character);
+                if character == '\n' {
+                    state = State::Normal;
+                }
+            }
+            State::BlockComment => {
+                out.push(character);
+                if character == '*' && chars.peek() == Some(&'/') {
+                    out.push(chars.next().expect("peek 已确认存在"));
+                    state = State::Normal;
+                }
+            }
+        }
+    }
+
+    out
 }
 
 /// `Any` 的驱动表是全局一次性的，注册多次无害但没必要。
@@ -263,6 +343,10 @@ pub async fn ensure_database(url: &str) -> Result<DatabaseOutcome> {
 }
 
 /// 执行建表语句（幂等，可重复运行）；按后端选对应的 schema。
+///
+/// SQLite 老库还要额外补列：SQLite 没有 `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`，
+/// 只靠 `CREATE TABLE IF NOT EXISTS` 不会给已存在的表加新列（例如 `bills.excluded`），
+/// 所以这里按 [`SQLITE_ADDED_COLUMNS`] 逐列检查后补上。
 pub async fn init_schema(pool: &Pool) -> Result<()> {
     let schema = match pool.kind() {
         DbKind::Postgres => SCHEMA_POSTGRES_SQL,
@@ -273,6 +357,50 @@ pub async fn init_schema(pool: &Pool) -> Result<()> {
         .execute(pool.any())
         .await
         .with_context(|| format!("初始化{}表结构失败", pool.kind().label()))?;
+
+    if pool.kind() == DbKind::Sqlite {
+        migrate_sqlite_columns(pool).await?;
+    }
+    Ok(())
+}
+
+/// 后加的列：`(表名, 列名, 补列 DDL)`。
+///
+/// 两份 schema 都写了新列，但老 SQLite 文件里那几张表已经存在，必须单独补。
+/// 以后再加列，除了改两份 schema，也要在这里登记一条（PG 侧由 schema 里的
+/// `ADD COLUMN IF NOT EXISTS` 负责）。
+const SQLITE_ADDED_COLUMNS: &[(&str, &str, &str)] = &[(
+    "bills",
+    "excluded",
+    "ALTER TABLE bills ADD COLUMN excluded INTEGER NOT NULL DEFAULT 0",
+)];
+
+/// 给老 SQLite 库补上后加的列（幂等：先查 `pragma_table_info`，有就跳过）。
+async fn migrate_sqlite_columns(pool: &Pool) -> Result<()> {
+    for (table, column, ddl) in SQLITE_ADDED_COLUMNS {
+        // 表名/列名来自上面的常量，不接外部输入；这里只是拼 SQL 字面量
+        let found: Option<(i64,)> = sqlx::query_as(&format!(
+            "SELECT 1 FROM pragma_table_info('{table}') WHERE name = '{column}'"
+        ))
+        .fetch_optional(pool.any())
+        .await
+        .with_context(|| format!("检查 {table}.{column} 是否存在失败"))?;
+
+        if found.is_some() {
+            continue;
+        }
+
+        if let Err(error) = sqlx::raw_sql(ddl).execute(pool.any()).await {
+            // 两个进程同时启动时可能都被判定为「缺列」，后到的那个会撞上重复列；
+            // 这属于已达成目标，忽略即可。
+            let message = format!("{error:?}").to_ascii_lowercase();
+            if message.contains("duplicate column") {
+                continue;
+            }
+            return Err(error).with_context(|| format!("给 {table} 补列 {column} 失败"));
+        }
+    }
+
     Ok(())
 }
 
@@ -486,23 +614,28 @@ pub fn with_database(url: &str, database: &str) -> Result<String> {
     Ok(result)
 }
 
-/// 外键冲突：PostgreSQL 报 SQLSTATE `23503`，SQLite 报扩展码 787 / 消息文本。
+/// 外键冲突：PostgreSQL 报 SQLSTATE `23503`，SQLite 报扩展码 `787`（`FOREIGN KEY constraint failed`）。
 pub fn is_foreign_key_violation(error: &sqlx::Error) -> bool {
     match error {
         sqlx::Error::Database(db) => {
-            db.code().as_deref() == Some("23503")
+            matches!(db.code().as_deref(), Some("23503") | Some("787"))
                 || db.message().to_ascii_lowercase().contains("foreign key")
         }
         _ => false,
     }
 }
 
-/// 唯一约束冲突：PostgreSQL 报 SQLSTATE `23505`，SQLite 报扩展码 2067 / 消息文本。
+/// 唯一约束冲突：PostgreSQL 报 SQLSTATE `23505`；
+/// SQLite 报扩展码 `2067`（UNIQUE）或 `1555`（PRIMARY KEY），消息里是 `UNIQUE constraint failed`。
 pub fn is_unique_violation(error: &sqlx::Error) -> bool {
     match error {
         sqlx::Error::Database(db) => {
-            matches!(db.code().as_deref(), Some("23505") | Some("2067"))
+            matches!(db.code().as_deref(), Some("23505") | Some("2067") | Some("1555"))
                 || db.message().to_ascii_lowercase().contains("unique constraint")
+                || db
+                    .message()
+                    .to_ascii_lowercase()
+                    .contains("duplicate key value")
         }
         _ => false,
     }
@@ -798,6 +931,11 @@ mod tests {
             is_foreign_key_violation(sqlx_error),
             "SQLite 的外键错误也要能识别：{error:?}"
         );
+        assert_eq!(
+            sqlite_error_code(sqlx_error).as_deref(),
+            Some("787"),
+            "SQLite 的外键约束扩展码应为 787"
+        );
 
         // 唯一约束（账本重名）
         let error = books.insert("微信").await.expect_err("重名账本应被拒绝");
@@ -808,6 +946,267 @@ mod tests {
             is_unique_violation(sqlx_error),
             "SQLite 的唯一约束错误也要能识别：{error:?}"
         );
+        assert_eq!(
+            sqlite_error_code(sqlx_error).as_deref(),
+            Some("2067"),
+            "SQLite 的唯一约束扩展码应为 2067"
+        );
+        // service 层靠 `describe` 把 SQLite 错误翻成单行友好提示
+        let described = describe(error, "账本「微信」已存在");
+        assert_eq!(described.to_string(), "账本「微信」已存在");
+        assert_eq!(described.chain().count(), 1, "友好提示不应再挂底层原因链");
+
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 从 sqlx 错误里取出数据库扩展码（SQLite 是十进制字符串）。
+    fn sqlite_error_code(error: &sqlx::Error) -> Option<String> {
+        match error {
+            sqlx::Error::Database(db) => db.code().map(|code| code.to_string()),
+            _ => None,
+        }
+    }
+
+    /// 占位符改写只动真正的占位符：字符串字面量、注释里的 `?` 必须原样保留。
+    #[test]
+    fn rewrites_placeholders_only_outside_literals() {
+        assert_eq!(
+            rewrite_placeholders("SELECT * FROM bills WHERE id = ? AND book_id = ?"),
+            "SELECT * FROM bills WHERE id = $1 AND book_id = $2"
+        );
+        // 字符串字面量里的问号不是占位符
+        assert_eq!(
+            rewrite_placeholders("INSERT INTO t (memo) VALUES ('?') RETURNING id"),
+            "INSERT INTO t (memo) VALUES ('?') RETURNING id"
+        );
+        assert_eq!(
+            rewrite_placeholders("SELECT 'why?' AS q WHERE id = ?"),
+            "SELECT 'why?' AS q WHERE id = $1"
+        );
+        // 连写两个单引号是转义，不算字符串结束
+        assert_eq!(
+            rewrite_placeholders("SELECT 'it''s ?' WHERE id = ?"),
+            "SELECT 'it''s ?' WHERE id = $1"
+        );
+        // 引号标识符（含问号的列名）也不改
+        assert_eq!(
+            rewrite_placeholders("SELECT \"what?\" FROM t WHERE id = ?"),
+            "SELECT \"what?\" FROM t WHERE id = $1"
+        );
+        // 注释里的问号不改
+        assert_eq!(
+            rewrite_placeholders("SELECT ? -- 为什么是 ?\n"),
+            "SELECT $1 -- 为什么是 ?\n"
+        );
+        assert_eq!(
+            rewrite_placeholders("SELECT ? /* ? */"),
+            "SELECT $1 /* ? */"
+        );
+    }
+
+    /// 两份 schema 必须始终同步：表、列（含顺序）、索引一个都不能少。
+    #[test]
+    fn schemas_stay_in_sync() {
+        let postgres = parse_schema_tables(SCHEMA_POSTGRES_SQL);
+        let sqlite = parse_schema_tables(SCHEMA_SQLITE_SQL);
+
+        let postgres_tables: Vec<&String> = postgres.keys().collect();
+        let sqlite_tables: Vec<&String> = sqlite.keys().collect();
+        assert_eq!(
+            postgres_tables, sqlite_tables,
+            "两份 schema 的表必须一一对应"
+        );
+
+        for (table, postgres_columns) in &postgres {
+            let sqlite_columns = sqlite.get(table).expect("表集合已比对过");
+            assert_eq!(
+                postgres_columns, sqlite_columns,
+                "表 {table} 的列必须一致（含顺序）"
+            );
+        }
+
+        assert_eq!(
+            parse_schema_indexes(SCHEMA_POSTGRES_SQL),
+            parse_schema_indexes(SCHEMA_SQLITE_SQL),
+            "两份 schema 的索引必须一致"
+        );
+    }
+
+    /// 从建表语句里抽出 `表名 -> 列名列表`（够用即可：本项目 schema 一行一列）。
+    fn parse_schema_tables(sql: &str) -> std::collections::BTreeMap<String, Vec<String>> {
+        const MARKER: &str = "CREATE TABLE IF NOT EXISTS ";
+
+        // 注释里也可能出现 `CREATE TABLE ...` 字样，先按行剥掉，避免被当成真表
+        let sql = strip_sql_comments(sql);
+
+        let mut tables = std::collections::BTreeMap::new();
+        let mut cursor = 0;
+
+        while let Some(found) = sql[cursor..].find(MARKER) {
+            let after_marker = cursor + found + MARKER.len();
+            let rest = &sql[after_marker..];
+
+            let name_end = rest
+                .find(|character: char| character.is_whitespace() || character == '(')
+                .expect("表名后面一定有空白或左括号");
+            let name = rest[..name_end].trim().to_string();
+
+            let open = rest.find('(').expect("建表语句一定有左括号");
+            let mut depth = 0_i32;
+            let mut close = None;
+            for (offset, character) in rest[open..].char_indices() {
+                match character {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            close = Some(open + offset);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let close = close.expect("建表语句的括号必须配对");
+            let body = &rest[open + 1..close];
+
+            let mut columns = Vec::new();
+            for line in body.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with("--") {
+                    continue;
+                }
+                let first = line.split_whitespace().next().expect("非空行一定有内容");
+                let keyword = first.to_ascii_uppercase();
+                if matches!(
+                    keyword.as_str(),
+                    "PRIMARY" | "UNIQUE" | "FOREIGN" | "CONSTRAINT" | "CHECK"
+                ) {
+                    continue;
+                }
+                columns.push(first.to_string());
+            }
+
+            tables.insert(name, columns);
+            cursor = after_marker + close + 1;
+        }
+
+        tables
+    }
+
+    /// 去掉 `--` 行注释（schema 里的注释占整行）。
+    fn strip_sql_comments(sql: &str) -> String {
+        sql.lines()
+            .filter(|line| !line.trim_start().starts_with("--"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// 从 schema 里抽出 `索引名 -> 归一化后的建索引语句`。
+    fn parse_schema_indexes(sql: &str) -> std::collections::BTreeMap<String, String> {
+        let mut indexes = std::collections::BTreeMap::new();
+        let sql = strip_sql_comments(sql);
+
+        for statement in sql.split(';') {
+            let normalized = statement.split_whitespace().collect::<Vec<_>>().join(" ");
+
+            if !normalized.to_ascii_uppercase().starts_with("CREATE INDEX")
+                && !normalized
+                    .to_ascii_uppercase()
+                    .starts_with("CREATE UNIQUE INDEX")
+            {
+                continue;
+            }
+
+            let Some(rest) = normalized.split("INDEX IF NOT EXISTS ").nth(1) else {
+                continue;
+            };
+            let name = rest
+                .split_whitespace()
+                .next()
+                .expect("索引名一定存在")
+                .to_string();
+            indexes.insert(name, normalized);
+        }
+
+        indexes
+    }
+
+    /// 造一个「旧版本」的 SQLite 库（`bills` 还没有 excluded 列），
+    /// 验证 [`init_schema`] 会像 PG 的 `ADD COLUMN IF NOT EXISTS` 一样把列补上。
+    #[tokio::test]
+    async fn sqlite_old_database_gets_the_excluded_column() {
+        use chrono::{TimeZone, Utc};
+
+        use crate::bill::dao::BillDao;
+        use crate::bill::model::BillKind;
+        use crate::bill_book::dao::BookDao;
+        use crate::category::dao::CategoryDao;
+
+        let dir = std::env::temp_dir().join(format!(
+            "biller-sqlite-old-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let url = sqlite_url(&dir.join("biller.db"));
+
+        let pool = connect(&url).await.expect("连接本地 SQLite");
+        // 旧版本 schema：bills 没有 excluded 列，也没有后加的 bank_* / app_state 表
+        sqlx::raw_sql(
+            "CREATE TABLE bill_books (
+                 id   INTEGER PRIMARY KEY AUTOINCREMENT,
+                 name TEXT NOT NULL UNIQUE
+             );
+             CREATE TABLE categories (
+                 id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                 parent_id INTEGER REFERENCES categories (id) ON DELETE RESTRICT,
+                 name      TEXT NOT NULL
+             );
+             CREATE TABLE bills (
+                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                 kind        TEXT    NOT NULL,
+                 amount      INTEGER NOT NULL,
+                 book_id     INTEGER NOT NULL REFERENCES bill_books (id) ON DELETE RESTRICT,
+                 category_id INTEGER NOT NULL REFERENCES categories (id) ON DELETE RESTRICT,
+                 created_at  TEXT    NOT NULL,
+                 remark      TEXT
+             );",
+        )
+        .execute(pool.any())
+        .await
+        .expect("造旧版表结构");
+
+        init_schema(&pool).await.expect("初始化应补齐缺失的列与表");
+        // 幂等：再跑一次不应因为「列已存在」报错
+        init_schema(&pool).await.expect("初始化必须可重复执行");
+
+        let books = BookDao::new(pool.clone());
+        let categories = CategoryDao::new(pool.clone());
+        let bills = BillDao::new(pool.clone());
+
+        let book_id = books.insert("旧库账本").await.expect("建账本");
+        let category_id = categories.insert(None, "旧库分类").await.expect("建分类");
+        let created_at = Utc.with_ymd_and_hms(2026, 10, 1, 8, 0, 0).unwrap();
+        let bill_id = bills
+            .insert(
+                BillKind::Expense,
+                500,
+                book_id,
+                category_id,
+                created_at,
+                Some("旧库里的账单"),
+            )
+            .await
+            .expect("旧库补列后必须能记账");
+
+        let bill = bills.get(bill_id).await.expect("取单条").expect("应存在");
+        assert!(!bill.excluded, "补出来的列默认是 0（计入日历）");
+
+        bills.set_excluded(bill_id, true).await.expect("切换计入日历");
+        let bill = bills.get(bill_id).await.expect("取单条").expect("应存在");
+        assert!(bill.excluded, "补出来的列也必须能写");
 
         pool.close().await;
         let _ = std::fs::remove_dir_all(&dir);

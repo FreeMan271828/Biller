@@ -32,60 +32,86 @@ impl BookDao {
     }
 
     pub async fn insert(&self, name: &str) -> Result<BookId> {
-        let (id,): (i64,) = sqlx::query_as("INSERT INTO bill_books (name) VALUES ($1) RETURNING id")
-            .bind(name)
-            .fetch_one(self.pool.any())
-            .await?;
+        let (id,): (i64,) = sqlx::query_as(&self.pool.shared(
+            "INSERT INTO bill_books (name) VALUES (?) RETURNING id",
+        ))
+        .bind(name)
+        .fetch_one(self.pool.any())
+        .await?;
         Ok(id as BookId)
     }
 
     pub async fn list(&self) -> Result<Vec<BillBook>> {
-        let rows = sqlx::query_as::<_, BookRow>("SELECT id, name FROM bill_books ORDER BY id")
-            .fetch_all(self.pool.any())
-            .await?;
+        let rows = sqlx::query_as::<_, BookRow>(
+            &self
+                .pool
+                .shared("SELECT id, name FROM bill_books ORDER BY id"),
+        )
+        .fetch_all(self.pool.any())
+        .await?;
         Ok(rows.into_iter().map(BillBook::from).collect())
     }
 
     pub async fn get(&self, id: BookId) -> Result<Option<BillBook>> {
-        let row = sqlx::query_as::<_, BookRow>("SELECT id, name FROM bill_books WHERE id = $1")
-            .bind(id as i64)
-            .fetch_optional(self.pool.any())
-            .await?;
+        let row = sqlx::query_as::<_, BookRow>(
+            &self
+                .pool
+                .shared("SELECT id, name FROM bill_books WHERE id = ?"),
+        )
+        .bind(id as i64)
+        .fetch_optional(self.pool.any())
+        .await?;
         Ok(row.map(BillBook::from))
     }
 
     pub async fn find_by_name(&self, name: &str) -> Result<Option<BillBook>> {
-        let row = sqlx::query_as::<_, BookRow>("SELECT id, name FROM bill_books WHERE name = $1")
-            .bind(name)
-            .fetch_optional(self.pool.any())
-            .await?;
+        let row = sqlx::query_as::<_, BookRow>(
+            &self
+                .pool
+                .shared("SELECT id, name FROM bill_books WHERE name = ?"),
+        )
+        .bind(name)
+        .fetch_optional(self.pool.any())
+        .await?;
         Ok(row.map(BillBook::from))
     }
 
     /// 改名；返回受影响行数。
     pub async fn update(&self, id: BookId, name: &str) -> Result<u64> {
-        let result = sqlx::query("UPDATE bill_books SET name = $1 WHERE id = $2")
-            .bind(name)
-            .bind(id as i64)
-            .execute(self.pool.any())
-            .await?;
+        let result = sqlx::query(
+            &self
+                .pool
+                .shared("UPDATE bill_books SET name = ? WHERE id = ?"),
+        )
+        .bind(name)
+        .bind(id as i64)
+        .execute(self.pool.any())
+        .await?;
         Ok(result.rows_affected())
     }
 
     /// 该账本下的账单数量，用于删除前的友好提示。
     pub async fn count_bills(&self, id: BookId) -> Result<i64> {
-        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM bills WHERE book_id = $1")
-            .bind(id as i64)
-            .fetch_one(self.pool.any())
-            .await?;
+        let (count,): (i64,) = sqlx::query_as(
+            &self
+                .pool
+                .shared("SELECT COUNT(*) FROM bills WHERE book_id = ?"),
+        )
+        .bind(id as i64)
+        .fetch_one(self.pool.any())
+        .await?;
         Ok(count)
     }
 
     pub async fn delete(&self, id: BookId) -> Result<u64> {
-        let result = sqlx::query("DELETE FROM bill_books WHERE id = $1")
-            .bind(id as i64)
-            .execute(self.pool.any())
-            .await?;
+        let result = sqlx::query(
+            &self
+                .pool
+                .shared("DELETE FROM bill_books WHERE id = ?"),
+        )
+        .bind(id as i64)
+        .execute(self.pool.any())
+        .await?;
         Ok(result.rows_affected())
     }
 }

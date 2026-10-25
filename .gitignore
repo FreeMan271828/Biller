@@ -3,3 +3,6 @@
 .env
 pictures
 /tests
+
+# DSH 工具临时目录
+.dsh-tmp/

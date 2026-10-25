@@ -4,6 +4,7 @@
 //! `model`（数据结构）→ `dao`（SQL）→ `service`（业务规则）→ `tui`（终端交互）。
 //! 领域之间只允许通过对方的 `service` 交互，公共能力放在 [`common`]。
 
+pub mod bank;
 pub mod bill;
 pub mod bill_book;
 pub mod category;

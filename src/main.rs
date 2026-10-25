@@ -4,6 +4,8 @@ use anyhow::Result;
 use chrono::Utc;
 use clap::{Parser, Subcommand};
 
+use biller::bank::service::BankService;
+use biller::bank::tui::{self as bank_tui, SyncCmd};
 use biller::bill::service::BillService;
 use biller::bill::tui::{self as bill_tui, BillCmd};
 use biller::bill_book::service::BookService;
@@ -55,6 +57,11 @@ enum Command {
     Bill {
         #[command(subcommand)]
         cmd: BillCmd,
+    },
+    /// 银行流水同步（复用本机浏览器里的登录会话）
+    Sync {
+        #[command(subcommand)]
+        cmd: SyncCmd,
     },
     /// 月度记账
     Month {
@@ -139,6 +146,10 @@ async fn main() -> Result<()> {
         Command::Bill { cmd } => {
             let pool = require_pool(&pool)?;
             bill_tui::run(&BillService::new(pool), cmd).await
+        }
+        Command::Sync { cmd } => {
+            let pool = require_pool(&pool)?;
+            bank_tui::run(&BankService::new(pool), cmd).await
         }
         Command::Month { cmd } => {
             let pool = require_pool(&pool)?;

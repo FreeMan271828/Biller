@@ -162,7 +162,10 @@ impl AppConfig {
     }
 }
 
-/// 去掉两侧引号，并把转义过的反斜杠还原。
+/// 去掉两侧引号，并还原 [`escape`] 写进去的反斜杠转义。
+///
+/// 必须逐字符处理：先还 `\"` 再还 `\\` 之类的固定顺序会在
+/// `a\"b` 这种内容上还原错（连接串密码里真出现引号时就会读错）。
 fn unquote(value: &str) -> String {
     let trimmed = value.trim();
     let stripped = trimmed
@@ -170,7 +173,25 @@ fn unquote(value: &str) -> String {
         .and_then(|rest| rest.strip_suffix('"'))
         .unwrap_or(trimmed);
 
-    stripped.replace("\\\\", "\\")
+    let mut out = String::with_capacity(stripped.len());
+    let mut chars = stripped.chars();
+    while let Some(character) = chars.next() {
+        if character != '\\' {
+            out.push(character);
+            continue;
+        }
+        match chars.next() {
+            Some('\\') => out.push('\\'),
+            Some('"') => out.push('"'),
+            // 不认识的转义原样保留，避免吃掉内容
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
 }
 
 /// 写进配置前转义反斜杠与引号（Windows 路径必须有这一步）。
@@ -188,6 +209,16 @@ mod tests {
         let path = r"C:\Users\me\.biller\biller.db";
         assert_eq!(unquote(&format!("\"{}\"", escape(path))), path);
         assert_eq!(escape(r"a\b"), r"a\\b");
+    }
+
+    #[test]
+    fn round_trips_values_containing_quotes_and_backslashes() {
+        // 密码里同时有引号和反斜杠时也不能读错
+        let value = "p@ss\"word\\x";
+        assert_eq!(unquote(&format!("\"{}\"", escape(value))), value);
+        assert_eq!(unquote(r#""a\"b""#), "a\"b");
+        // 不认识的转义原样保留
+        assert_eq!(unquote(r#""a\nb""#), r"a\nb");
     }
 
     #[test]

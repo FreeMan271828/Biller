@@ -55,3 +55,41 @@ CREATE TABLE IF NOT EXISTS app_state (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+-- ===== 银行流水同步 =====
+
+-- 同步账户（同一张卡在页面里的两个标识）。
+CREATE TABLE IF NOT EXISTS bank_accounts (
+    id             BIGSERIAL PRIMARY KEY,
+    account_uid    TEXT NOT NULL UNIQUE,
+    sub_account_no TEXT NOT NULL,
+    alias          TEXT NOT NULL DEFAULT '',
+    is_default     BOOLEAN NOT NULL DEFAULT FALSE
+);
+
+-- 已导入过的银行流水：fingerprint 唯一，保证重复同步不会重复记账。
+CREATE TABLE IF NOT EXISTS bank_imports (
+    fingerprint TEXT PRIMARY KEY,
+    txn_date    DATE   NOT NULL,
+    txn_money   BIGINT NOT NULL,
+    memo        TEXT   NOT NULL,
+    bill_id     BIGINT REFERENCES bills (id) ON DELETE SET NULL,
+    imported_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- 记忆规则一：店家（归一化后的 memo）→ 账本 + 分类。优先级最高。
+CREATE TABLE IF NOT EXISTS merchant_memory (
+    memo_key     TEXT PRIMARY KEY,
+    book_id      BIGINT  NOT NULL REFERENCES bill_books (id) ON DELETE CASCADE,
+    category_id  BIGINT  NOT NULL REFERENCES categories (id) ON DELETE CASCADE,
+    hits         INTEGER NOT NULL DEFAULT 1,
+    last_used_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- 记忆规则二：关键词 → 分类。只在规则一没命中时兜底。
+CREATE TABLE IF NOT EXISTS keyword_rules (
+    keyword      TEXT PRIMARY KEY,
+    category_id  BIGINT  NOT NULL REFERENCES categories (id) ON DELETE CASCADE,
+    hits         INTEGER NOT NULL DEFAULT 1,
+    last_used_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
