@@ -78,7 +78,17 @@ pub async fn run(
     let result = async {
         let mut app = App::new(month, &connection_url, &sqlite_path);
         match services.as_ref() {
-            Some(services) => app.reload(services).await?,
+            Some(services) => {
+                // 1.4 之前计划存成 app_state 里的一串 JSON：开界面时顺手搬进计划列表。
+                // 迁移自己写 `plan.migrated` 标记，重复打开只会白跑一次查询。
+                let migrated = services.plans.migrate_items_into_plans().await?;
+                app.reload(services).await?;
+                if migrated > 0 {
+                    app.status = Some(app::Status::Info(format!(
+                        "已把 {migrated} 个旧计划块搬进计划列表"
+                    )));
+                }
+            }
             // 连不上也照样进界面：先让用户看到引导页，去设置里配好库
             None => app.mark_needs_setup(),
         }

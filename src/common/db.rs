@@ -372,11 +372,18 @@ pub async fn init_schema(pool: &Pool) -> Result<()> {
 /// 两份 schema 都写了新列，但老 SQLite 文件里那几张表已经存在，必须单独补。
 /// 以后再加列，除了改两份 schema，也要在这里登记一条（PG 侧由 schema 里的
 /// `ADD COLUMN IF NOT EXISTS` 负责）。
-const SQLITE_ADDED_COLUMNS: &[(&str, &str, &str)] = &[(
-    "bills",
-    "excluded",
-    "ALTER TABLE bills ADD COLUMN excluded INTEGER NOT NULL DEFAULT 0",
-)];
+const SQLITE_ADDED_COLUMNS: &[(&str, &str, &str)] = &[
+    (
+        "bills",
+        "excluded",
+        "ALTER TABLE bills ADD COLUMN excluded INTEGER NOT NULL DEFAULT 0",
+    ),
+    (
+        "bill_books",
+        "plan_limit",
+        "ALTER TABLE bill_books ADD COLUMN plan_limit INTEGER",
+    ),
+];
 
 /// 给老 SQLite 库补上后加的列（幂等：先查 `pragma_table_info`，有就跳过）。
 async fn migrate_sqlite_columns(pool: &Pool) -> Result<()> {
@@ -836,7 +843,7 @@ mod tests {
         let bills = BillDao::new(pool.clone());
         let months = MonthDao::new(pool.clone());
 
-        let book_id = books.insert("微信").await.expect("建账本");
+        let book_id = books.insert("微信", None).await.expect("建账本");
         let category_id = categories.insert(None, "餐饮").await.expect("建分类");
 
         let created_at = chrono::Utc.with_ymd_and_hms(2026, 10, 5, 12, 0, 0).unwrap();
@@ -944,7 +951,7 @@ mod tests {
         );
 
         // 唯一约束（账本重名）
-        let error = books.insert("微信").await.expect_err("重名账本应被拒绝");
+        let error = books.insert("微信", None).await.expect_err("重名账本应被拒绝");
         let sqlx_error = error
             .downcast_ref::<sqlx::Error>()
             .expect("DAO 应把 sqlx 错误原样往上抛");
@@ -1192,7 +1199,7 @@ mod tests {
         let categories = CategoryDao::new(pool.clone());
         let bills = BillDao::new(pool.clone());
 
-        let book_id = books.insert("旧库账本").await.expect("建账本");
+        let book_id = books.insert("旧库账本", None).await.expect("建账本");
         let category_id = categories.insert(None, "旧库分类").await.expect("建分类");
         let created_at = Utc.with_ymd_and_hms(2026, 10, 1, 8, 0, 0).unwrap();
         let bill_id = bills

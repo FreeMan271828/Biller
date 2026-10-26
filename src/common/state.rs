@@ -28,6 +28,15 @@ impl StateStore {
         Ok(row.map(|(value,)| value))
     }
 
+    /// 删掉一个键；键本来就不存在也算成功。
+    pub async fn remove(&self, key: &str) -> Result<()> {
+        sqlx::query(&self.pool.shared("DELETE FROM app_state WHERE key = ?"))
+            .bind(key)
+            .execute(self.pool.any())
+            .await?;
+        Ok(())
+    }
+
     pub async fn set(&self, key: &str, value: &str) -> Result<()> {
         sqlx::query(&self.pool.shared(
             "INSERT INTO app_state (key, value) VALUES (?, ?)

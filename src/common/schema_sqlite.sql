@@ -9,8 +9,10 @@
 --     里的 `migrate_sqlite_columns` 按 `pragma_table_info` 检查后补上（见 common/db.rs）。
 
 CREATE TABLE IF NOT EXISTS bill_books (
-    id   INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL UNIQUE
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    name       TEXT NOT NULL UNIQUE,
+    -- 计划的上限（分）。NULL = 不设上限：这个计划只从 0 开始累计
+    plan_limit INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS categories (

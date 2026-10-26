@@ -12,9 +12,9 @@ pub struct Category {
 
 /// 子分类名 → 父分类名。
 ///
-/// 计划里按分类对账时，一笔打在「餐饮/外卖」上的账单也要算进「餐饮」的预算，
-/// 所以先把父子关系摊平成一张表，再让 [`crate::plan::model::expense_by_category`]
-/// 沿这张表往上加。名字相同时取先出现的那条——分类名在库里就是按父级唯一的。
+/// 按分类统计支出时，一笔打在「餐饮/外卖」上的账单也要算进「餐饮」，
+/// 所以先把父子关系摊平成一张表，再沿这张表往上加。
+/// 名字相同时取先出现的那条——分类名在库里就是按父级唯一的。
 pub fn parent_names(categories: &[Category]) -> HashMap<String, String> {
     let by_id: HashMap<CategoryId, &str> = categories
         .iter()

@@ -4,7 +4,7 @@ use crate::common::db::Pool;
 use anyhow::{Context, Result, bail};
 
 use crate::bill_book::dao::BookDao;
-use crate::bill_book::model::BillBook;
+use crate::bill_book::model::{BillBook, Plan};
 use crate::common::db;
 use crate::common::types::BookId;
 
@@ -20,15 +20,15 @@ impl BookService {
         }
     }
 
-    /// 新增账本；重名时报错。
-    pub async fn add(&self, name: &str) -> Result<BillBook> {
+    /// 新增计划（账本）；重名时报错。`limit = None` 表示从 0 开始记录、不设上限。
+    pub async fn add(&self, name: &str, limit: Option<crate::common::types::AmountType>) -> Result<BillBook> {
         let name = normalize(name)?;
         if self.dao.find_by_name(name).await?.is_some() {
             bail!("账本「{name}」已存在");
         }
         let id = self
             .dao
-            .insert(name)
+            .insert(name, limit)
             .await
             .map_err(|error| db::describe(error, &format!("账本「{name}」已存在")))?;
         Ok(BillBook {
@@ -39,6 +39,24 @@ impl BookService {
 
     pub async fn list(&self) -> Result<Vec<BillBook>> {
         self.dao.list().await
+    }
+
+    /// 计划列表（账本 + 上限）。
+    pub async fn list_plans(&self) -> Result<Vec<Plan>> {
+        self.dao.list_plans().await
+    }
+
+    /// 设置/取消某个计划的上限。
+    pub async fn set_limit(
+        &self,
+        id: BookId,
+        limit: Option<crate::common::types::AmountType>,
+    ) -> Result<()> {
+        let affected = self.dao.set_limit(id, limit).await?;
+        if affected == 0 {
+            bail!("计划 id={id} 不存在");
+        }
+        Ok(())
     }
 
     /// 按名称查找，不存在则报错。
@@ -56,7 +74,7 @@ impl BookService {
         match self.dao.find_by_name(name).await? {
             Some(book) => Ok((book, false)),
             None => {
-                let id = self.dao.insert(name).await?;
+                let id = self.dao.insert(name, None).await?;
                 Ok((
                     BillBook {
                         id,

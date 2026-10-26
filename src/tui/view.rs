@@ -26,7 +26,7 @@ use crate::common::table::{display_width, pad_right};
 use crate::common::types::AmountType;
 use crate::common::{money, time};
 use crate::month::service::MonthReport;
-use crate::plan::model::DayStatus;
+use crate::plan::model::{DayStatus, total_limit};
 use crate::tui::app::{App, Form, Modal, Page, ReportTab, SettingsFocus, SettingsSection};
 
 // ---------------------------------------------------------------------------
@@ -86,21 +86,39 @@ pub fn render(frame: &mut Frame, app: &App) {
 // 顶栏
 // ---------------------------------------------------------------------------
 
-/// 1 行顶栏：左「品牌 + 当前月 + 换月键」、中「胶囊页签」、右「连接状态」。
+/// 1 行顶栏：左「品牌 + 当前月 + 换月键 + 设置入口」、中「胶囊页签」、右「连接状态」。
 fn render_topbar(frame: &mut Frame, area: Rect, app: &App) {
     let width = area.width as usize;
+
+    // 左：biller 2026-10  [ / ] 换月  , 设置
+    //
+    // 设置不在页签队列里（一年点不了几次），但入口必须一直看得见——
+    // 只在帮助里写 `,` 等于没有入口。在设置页时提示改成「, 返回」。
+    let settings_hint = if app.page == Page::Settings { ", 返回" } else { ", 设置" };
+    let left = Line::from(vec![
+        Span::styled("biller", bold(ACCENT)),
+        Span::raw(" "),
+        Span::styled(time::format_month(app.month), bold(WARN)),
+        Span::raw("  "),
+        Span::styled("[ / ] 换月", muted()),
+        Span::raw("  "),
+        Span::styled(settings_hint, muted()),
+    ]);
+    let left_w = left.width();
+
     // 页签宽度跟着页数走，别写死：标题都是 2 个字，带序号的胶囊 8 列、不带序号 6 列，组间 1 列
     let tabs = Page::ALL.len();
     let gaps = tabs.saturating_sub(1);
     let numeric_w = tabs * 8 + gaps;
     let compact_w = tabs * 6 + gaps;
     // 窄终端先砍掉右槽，再砍掉页签序号，保证左边永远先画出来
-    let (left_w, tab_w, numeric, right_w) = if width >= 27 + numeric_w + 16 {
-        (27usize, numeric_w, true, width - 27 - numeric_w)
-    } else if width >= 27 + compact_w {
-        (27, compact_w, false, 0)
+    let (tab_w, numeric, right_w) = if width >= left_w + 1 + numeric_w + 16 {
+        (numeric_w, true, width - left_w - 1 - numeric_w)
+    } else if width >= left_w + 1 + compact_w {
+        (compact_w, false, 0)
     } else {
-        (width, 0, false, 0)
+        // 实在窄：左边都放不下时优先留左侧，页签和右槽都不要
+        (0, false, 0)
     };
 
     let cols = Layout::horizontal([
@@ -110,14 +128,6 @@ fn render_topbar(frame: &mut Frame, area: Rect, app: &App) {
     ])
     .split(area);
 
-    // 左：biller 2026-10  [ / ] 换月
-    let left = Line::from(vec![
-        Span::styled("biller", bold(ACCENT)),
-        Span::raw(" "),
-        Span::styled(time::format_month(app.month), bold(WARN)),
-        Span::raw("  "),
-        Span::styled("[ / ] 换月", muted()),
-    ]);
     frame.render_widget(Paragraph::new(left), cols[0]);
 
     // 中：胶囊页签，当前页反色（ACCENT 底 + 黑字加粗）
@@ -429,13 +439,12 @@ fn render_settings(frame: &mut Frame, area: Rect, app: &App) {
     let rows = Layout::vertical([Constraint::Min(6), Constraint::Length(4)]).split(cols[1]);
     match app.settings_section {
         SettingsSection::Connection => render_connection_panel(frame, rows[0], app),
-        SettingsSection::Books => render_books_panel(frame, rows[0], app),
         SettingsSection::Categories => render_categories_panel(frame, rows[0], app),
     }
     render_settings_actions(frame, rows[1], app);
 }
 
-/// 一级菜单：数据库连接 / 账本 / 分类。
+/// 一级菜单：分类 / 数据库连接。
 ///
 /// 焦点在菜单上时选中项整行反色 + 前置 ▶；焦点进了右侧列表后不再反色，
 /// 只留一个 ACCENT 的 ▶——这样一眼能看出「现在按 ↑↓ 移动的是哪一级」。
@@ -546,59 +555,6 @@ fn render_connection_panel(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-/// 账本分区：列表 + 位置提示。
-fn render_books_panel(frame: &mut Frame, area: Rect, app: &App) {
-    let selected = app.settings_index();
-    // 焦点在左边菜单时，右侧列表只当预览看，不显示第二个光标
-    let focused = app.settings_focus == SettingsFocus::Detail;
-    let title = format!(
-        "账本 · 共 {} 个{}",
-        app.books.len(),
-        if focused {
-            position_hint(selected, app.books.len())
-        } else {
-            String::new()
-        }
-    );
-
-    if app.books.is_empty() {
-        render_placeholder(
-            frame,
-            area,
-            block_with_title(true, title),
-            "还没有账本",
-            "按 a 新增一个，例如「微信」「支付宝」",
-        );
-        return;
-    }
-
-    let rows = app
-        .books
-        .iter()
-        .enumerate()
-        .map(|(index, book)| {
-            let highlight_row = focused && index == selected;
-            let id_cell = Cell::from(Span::styled(
-                book.id.to_string(),
-                if highlight_row { muted() } else { muted() },
-            ));
-            let name_cell = if highlight_row {
-                Cell::from(Line::from(book.name.clone()))
-            } else {
-                Cell::from(Line::from(Span::styled(book.name.clone(), plain())))
-            };
-            Row::new(vec![id_cell, name_cell]).style(highlight(highlight_row))
-        })
-        .collect::<Vec<_>>();
-
-    let table = Table::new(rows, [Constraint::Length(6), Constraint::Min(12)])
-        .header(Row::new(vec![header_cell("ID"), header_cell("账本")]).style(header_style()))
-        .column_spacing(1)
-        .block(block_with_title(focused, title));
-
-    render_following_table(frame, area, table, focused.then_some(selected));
-}
-
 /// 分类分区：树状缩进 + 父分类列。
 fn render_categories_panel(frame: &mut Frame, area: Rect, app: &App) {
     let names: HashMap<u64, String> = app
@@ -704,17 +660,6 @@ fn render_settings_actions(frame: &mut Frame, area: Rect, app: &App) {
             actions.push(("t", "整库数据迁移"));
             "设置写进 config.toml / .env（含明文密码，已在 .gitignore）"
         }
-        SettingsSection::Books => {
-            if app.settings_focus == SettingsFocus::Menu {
-                actions.push(("Enter", "进列表"));
-            } else {
-                actions.push(("Enter", "改名"));
-            }
-            actions.push(("a", "新增账本"));
-            actions.push(("e", "改名"));
-            actions.push(("d", "删除"));
-            "账本回答「钱从哪走」；删之前先把名下账单清掉"
-        }
         SettingsSection::Categories => {
             if app.settings_focus == SettingsFocus::Menu {
                 actions.push(("Enter", "进列表"));
@@ -803,7 +748,7 @@ fn render_month_bar(frame: &mut Frame, area: Rect, app: &App) {
         .unwrap_or(report.collection.total_expense);
     let limit = progress
         .map(|progress| progress.limit)
-        .unwrap_or_else(|| app.plan.limit());
+        .unwrap_or_else(|| total_limit(&app.plans));
     let average = progress.map(|progress| progress.daily_average).unwrap_or(0);
     let days = month_shape(app.month.year(), app.month.month()).1;
 
@@ -1097,28 +1042,35 @@ fn calendar_cell(day: u32, status: DayStatus, selected: bool, cell: usize) -> Sp
 // 计划
 // ---------------------------------------------------------------------------
 
-/// 计划：左边是分好的 n 块，右边给出「合计 vs 收入」的覆盖结论。
+/// 计划：左边是全部计划，右边给出「额度合计 vs 收入」的覆盖结论。
+///
+/// 计划 = 一个名字 + 可选上限：账单记在哪个计划名下，那个计划的「已花」就自动涨。
+/// 有上限的判超支，没上限的只从 0 开始累计——两种都在这张表里，不再分两套概念。
 fn render_plan(frame: &mut Frame, area: Rect, app: &App) {
-    let plan = &app.plan;
-    let count = plan.items().len();
-    let title = format!(
-        "计划 · 已分 {} 块 · 合计 {}",
-        count,
-        money::format_amount(plan.total()),
-    );
+    let count = app.plans.len();
+    let total = total_limit(&app.plans);
+    let title = if total > 0 {
+        format!(
+            "计划 · 共 {} 个 · 额度合计 {}",
+            count,
+            money::format_amount(total)
+        )
+    } else {
+        format!("计划 · 共 {count} 个")
+    };
 
     if count == 0 {
         render_placeholder(
             frame,
             area,
             block_with_title(true, title),
-            "还没分钱",
-            "按 a 把收入分成几块 · 例如 日常开销 3000 / 存款 9000",
+            "还没有计划",
+            "按 a 新建一个 · 想控预算就填上限，只想记花销就留空",
         );
         return;
     }
 
-    // 宽屏左右分栏（列表 | 校验），窄屏上下叠：先看块，再看够不够
+    // 宽屏左右分栏（列表 | 校验），窄屏上下叠：先看计划，再看够不够
     if area.width >= 96 {
         let columns = Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)])
             .split(area);
@@ -1131,64 +1083,47 @@ fn render_plan(frame: &mut Frame, area: Rect, app: &App) {
     }
 }
 
-/// 计划列表：名称 / 额度 / 已花 / 剩余 / 构成，选中行高亮，底部给位置与操作提示。
+/// 计划列表：名称 / 上限 / 已花 / 剩余 / 用量，选中行高亮，底部给位置与操作提示。
 ///
-/// 「已花」和「剩余」只有绑了分类的块才有——没绑的块没有账单可以对照，
-/// 显示 `—` 比显示 0 更诚实。绑了分类的块名称后面会跟一个淡淡的分类名，
-/// 一眼能看出这块预算在盯哪个分类（子分类也会算进来）。
+/// 没上限的计划「上限」列写 `不限`、「剩余」列写 `—`：没有额度就没有「还剩多少」这件事，
+/// 显示 0 会让人以为额度用光了。
 fn render_plan_list(frame: &mut Frame, area: Rect, app: &App, title: String) {
-    let plan = &app.plan;
     let selected = app.selected_index(Page::Plan);
     let width = area.width.saturating_sub(2) as usize;
-    let income = app
-        .coverage
-        .as_ref()
-        .map(|coverage| coverage.income)
-        .unwrap_or(0);
-    let base = if income > 0 {
-        income
-    } else {
-        plan.total().max(1)
-    };
-    // 名称 8 + 三列金额 12×3 + 列间距 4，剩下给条形图
+    // 名称 8 + 三列金额 12×3 + 列间距 4，剩下给用量条
     let bar_width = width.saturating_sub(8 + 12 * 3 + 4).clamp(MIN_BAR_WIDTH, 16);
 
-    let rows = plan
-        .items()
+    let rows = app
+        .plans
         .iter()
         .enumerate()
-        .map(|(index, item)| {
+        .map(|(index, row)| {
             let chosen = index == selected;
-            let (_, bar) = share(item.amount, base, bar_width);
-            let spent = app.plan_spent.get(index).copied().flatten();
-            let (spent_text, remaining_text, remaining_style) = match spent {
-                Some(spent) => {
-                    let remaining = item.amount - spent;
-                    (
-                        money::format_amount(spent),
-                        money::format_amount(remaining.abs()),
-                        if remaining >= 0 { GOOD } else { BAD },
-                    )
-                }
-                None => ("—".to_string(), "—".to_string(), MUTED),
+            let limit = row.plan.limit.filter(|limit| *limit > 0);
+            let limit_text = match limit {
+                Some(limit) => money::format_amount(limit),
+                None => "不限".to_string(),
             };
-            let remaining_text = if spent.is_some() && item.amount - spent.unwrap_or(0) < 0 {
-                format!("超 {remaining_text}")
-            } else {
-                remaining_text
+            // 有上限：剩余可能为负 → 「超 X」；没上限：没有剩余这回事
+            let (remaining_text, remaining_style) = match (limit, row.remaining()) {
+                (Some(_), Some(rest)) if rest < 0 => {
+                    (format!("超 {}", money::format_amount(rest.abs())), BAD)
+                }
+                (Some(_), Some(rest)) => (money::format_amount(rest), GOOD),
+                _ => ("—".to_string(), MUTED),
+            };
+            let bar = match limit {
+                Some(limit) => share(row.spent, limit, bar_width).1,
+                None => BAR_EMPTY.repeat(bar_width),
             };
 
-            let name_line = match &item.category {
-                Some(category) => Line::from(vec![
-                    Span::styled(item.name.clone(), plain()),
-                    Span::styled(format!(" · {category}"), muted()),
-                ]),
-                None => Line::from(Span::styled(item.name.clone(), plain())),
-            };
-            let amount_line =
-                Line::from(Span::styled(money::format_amount(item.amount), bold(TEXT)))
-                    .right_aligned();
-            let spent_line = Line::from(Span::styled(spent_text, muted())).right_aligned();
+            let name_line = Line::from(Span::styled(row.name().to_string(), plain()));
+            let limit_line = Line::from(Span::styled(limit_text, bold(TEXT))).right_aligned();
+            let spent_line = Line::from(Span::styled(
+                money::format_amount(row.spent),
+                Style::default().fg(if row.over() { BAD } else { TEXT }),
+            ))
+            .right_aligned();
             let remaining_line =
                 Line::from(Span::styled(remaining_text, Style::default().fg(remaining_style)))
                     .right_aligned();
@@ -1196,7 +1131,7 @@ fn render_plan_list(frame: &mut Frame, area: Rect, app: &App, title: String) {
             let cells = if chosen {
                 vec![
                     Cell::from(name_line),
-                    Cell::from(amount_line),
+                    Cell::from(limit_line),
                     Cell::from(spent_line),
                     Cell::from(remaining_line),
                     Cell::from(bar),
@@ -1204,7 +1139,7 @@ fn render_plan_list(frame: &mut Frame, area: Rect, app: &App, title: String) {
             } else {
                 vec![
                     Cell::from(name_line),
-                    Cell::from(amount_line),
+                    Cell::from(limit_line),
                     Cell::from(spent_line),
                     Cell::from(remaining_line),
                     Cell::from(Span::styled(bar, Style::default().fg(ACCENT))),
@@ -1232,11 +1167,11 @@ fn render_plan_list(frame: &mut Frame, area: Rect, app: &App, title: String) {
     )
     .header(
         Row::new(vec![
-            header_cell("名称"),
-            header_cell_at("额度", Alignment::Right),
+            header_cell("计划"),
+            header_cell_at("上限", Alignment::Right),
             header_cell_at("已花", Alignment::Right),
             header_cell_at("剩余", Alignment::Right),
-            header_cell("构成"),
+            header_cell("用量"),
         ])
         .style(header_style()),
     )
@@ -1256,9 +1191,9 @@ fn render_plan_list(frame: &mut Frame, area: Rect, app: &App, title: String) {
             Paragraph::new(
                 Line::from(Span::styled(
                     format!(
-                        "第 {} / {} 块 · Enter 编辑 · d 删除",
+                        "第 {} / {} 个 · Enter 编辑 · d 删除",
                         selected + 1,
-                        plan.items().len()
+                        app.plans.len()
                     ),
                     muted(),
                 ))
@@ -1269,12 +1204,12 @@ fn render_plan_list(frame: &mut Frame, area: Rect, app: &App, title: String) {
     }
 }
 
-/// 覆盖校验：收入 / 已分 / 剩余（或缺口）一句话结论 —— 计划能不能盖住工资，看这里。
+/// 覆盖校验：收入 / 额度合计 / 剩余（或缺口）一句话结论 —— 有上限的计划盖不盖得住工资，看这里。
 fn render_plan_check(frame: &mut Frame, area: Rect, app: &App) {
     let block = block_with_title(false, "覆盖校验");
     let inner = block.inner(area);
     let width = inner.width as usize;
-    let total = app.plan.total();
+    let total = total_limit(&app.plans);
 
     let mut lines = vec![
         stat_row(
@@ -1289,33 +1224,41 @@ fn render_plan_check(frame: &mut Frame, area: Rect, app: &App) {
                     ),
                     plain(),
                 ),
-                ("已分", money::format_amount(total), bold(TEXT)),
+                ("额度", money::format_amount(total), bold(TEXT)),
             ],
             width,
         ),
         Line::from(Span::styled("─".repeat(width), Style::default().fg(BORDER))),
     ];
 
-    match app.coverage.as_ref() {
-        Some(coverage) if coverage.covers() => {
-            lines.push(Line::from(vec![Span::styled(
-                "✔ 计划能盖住收入",
-                bold(GOOD),
-            )]));
-            lines.push(Line::from(vec![
-                Span::styled("还剩 ", muted()),
-                Span::styled(money::format_amount(coverage.remaining()), bold(GOOD)),
-            ]));
-        }
-        Some(coverage) => {
-            lines.push(Line::from(Span::styled("✖ 计划盖不住收入", bold(BAD))));
-            lines.push(Line::from(vec![
-                Span::styled("差 ", muted()),
-                Span::styled(money::format_amount(coverage.shortfall()), bold(BAD)),
-            ]));
-        }
-        None => {
-            lines.push(Line::from(Span::styled("收入待汇总", muted())));
+    if total == 0 {
+        lines.push(Line::from(Span::styled("还没设上限", muted())));
+        lines.push(Line::from(Span::styled(
+            "留空上限的计划只累计，不参与校验",
+            muted(),
+        )));
+    } else {
+        match app.coverage.as_ref() {
+            Some(coverage) if coverage.covers() => {
+                lines.push(Line::from(vec![Span::styled(
+                    "✔ 额度盖得住收入",
+                    bold(GOOD),
+                )]));
+                lines.push(Line::from(vec![
+                    Span::styled("还剩 ", muted()),
+                    Span::styled(money::format_amount(coverage.remaining()), bold(GOOD)),
+                ]));
+            }
+            Some(coverage) => {
+                lines.push(Line::from(Span::styled("✖ 额度盖不住收入", bold(BAD))));
+                lines.push(Line::from(vec![
+                    Span::styled("差 ", muted()),
+                    Span::styled(money::format_amount(coverage.shortfall()), bold(BAD)),
+                ]));
+            }
+            None => {
+                lines.push(Line::from(Span::styled("收入待汇总", muted())));
+            }
         }
     }
 
@@ -1327,7 +1270,6 @@ fn render_plan_check(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-/// 计划页的用法提示：宽屏右列下半，把空白变成 onboarding。
 
 // ---------------------------------------------------------------------------
 // 账单
@@ -1481,7 +1423,7 @@ fn weekday_label(date: chrono::NaiveDate) -> &'static str {
     LABELS[date.weekday().num_days_from_monday() as usize]
 }
 
-/// 账单页一行：方向 · 金额 · 账本 · 分类 · 备注 · 计列。
+/// 账单页一行：方向 · 金额 · 计划 · 分类 · 备注 · 计列。
 fn bill_line(bill: &BillEntity, selected: bool, width: usize) -> Line<'static> {
     let kind_style = match bill.kind {
         BillKind::Income => bold(GOOD),
@@ -1524,7 +1466,7 @@ fn bill_line(bill: &BillEntity, selected: bool, width: usize) -> Line<'static> {
     Line::from(spans).style(highlight(selected))
 }
 
-/// 概览「最近动账」的一行：备注（没有就落到分类）· 金额 · 账本。
+/// 概览「最近动账」的一行：备注（没有就落到分类）· 金额 · 计划。
 fn compact_bill_line(bill: &BillEntity, width: usize) -> Line<'static> {
     let kind_style = match bill.kind {
         BillKind::Income => bold(GOOD),
@@ -1555,7 +1497,7 @@ fn compact_bill_line(bill: &BillEntity, width: usize) -> Line<'static> {
 // 月报
 // ---------------------------------------------------------------------------
 
-/// 月报：左「汇总 + 按分类收入」、右「分类 + 账本排行 + 明细」。
+/// 月报：左「汇总 + 按分类收入」、右「分类 + 计划排行 + 明细」。
 fn render_months(frame: &mut Frame, area: Rect, app: &App) {
     let Some(report) = app.report.as_ref() else {
         render_loading(frame, area, "月报", "正在汇总本月账单…");
@@ -1713,14 +1655,14 @@ fn render_income_table(frame: &mut Frame, area: Rect, report: &MonthReport) {
     frame.render_widget(table, area);
 }
 
-/// 「支出 · 分类 + 账本」：排行 + 占比 + 条形图；选中行跟着明细走。
+/// 「支出 · 分类 + 计划」：排行 + 占比 + 条形图；选中行跟着明细走。
 fn render_pair_table(frame: &mut Frame, area: Rect, app: &App, report: &MonthReport) {
     let collection = &report.collection;
     let pairs = collection.expense_pairs();
     let total = collection.total_expense;
     let selected = app.selected_index(Page::Reports);
     let title = format!(
-        "支出 · 分类 + 账本 · 合计 {}{}",
+        "支出 · 分类 + 计划 · 合计 {}{}",
         money::format_amount(total),
         position_hint(selected, pairs.len())
     );
@@ -1792,7 +1734,7 @@ fn render_pair_table(frame: &mut Frame, area: Rect, app: &App, report: &MonthRep
     .header(
         Row::new(vec![
             header_cell("分类"),
-            header_cell("账本"),
+            header_cell("计划"),
             header_cell_at("金额", Alignment::Right),
             header_cell_at("占比", Alignment::Right),
             header_cell("构成"),
@@ -1805,7 +1747,7 @@ fn render_pair_table(frame: &mut Frame, area: Rect, app: &App, report: &MonthRep
     render_following_table(frame, area, table, Some(selected));
 }
 
-/// 明细：当前选中「分类 + 账本」在本月的账单。
+/// 明细：当前选中「分类 + 计划」在本月的账单。
 fn render_pair_detail(frame: &mut Frame, area: Rect, app: &App) {
     let label = app
         .month_selected_label()
@@ -1818,7 +1760,7 @@ fn render_pair_detail(frame: &mut Frame, area: Rect, app: &App) {
             frame,
             area,
             block_with_title(false, title),
-            "这个分类 + 账本本月没有账单",
+            "这个分类 + 计划本月没有账单",
             "↑ ↓ 换一行看看",
         );
         return;
@@ -1876,7 +1818,7 @@ fn render_pair_detail(frame: &mut Frame, area: Rect, app: &App) {
 // 年报
 // ---------------------------------------------------------------------------
 
-/// 年报：顶部一行总账 → 中间按账本两张表 → 底部逐月走势。
+/// 年报：顶部一行总账 → 中间按计划两张表 → 底部逐月走势。
 fn render_years(frame: &mut Frame, area: Rect, app: &App) {
     let Some(report) = app.year_report.as_ref() else {
         render_loading(frame, area, "年报", "正在汇总全年账单…");
@@ -1897,7 +1839,7 @@ fn render_years(frame: &mut Frame, area: Rect, app: &App) {
     render_book_table(
         frame,
         books[0],
-        "按账本 · 收入",
+        "按计划 · 收入",
         &collection.income_by_book,
         &report.book_names,
         collection.total_income,
@@ -1907,7 +1849,7 @@ fn render_years(frame: &mut Frame, area: Rect, app: &App) {
     render_book_table(
         frame,
         books[1],
-        "按账本 · 支出",
+        "按计划 · 支出",
         &collection.expense_by_book,
         &report.book_names,
         collection.total_expense,
@@ -1950,7 +1892,7 @@ fn render_year_summary(
     frame.render_widget(Paragraph::new(line).block(block), area);
 }
 
-/// 按账本汇总：账本 / 金额 / 占比（支出再多一列分布条）。
+/// 按计划汇总：计划名 / 金额 / 占比（支出再多一列分布条）。
 #[allow(clippy::too_many_arguments)]
 fn render_book_table(
     frame: &mut Frame,
@@ -2009,7 +1951,7 @@ fn render_book_table(
         .collect::<Vec<_>>();
 
     let mut header = vec![
-        header_cell("账本"),
+        header_cell("计划"),
         header_cell_at("金额", Alignment::Right),
         header_cell_at("占比", Alignment::Right),
     ];
@@ -2771,7 +2713,8 @@ mod tests {
     use crate::category::service::CategoryNode;
     use crate::month::model::{BillMonthCollection, YearCollection};
     use crate::month::service::{MonthReport, YearReport};
-    use crate::plan::model::{PlanItem, PlanProgress, SpendingPlan};
+    use crate::bill_book::model::Plan;
+    use crate::plan::model::{PlanProgress, PlanRow};
     use crate::tui::app::{Action, Form, Modal, Page, SettingsSection};
     use crate::tui::input::Key;
     use chrono::{NaiveDate, TimeZone, Utc};
@@ -2866,12 +2809,20 @@ mod tests {
             book_names,
         });
 
-        // 概览页的日历需要计划进度：上限 4000.00，5 号花了 12.34
-        let plan = SpendingPlan::new(vec![PlanItem::new("日常开销", 4_000_00)]);
+        // 概览页的日历需要计划进度：有上限的计划合计 4000.00，5 号花了 12.34
+        app.plans = vec![PlanRow::new(
+            Plan::new(
+                BillBook {
+                    id: 1,
+                    name: "日常开销".into(),
+                },
+                Some(4_000_00),
+            ),
+            1234,
+        )];
         let mut spending = HashMap::new();
         spending.insert(5, 1234);
-        app.plan = plan;
-        app.progress = Some(PlanProgress::build(month, &app.plan, None, &spending));
+        app.progress = Some(PlanProgress::build(month, 4_000_00, None, &spending));
 
         app
     }
@@ -3035,37 +2986,51 @@ mod tests {
     fn plan_page_survives_a_narrow_terminal() {
         let mut app = sample_app();
         app.page = Page::Plan;
-        app.plan = SpendingPlan::new(vec![
-            PlanItem::new("吃饭", 1_500_00).with_category(Some("餐饮")),
-            PlanItem::new("存款", 9_000_00),
-        ]);
-        app.plan_spent = vec![Some(88_50), None];
+        app.plans = vec![
+            PlanRow::new(
+                Plan::new(
+                    BillBook {
+                        id: 1,
+                        name: "吃饭".into(),
+                    },
+                    Some(1_500_00),
+                ),
+                88_50,
+            ),
+            PlanRow::new(
+                Plan::new(
+                    BillBook {
+                        id: 2,
+                        name: "存款".into(),
+                    },
+                    None,
+                ),
+                9_000_00,
+            ),
+        ];
 
         // 窄屏走上下叠布局，表格列会被压缩，但不能渲染失败、也不能丢列名
         let screen = render_screen(&app, 76, 30);
-        assert!(screen.contains("名称"), "{screen}");
-        assert!(screen.contains("额度"), "{screen}");
+        assert!(screen.contains("上限"), "{screen}");
         assert!(screen.contains("已花"), "{screen}");
         assert!(screen.contains("吃饭"), "{screen}");
+        assert!(screen.contains("不限"), "没上限的计划要写清楚：\n{screen}");
     }
 
     #[test]
-    fn settings_page_hosts_books_and_categories() {
+    fn settings_page_hosts_categories_and_connection() {
         let mut app = sample_app();
         app.page = Page::Settings;
-
-        // 账本分区
-        app.settings_section = SettingsSection::Books;
-        let screen = render_screen(&app, 110, 26);
-        assert!(screen.contains("▶ 账本"), "当前分区应有记号：\n{screen}");
-        assert!(screen.contains("支付宝"), "{screen}");
 
         // 分类分区（树状缩进）
         app.settings_section = SettingsSection::Categories;
         let screen = render_screen(&app, 110, 26);
-        assert!(screen.contains("▶ 分类"), "焦点应移到分类分区：\n{screen}");
+        assert!(screen.contains("▶ 分类"), "当前分区应有记号：\n{screen}");
         assert!(screen.contains("餐饮"), "{screen}");
         assert!(screen.contains("午餐"), "{screen}");
+
+        // 运维分区不该出现在首屏（默认就停在分类上）
+        assert!(!screen.contains("连接串"), "首屏不该铺数据库表单：\n{screen}");
 
         // 换分区不该改变页面
         assert_eq!(app.page, Page::Settings);
@@ -3127,12 +3092,12 @@ mod tests {
         app.page = Page::Reports;
         let screen = render_screen(&app, 120, 30);
 
-        assert!(screen.contains("支出 · 分类 + 账本"), "{screen}");
+        assert!(screen.contains("支出 · 分类 + 计划"), "{screen}");
         assert!(
             screen.contains("按分类 · 收入"),
             "收入仍按分类汇总：\n{screen}"
         );
-        // 同一行里既有分类又有账本，大头藏不住
+        // 同一行里既有分类又有计划，大头藏不住
         assert!(screen.contains("餐饮"), "{screen}");
         assert!(screen.contains("微信"), "{screen}");
         assert!(
@@ -3143,8 +3108,8 @@ mod tests {
         assert!(screen.contains("100.0%"), "{screen}");
         assert!(screen.contains('█'), "占比应配条形图：\n{screen}");
         assert!(
-            !screen.contains("按账本"),
-            "月报不做按账本的独立汇总，账本口径归年报：\n{screen}"
+            !screen.contains("按计划"),
+            "月报不做按计划的独立汇总，计划口径归年报：\n{screen}"
         );
     }
 
@@ -3155,10 +3120,10 @@ mod tests {
         app.report_tab = ReportTab::Year;
         let screen = render_screen(&app, 120, 30);
         assert!(screen.contains("年报"), "{screen}");
-        assert!(screen.contains("按账本 · 收入"), "{screen}");
-        assert!(screen.contains("按账本 · 支出"), "{screen}");
+        assert!(screen.contains("按计划 · 收入"), "{screen}");
+        assert!(screen.contains("按计划 · 支出"), "{screen}");
         assert!(screen.contains("逐月走势"), "{screen}");
-        assert!(screen.contains("占比"), "按账本支出应给出占比：\n{screen}");
+        assert!(screen.contains("占比"), "按计划支出应给出占比：\n{screen}");
         assert!(screen.contains("100.0%"), "{screen}");
         assert!(screen.contains('█'), "占比应配条形图：\n{screen}");
         assert!(
@@ -3172,7 +3137,7 @@ mod tests {
         let mut app = sample_app();
         app.page = Page::Settings;
 
-        // 首屏是账本管理：运维项退到菜单最后，不占常驻版面
+        // 首屏是计划管理：运维项退到菜单最后，不占常驻版面
         let first = render_screen(&app, 110, 28);
         assert!(first.contains("运维 · 数据库"), "{first}");
         assert!(!first.contains("连接串"), "首屏不该铺连接表单：\n{first}");
@@ -3204,7 +3169,7 @@ mod tests {
         let screen = render_screen(&app, 100, 30);
         assert!(screen.contains("新增账单"), "{screen}");
         assert!(screen.contains("金额"), "{screen}");
-        assert!(screen.contains("账本"), "{screen}");
+        assert!(screen.contains("计划"), "{screen}");
         assert!(screen.contains("分类"), "{screen}");
         assert!(screen.contains("Enter 提交"), "{screen}");
     }
@@ -3249,10 +3214,10 @@ mod tests {
             assert!(screen.contains(needle), "概览缺少「{needle}」：\n{screen}");
         }
 
-        // 设置：左菜单 + 右面板，日常账本在前、运维在后
+        // 设置：左菜单 + 右面板，日常计划在前、运维在后
         app.page = Page::Settings;
         let screen = render_screen(&app, 120, 40);
-        for needle in ["▶ 账本", "分类", "运维 · 数据库"] {
+        for needle in ["▶ 分类", "运维 · 数据库"] {
             assert!(
                 screen.contains(needle),
                 "设置页缺少「{needle}」：\n{screen}"
@@ -3281,13 +3246,13 @@ mod tests {
         assert!(screen.contains("本月还没有账单"), "{screen}");
         assert!(screen.contains("按 a 记一笔"), "{screen}");
 
-        // 设置 → 账本为空
+        // 设置 → 分类为空
         app.page = Page::Settings;
-        app.settings_section = SettingsSection::Books;
-        app.books.clear();
+        app.settings_section = SettingsSection::Categories;
+        app.categories.clear();
         let screen = render_screen(&app, 110, 24);
-        assert!(screen.contains("还没有账本"), "{screen}");
-        assert!(screen.contains("按 a 新增一个"), "{screen}");
+        assert!(screen.contains("还没有分类"), "{screen}");
+        assert!(screen.contains("按 a 新增"), "{screen}");
     }
 
     /// 人工核对用：`cargo test -- --nocapture print_page_snapshots`

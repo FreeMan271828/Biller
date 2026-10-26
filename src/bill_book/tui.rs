@@ -41,7 +41,7 @@ pub async fn run(service: &BookService, command: BookCmd) -> Result<()> {
             table::print_table(&["ID", "账本"], &rows);
         }
         BookCmd::Add { name } => {
-            let book = service.add(&name).await?;
+            let book = service.add(&name, None).await?;
             println!("已新增账本「{}」(id={})", book.name, book.id);
         }
         BookCmd::Edit { target, name } => {

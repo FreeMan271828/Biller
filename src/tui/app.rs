@@ -21,7 +21,7 @@ use crate::common::money;
 use crate::common::types::{AmountType, BookId, CategoryId};
 use crate::month::service::{MonthReport, YearReport};
 use crate::plan::model::{
-    PlanCoverage, PlanProgress, SpendingPlan, days_in_month,
+    PlanCoverage, PlanProgress, PlanRow, days_in_month, describe_limit,
 };
 use crate::tui::Services;
 use crate::tui::input::Key;
@@ -103,20 +103,19 @@ pub enum ReportTab {
     Year,
 }
 
-/// 设置页里的三个分区，焦点在菜单上时用 `↑` `↓` 切换。
+/// 设置页里的两个分区，焦点在菜单上时用 `↑` `↓` 切换。
 ///
-/// 账本与分类以前是顶级页签，现在收进设置页：页签少两个，改数据的地方集中在一处。
+/// 「账本」分区已经下线：账本现在就是计划（带不带上限而已），增删改名都在计划页，
+/// 设置页只剩「改分类」和「修数据库」这两件真正属于设置的事。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsSection {
     Connection,
-    Books,
     Categories,
 }
 
 impl SettingsSection {
-    /// 顺序即菜单顺序：日常记账（账本 / 分类）在前，数据库运维沉到最后。
-    pub const ALL: [SettingsSection; 3] = [
-        SettingsSection::Books,
+    /// 顺序即菜单顺序：日常记账（分类）在前，数据库运维沉到最后。
+    pub const ALL: [SettingsSection; 2] = [
         SettingsSection::Categories,
         SettingsSection::Connection,
     ];
@@ -132,7 +131,6 @@ impl SettingsSection {
     pub fn title(self) -> &'static str {
         match self {
             SettingsSection::Connection => "运维 · 数据库",
-            SettingsSection::Books => "账本",
             SettingsSection::Categories => "分类",
         }
     }
@@ -323,9 +321,8 @@ pub struct BillPage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FormKind {
     NewBill,
-    NewBook,
     NewCategory,
-    /// 计划里的资金块（计划页）。
+    /// 一个计划：名称 + 可选上限（计划页）。
     PlanItem,
     /// 设置某月起始金额（概览页）。
     SetStartBalance,
@@ -339,9 +336,8 @@ pub enum FormKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EditTarget {
     Bill(u64),
-    Book(u64),
     Category(u64),
-    /// 计划里的第 index 块（位置即展示顺序）。
+    /// 计划列表里的第 index 个（位置即展示顺序）。
     PlanItem(usize),
     /// 某月的起始金额（携带该月）。
     MonthBalance(NaiveDate),
@@ -361,18 +357,18 @@ pub struct Form {
 impl Form {
     /// 新增账单。
     ///
-    /// 账本 / 分类都**不留空**：空值提交时会被 service 拒绝（并且提示很难懂），
+    /// 计划 / 分类都**不留空**：空值提交时会被 service 拒绝（并且提示很难懂），
     /// 所以这里直接给出一个合法的落点——
     ///
-    /// * 账本：上次记账用过的那个（`preferred_book`）→ 否则「默认」→ 否则第一个；
+    /// * 计划：上次记账用过的那个（`preferred_book`）→ 否则「默认」→ 否则第一个；
     /// * 分类：「默认」（不存在时取第一个）；
     /// * 候选列表整个为空（刚建的库）时，塞一个同名候选，让表单仍然可用——
     ///   提交时 service 会按需自动创建这两个条目。
     ///
     /// 「日期」默认留空表示今天，需要在字段上按空格才填入上次用过的日期；
-    /// 焦点默认落在「金额」——打开表单第一件事就是输钱，输完再挑分类和账本。
-    /// 字段顺序也照这个动线排：金额 → 分类 → 账本 → 日期 → 备注，
-    /// 因为「这笔钱花在哪」每次都要想，「记在哪个账本」基本是固定的。
+    /// 焦点默认落在「金额」——打开表单第一件事就是输钱，输完再挑分类和计划。
+    /// 字段顺序也照这个动线排：金额 → 分类 → 计划 → 日期 → 备注，
+    /// 因为「这笔钱花在哪」每次都要想，「记在哪个计划」基本是固定的。
     pub fn new_bill(
         book_options: Vec<String>,
         category_options: Vec<String>,
@@ -410,25 +406,15 @@ impl Form {
                     "Enter 展开选择；新增请到「分类」页",
                 ),
                 picker(
-                    "账本",
+                    "计划",
                     book_options,
                     preferred_book,
-                    "Enter 展开选择；新增请到「账本」页",
+                    "Enter 展开选择；新增请到「计划」页",
                 ),
                 Field::date("日期", "留空即今天；按空格填入上次使用的时间"),
                 Field::text("备注", "", "可留空"),
             ],
             focus: 1,
-            target: None,
-        }
-    }
-
-    pub fn new_book() -> Self {
-        Self {
-            kind: FormKind::NewBook,
-            title: "新增账本",
-            fields: vec![Field::text("名称", "", "例如 微信")],
-            focus: 0,
             target: None,
         }
     }
@@ -485,15 +471,6 @@ impl Form {
         form
     }
 
-    /// 编辑账本：预填当前名称。
-    pub fn edit_book(book: &BillBook) -> Self {
-        let mut form = Self::new_book();
-        form.title = "编辑账本";
-        form.target = Some(EditTarget::Book(book.id));
-        form.fields[0].value = book.name.clone();
-        form
-    }
-
     /// 编辑分类：预填名称与当前父分类。
     pub fn edit_category(
         category: &Category,
@@ -526,51 +503,38 @@ impl Form {
         }
     }
 
-    /// 计划页新增/编辑一块资金。
+    /// 计划页新建 / 改一个计划。
     ///
-    /// `index` 为 `None` 时是新增；为 `Some` 时预填该块的名称与金额，
-    /// 提交后按位置覆盖——位置就是计划里的展示顺序。
+    /// `index` 为 `None` 时是新建；为 `Some` 时预填该计划的名称与上限，
+    /// 提交后按位置找回来——位置就是计划列表的展示顺序。
     ///
-    /// 「分类（可选）」是这块预算和账单分类的绑定：绑了之后，
-    /// 这个分类（含子分类）当月的支出会自动算进「已花」，
-    /// 计划页就能看到「额度 3000 / 已花 1200」这种对账，不用手动填两遍。
-    pub fn plan_item(
-        plan: &SpendingPlan,
-        index: Option<usize>,
-        category_options: Vec<String>,
-    ) -> Self {
-        let mut options = vec![UNBOUND_CATEGORY.to_string()];
-        options.extend(category_options);
-
+    /// 「上限」留空 = 不设上限：这种计划只从 0 开始累计花了多少，不判超支。
+    /// 账单记在哪个计划，就等于归到哪个计划——不再有「绑分类」这层映射。
+    pub fn plan_item(rows: &[PlanRow], index: Option<usize>) -> Self {
         let mut form = Self {
             kind: FormKind::PlanItem,
-            title: "新增计划块",
+            title: "新建计划",
             fields: vec![
-                Field::text("名称", "", "例如 日常开销 / 存款 / 房租；留空则用分类名"),
-                Field::amount("金额", "元，例如 3000 或 3000.50；可写算式"),
-                Field::choice_with(
-                    "分类（可选）",
-                    options,
-                    UNBOUND_CATEGORY.to_string(),
-                    "←/→ 选择；绑定后自动对账，子分类也算进来",
-                ),
+                Field::text("名称", "", "例如 房租 / 吃饭 / 零花"),
+                Field::text("上限", "", "每月额度（元）；留空就是不设上限"),
             ],
             focus: 0,
             target: None,
         };
 
-        if let Some(index) = index {
-            if let Some(item) = plan.get(index) {
-                form.title = "编辑计划块";
-                form.target = Some(EditTarget::PlanItem(index));
-                form.fields[0].value = item.name.clone();
-                form.fields[1].value = money::format_amount(item.amount);
-                // 名称/金额都可能改，但金额改动最多：焦点落在金额上
-                form.focus = 1;
-                if let Some(category) = &item.category {
-                    set_field_value(&mut form.fields[2], category);
-                }
-            }
+        if let Some(index) = index
+            && let Some(row) = rows.get(index)
+        {
+            form.title = "编辑计划";
+            form.target = Some(EditTarget::PlanItem(index));
+            form.fields[0].value = row.name().to_string();
+            form.fields[1].value = row
+                .plan
+                .limit
+                .map(money::format_amount)
+                .unwrap_or_default();
+            // 名称/上限都可能改，但上限改动最多：焦点落在上限上
+            form.focus = 1;
         }
         form
     }
@@ -741,7 +705,6 @@ pub enum Action {
     DeleteBill(u64),
     /// 删除计划里的一块（位置，计划页 `d`）。
     DeletePlanItem(usize),
-    DeleteBook(u64),
     /// 删除分类；`recursive` 为真时连同子孙一起删（终端会先提示）。
     DeleteCategory {
         id: u64,
@@ -781,9 +744,6 @@ pub struct PendingSync {
 #[derive(Debug, Clone)]
 pub enum DeletedRecord {
     Bill(Box<BillEntity>),
-    Book {
-        name: String,
-    },
     /// 一整棵被删掉的子树。顺序是「父先子后」，照着塞回去即可。
     Categories(Vec<DeletedCategory>),
 }
@@ -815,14 +775,12 @@ pub struct App {
     pub settings_focus: SettingsFocus,
     /// 三个分区各自的选中行。
     settings_selected: [usize; SettingsSection::ALL.len()],
-    /// 资金分配计划：这个月的钱分成哪几块，全局生效。
-    pub plan: SpendingPlan,
-    /// 当月计划的执行情况与日历配色，在 `reload` 时算一次。
+    /// 所有计划（账本 + 可选上限）在本月的执行情况，`reload` 时算一次。
+    pub plans: Vec<PlanRow>,
+    /// 当月额度与日历配色，在 `reload` 时算一次。
     pub progress: Option<PlanProgress>,
     /// 计划合计 vs 当月收入（盖不盖得住），同样在 `reload` 时算一次。
     pub coverage: Option<PlanCoverage>,
-    /// 每块计划**已经花了多少**：与 `plan.items` 等长，未绑分类的是 `None`。
-    pub plan_spent: Vec<Option<AmountType>>,
     /// 终端视口高度，由事件循环每帧写回。
     ///
     /// 账单页按它决定「一页放多少条」，所以渲染和翻页读的是同一份值——
@@ -875,13 +833,12 @@ impl App {
             connection_url: connection_url.to_string(),
             sqlite_path: sqlite_path.to_string(),
             last_deleted: None,
-            settings_section: SettingsSection::Books,
+            settings_section: SettingsSection::Categories,
             settings_focus: SettingsFocus::Menu,
             settings_selected: [0; SettingsSection::ALL.len()],
-            plan: SpendingPlan::default(),
+            plans: Vec::new(),
             progress: None,
             coverage: None,
-            plan_spent: Vec::new(),
             viewport_height: 40,
             // 看本月就默认从今天开始看，看历史月份从 1 号开始
             selected_day: if today.year() == month.year() && today.month() == month.month() {
@@ -992,7 +949,7 @@ impl App {
     /// 当前页可供选择的行数。
     pub fn row_count(&self, page: Page) -> usize {
         match page {
-            Page::Plan => self.plan.items().len(),
+            Page::Plan => self.plans.len(),
             Page::Bills => self.bills.len(),
             // 报表页只有「月报」那一半是可选的排行列表
             Page::Reports => {
@@ -1095,7 +1052,6 @@ impl App {
     pub fn settings_row_count(&self) -> usize {
         match self.settings_section {
             SettingsSection::Connection => 0,
-            SettingsSection::Books => self.books.len(),
             SettingsSection::Categories => self.categories.len(),
         }
     }
@@ -1108,11 +1064,6 @@ impl App {
         } else {
             self.settings_selected[self.settings_section.index()].min(count - 1)
         }
-    }
-
-    /// 设置页当前选中的账本。
-    fn selected_book(&self) -> Option<&BillBook> {
-        self.books.get(self.settings_index())
     }
 
     /// 设置页当前选中的分类节点。
@@ -1388,11 +1339,10 @@ impl App {
                     &self.sqlite_path,
                     self.connection_url.starts_with("sqlite:"),
                 ),
-                SettingsSection::Books => Form::new_book(),
                 SettingsSection::Categories => Form::new_category(self.parent_options(None)),
             },
             // 计划页按 `a` 新增一块资金
-            Page::Plan => Form::plan_item(&self.plan, None, self.category_names()),
+            Page::Plan => Form::plan_item(&self.plans, None),
             // 概览/账单/报表都认为你要记账
             Page::Overview | Page::Bills | Page::Reports => Form::new_bill_with(
                 self.book_names(),
@@ -1443,9 +1393,9 @@ impl App {
             // 计划页按 `e`：改选中的那一块
             Page::Plan => {
                 let index = self.selected_index(Page::Plan);
-                self.plan
+                self.plans
                     .get(index)
-                    .map(|_| Form::plan_item(&self.plan, Some(index), self.category_names()))
+                    .map(|_| Form::plan_item(&self.plans, Some(index)))
             }
             // 设置页按 `e`：改的是当前分区里的东西
             Page::Settings => match self.settings_section {
@@ -1454,7 +1404,6 @@ impl App {
                     &self.sqlite_path,
                     self.connection_url.starts_with("sqlite:"),
                 )),
-                SettingsSection::Books => self.selected_book().map(Form::edit_book),
                 SettingsSection::Categories => self.selected_category().and_then(|node| {
                     let options = self.parent_options(Some(node.category.id));
                     let label = match node.category.parent_id {
@@ -1566,12 +1515,12 @@ impl App {
                         Action::DeleteBill(bill.id),
                     )
                 }),
-            Page::Plan => self.plan.get(self.selected_index(Page::Plan)).map(|item| {
+            Page::Plan => self.plans.get(self.selected_index(Page::Plan)).map(|row| {
                 (
                     format!(
-                        "确定要删除计划块「{}」（{} 元）吗？",
-                        item.name,
-                        money::format_amount(item.amount)
+                        "确定要删除计划「{}」（{}）吗？此操作不可撤销。",
+                        row.name(),
+                        describe_limit(row.plan.limit)
                     ),
                     Action::DeletePlanItem(self.selected_index(Page::Plan)),
                 )
@@ -1579,12 +1528,6 @@ impl App {
             Page::Settings => match self.settings_section {
                 // 连接分区没有可删的东西
                 SettingsSection::Connection => None,
-                SettingsSection::Books => self.selected_book().map(|book| {
-                    (
-                        format!("确定要删除账本「{}」吗？此操作不可撤销。", book.name),
-                        Action::DeleteBook(book.id),
-                    )
-                }),
                 SettingsSection::Categories => self.category_delete_request(),
             },
             // 概览/报表没有可删的东西（设置页已经在上面按分区处理了）
@@ -2122,26 +2065,18 @@ impl App {
             }
             Action::DeletePlanItem(index) => {
                 let name = self
-                    .plan
+                    .plans
                     .get(index)
-                    .map(|item| item.name.clone())
+                    .map(|row| row.name().to_string())
                     .unwrap_or_default();
 
                 if name.is_empty() {
-                    self.set_info("计划里没有这一块");
+                    self.set_info("计划里没有这个");
                 } else {
-                    services.plans.remove_item(&name).await?;
-                    self.set_info(format!("已删除计划块「{name}」"));
+                    services.plans.remove(&name).await?;
+                    self.set_info(format!("已删除计划「{name}」"));
                     self.reload(services).await?;
                 }
-            }
-            Action::DeleteBook(id) => {
-                let book = services.books.remove(&id.to_string()).await?;
-                self.last_deleted = Some(DeletedRecord::Book {
-                    name: book.name.clone(),
-                });
-                self.set_info(format!("已删除账本「{}」（按 u 撤销）", book.name));
-                self.reload(services).await?;
             }
             Action::DeleteCategory { id, recursive } => {
                 let removed = services
@@ -2201,11 +2136,6 @@ impl App {
                         .await?;
                     self.reload(services).await?;
                     self.set_info(format!("已恢复账单 #{}（新 id）", restored.id));
-                }
-                Some(DeletedRecord::Book { name }) => {
-                    let book = services.books.add(&name).await?;
-                    self.reload(services).await?;
-                    self.set_info(format!("已恢复账本「{}」（新 id #{}）", book.name, book.id));
                 }
                 Some(DeletedRecord::Categories(entries)) => {
                     let mut restored = 0;
@@ -2353,7 +2283,7 @@ impl App {
 
         let bank = BankService::new(services.pool().clone());
         let bill = bank
-            .confirm(&transaction, form.value("账本"), form.value("分类"))
+            .confirm(&transaction, form.value("计划"), form.value("分类"))
             .await?;
 
         self.pending_sync.remove(0);
@@ -2384,7 +2314,7 @@ impl App {
         self.year_report = None;
         self.progress = None;
         self.coverage = None;
-        self.plan_spent.clear();
+        self.plans.clear();
         self.modal = None;
     }
 
@@ -2402,24 +2332,16 @@ impl App {
         self.last_entry_book = services.bills.default_entry_book().await?;
         self.last_entry_category = services.bills.default_entry_category().await?;
 
-        // 计划是全局的，进度按当前查看的月份算
-        self.plan = services.plans.get().await?;
+        // 计划是全局的，本月已花与日历按当前查看的月份算
         let today = if self.viewing_current_month() {
             Some(Self::today())
         } else {
             None
         };
-        self.progress = Some(
-            services
-                .plans
-                .progress(self.month, &self.plan, today, &self.bills),
-        );
-        self.coverage = Some(services.plans.coverage(self.month, &self.plan, &self.bills));
-        // 绑了分类的块，当月「已花」直接从账单里算，不用手填
-        self.plan_spent = services
-            .plans
-            .spending_with(self.month, &self.plan, &self.bills)
-            .await?;
+        let snapshot = services.plans.snapshot(self.month, today).await?;
+        self.plans = snapshot.rows;
+        self.progress = Some(snapshot.progress);
+        self.coverage = Some(snapshot.coverage);
         self.clamp_selection();
         Ok(())
     }
@@ -2444,11 +2366,6 @@ async fn submit(form: Form, services: &Services) -> Result<String> {
                 money::format_amount(bill.amount)
             ))
         }
-        (FormKind::NewBook, Some(EditTarget::Book(id))) => {
-            let name = require(form.value("名称"), "账本名称不能为空")?;
-            let book = services.books.rename(id, name).await?;
-            Ok(format!("账本已改名为「{}」", book.name))
-        }
         (FormKind::NewCategory, Some(EditTarget::Category(id))) => {
             let name = require(form.value("名称"), "分类名称不能为空")?;
             let parent = parent_from_form(&form);
@@ -2471,45 +2388,37 @@ async fn submit(form: Form, services: &Services) -> Result<String> {
             ))
         }
         (FormKind::PlanItem, Some(EditTarget::PlanItem(index))) => {
-            let category = plan_category_from_form(&form);
-            let name = plan_item_name(&form, category.as_deref())?;
-            let amount = parse_plan_amount(form.value("金额"))?;
-            let plan = services
+            let name = plan_name(&form)?;
+            let limit = plan_limit_from_form(&form)?;
+
+            let current = services
                 .plans
-                .update_item(index, &name, amount, category.as_deref())
-                .await?;
-            let binding = match category.as_deref() {
-                Some(category) => format!(" · 绑定分类「{category}」"),
-                None => " · 不再绑定分类".to_string(),
-            };
+                .list()
+                .await?
+                .get(index)
+                .map(|plan| plan.name().to_string())
+                .ok_or_else(|| anyhow!("这个计划已经不在列表里了"))?;
+
+            if current != name {
+                services.plans.rename(&current, &name).await?;
+            }
+            let plan = services.plans.set_limit(&name, limit).await?;
 
             Ok(format!(
-                "计划块「{}」已改为 {} 元{} · 合计 {} 元",
-                name,
-                money::format_amount(amount),
-                binding,
-                money::format_amount(plan.total())
+                "计划「{}」已改为 {}",
+                plan.name(),
+                describe_limit(plan.limit)
             ))
         }
         (FormKind::PlanItem, None) => {
-            let category = plan_category_from_form(&form);
-            let name = plan_item_name(&form, category.as_deref())?;
-            let amount = parse_plan_amount(form.value("金额"))?;
-            let plan = services
-                .plans
-                .add_item(&name, amount, category.as_deref())
-                .await?;
-            let binding = match category.as_deref() {
-                Some(category) => format!(" · 绑定分类「{category}」"),
-                None => String::new(),
-            };
+            let name = plan_name(&form)?;
+            let limit = plan_limit_from_form(&form)?;
+            let plan = services.plans.add(&name, limit).await?;
 
             Ok(format!(
-                "已新增计划块「{}」{} 元{} · 合计 {} 元",
-                name,
-                money::format_amount(amount),
-                binding,
-                money::format_amount(plan.total())
+                "已新增计划「{}」{}",
+                plan.name(),
+                describe_limit(plan.limit)
             ))
         }
         (FormKind::NewBill, None) => {
@@ -2526,14 +2435,6 @@ async fn submit(form: Form, services: &Services) -> Result<String> {
                 message.push_str(&format!("（自动创建{}）", auto_created.join("、")));
             }
             Ok(message)
-        }
-        (FormKind::NewBook, None) => {
-            let name = form.value("名称");
-            if name.is_empty() {
-                bail!("账本名称不能为空");
-            }
-            let book = services.books.add(name).await?;
-            Ok(format!("已新增账本「{}」", book.name))
         }
         (FormKind::NewCategory, None) => {
             let name = form.value("名称");
@@ -2598,35 +2499,31 @@ fn set_field_value(field: &mut Field, name: &str) {
     field.value = name.to_string();
 }
 
-/// 计划块要绑定的分类；`(不绑定)` 与空值都表示不绑。
-///
-/// 候选项带层级缩进，但 `Form::value` 已经去掉首尾空白，拿到的就是纯名称。
-fn plan_category_from_form(form: &Form) -> Option<String> {
-    match form.value("分类（可选）") {
-        "" | UNBOUND_CATEGORY => None,
-        name => Some(name.to_string()),
+/// 计划名：不允许为空——计划靠名字找，空名等于没建。
+fn plan_name(form: &Form) -> Result<String> {
+    let name = form.value("名称");
+    if name.is_empty() {
+        bail!("计划名不能为空");
     }
+    Ok(name.to_string())
 }
 
-/// 计划块的显示名称：留空时退化成分类名，两个都空才是错。
-///
-/// 绑了分类的块，名称再手写一遍只是重复信息，所以允许省掉。
-fn plan_item_name(form: &Form, category: Option<&str>) -> Result<String> {
-    match (form.value("名称"), category) {
-        ("", Some(category)) => Ok(category.to_string()),
-        ("", None) => bail!("计划块名称不能为空（绑了分类的话也可以只选分类）"),
-        (name, _) => Ok(name.to_string()),
+/// 计划上限：留空就是不设上限。和账单金额一样支持算式。
+fn plan_limit_from_form(form: &Form) -> Result<Option<AmountType>> {
+    let raw = form.value("上限");
+    if raw.trim().is_empty() {
+        return Ok(None);
     }
-}
-
-/// 计划块的金额：和账单一样支持算式，省得自己算完再填。
-fn parse_plan_amount(raw: &str) -> Result<AmountType> {
     let text = if raw.chars().any(|character| "+-*/()".contains(character)) {
         money::evaluate_expression(raw).map_err(|error| anyhow!("{error}"))?
     } else {
         raw.to_string()
     };
-    money::parse_amount(&text).map_err(|error| anyhow!("{error}"))
+    let amount = money::parse_amount(&text).map_err(|error| anyhow!("{error}"))?;
+    if amount <= 0 {
+        bail!("上限要大于 0；不想设上限就把「上限」留空");
+    }
+    Ok(Some(amount))
 }
 
 /// 从表单构造账单入参。
@@ -2658,7 +2555,7 @@ fn bill_from_form(form: &Form) -> Result<NewBill> {
     Ok(NewBill {
         kind,
         amount,
-        book: require(form.value("账本"), "账本名称不能为空")?.to_string(),
+        book: require(form.value("计划"), "计划名称不能为空")?.to_string(),
         category: require(form.value("分类"), "分类名称不能为空")?.to_string(),
         created_at,
         remark: match form.value("备注") {
@@ -2755,11 +2652,23 @@ mod tests {
 
     use super::*;
     use crate::month::model::BillMonthCollection;
-    use crate::plan::model::PlanItem;
+    use crate::bill_book::model::Plan;
+    use crate::plan::model::PlanRow;
 
     /// 测试用连接串：各字段值都便于断言。
     const TEST_CONNECTION_URL: &str = "postgres://postgres:postgres@127.0.0.1:5432/biller";
     const TEST_SQLITE_PATH: &str = "C:/Users/test/.biller/biller.db";
+
+    /// 造一个计划：测试里只关心名字和上限，账本 id 随便给。
+    fn plan_row(name: &str, limit: Option<AmountType>) -> Plan {
+        Plan::new(
+            BillBook {
+                id: 1,
+                name: name.into(),
+            },
+            limit,
+        )
+    }
 
     fn sample_app() -> App {
         let month = NaiveDate::from_ymd_opt(2026, 10, 1).unwrap();
@@ -2960,7 +2869,7 @@ mod tests {
             Some(Modal::Form(form)) => {
                 assert!(form.fields[2].is_choice(), "账本应自动读取成选择框");
                 assert!(form.fields[3].is_choice(), "分类应自动读取成选择框");
-                assert_eq!(form.value("账本"), "微信");
+                assert_eq!(form.value("计划"), "微信");
                 assert_eq!(form.value("分类"), "餐饮");
             }
             other => panic!("应打开新增账单表单，实际 {other:?}"),
@@ -2982,7 +2891,7 @@ mod tests {
                 // 空库也不能留空值：空着提交只会被 service 打回「名称不能为空」，
                 // 所以退化成「只有一个默认候选」的选择框，提交时自动创建
                 assert!(form.fields[2].is_choice(), "账本应给出默认候选");
-                assert_eq!(form.value("账本"), DEFAULT_BOOK);
+                assert_eq!(form.value("计划"), DEFAULT_BOOK);
                 assert!(form.fields[3].is_choice(), "分类应给出默认候选");
                 assert_eq!(form.value("分类"), DEFAULT_CATEGORY);
             }
@@ -2996,7 +2905,7 @@ mod tests {
 
         assert_eq!(form.focus, 1, "焦点应默认落在「金额」");
         assert_eq!(form.fields[1].label, "金额");
-        assert_eq!(form.value("账本"), "微信");
+        assert_eq!(form.value("计划"), "微信");
         assert_eq!(form.fields[4].value, "", "日期默认留空，留空即今天");
         assert_eq!(
             form.fields[4].role,
@@ -3012,11 +2921,11 @@ mod tests {
 
         // 上次用的是「支付宝」→ 默认应选中它，而不是列表第一个
         let form = Form::new_bill(books.clone(), categories.clone(), Some("支付宝"));
-        assert_eq!(form.value("账本"), "支付宝");
+        assert_eq!(form.value("计划"), "支付宝");
 
         // 上次那本账本已被删除 → 回落到第一个
         let form = Form::new_bill(books, categories, Some("已删除的账本"));
-        assert_eq!(form.value("账本"), "微信");
+        assert_eq!(form.value("计划"), "微信");
     }
 
     #[test]
@@ -3034,13 +2943,13 @@ mod tests {
     }
 
     #[test]
-    fn bill_form_asks_category_before_book() {
+    fn bill_form_asks_category_before_plan() {
         let form = Form::new_bill(vec!["微信".to_string()], vec!["餐饮".to_string()], None);
 
-        // 记账动线：金额 → 分类（每次都变）→ 账本（基本固定）
+        // 记账动线：金额 → 分类（每次都变）→ 计划（基本固定）
         assert_eq!(form.fields[1].label, "金额");
         assert_eq!(form.fields[2].label, "分类");
-        assert_eq!(form.fields[3].label, "账本");
+        assert_eq!(form.fields[3].label, "计划");
     }
 
     #[test]
@@ -3296,40 +3205,22 @@ mod tests {
     fn selection_wraps_and_is_clamped() {
         let mut app = sample_app();
         app.page = Page::Settings;
-        app.settings_section = SettingsSection::Books;
+        app.settings_section = SettingsSection::Categories;
         // 先按 Enter 进列表：↑↓ 在菜单态是换分区，不换条目
         app.settings_focus = SettingsFocus::Detail;
-        app.books = vec![
-            BillBook {
-                id: 1,
-                name: "微信".into(),
-            },
-            BillBook {
-                id: 2,
-                name: "支付宝".into(),
-            },
-        ];
+        app.categories.truncate(2);
         app.on_key(Key::Up);
         assert_eq!(app.settings_index(), 1, "向上应回绕到末行");
         app.on_key(Key::Down);
         assert_eq!(app.settings_index(), 0, "向下应回绕到首行");
 
-        app.books.truncate(1);
+        app.categories.truncate(1);
         app.clamp_selection();
         assert_eq!(app.settings_index(), 0);
     }
 
     #[test]
     fn a_key_opens_page_specific_form() {
-        let mut app = sample_app();
-        app.page = Page::Settings;
-        app.settings_section = SettingsSection::Books;
-        app.on_key(Key::Char('a'));
-        match &app.modal {
-            Some(Modal::Form(form)) => assert_eq!(form.kind, FormKind::NewBook),
-            other => panic!("账本页应打开新增账本，实际 {other:?}"),
-        }
-
         let mut app = sample_app();
         app.page = Page::Settings;
         app.settings_section = SettingsSection::Categories;
@@ -3373,34 +3264,38 @@ mod tests {
 
         assert_eq!(
             app.settings_section,
-            SettingsSection::Books,
-            "默认停在日常记账，数据库运维不该占首屏"
+            SettingsSection::Categories,
+            "默认停在改分类，数据库运维不该占首屏"
         );
         assert!(matches!(app.on_key(Key::Down), Action::None));
         assert_eq!(
             app.settings_section,
-            SettingsSection::Categories,
+            SettingsSection::Connection,
             "菜单态 ↓ 换分区"
         );
         app.on_key(Key::Down);
         assert_eq!(
             app.settings_section,
-            SettingsSection::Connection,
-            "数据库运维排在最后"
+            SettingsSection::Categories,
+            "分区也要能回绕"
         );
-        app.on_key(Key::Down);
-        assert_eq!(app.settings_section, SettingsSection::Books, "分区也要能回绕");
         app.on_key(Key::Up);
         assert_eq!(app.settings_section, SettingsSection::Connection);
 
         // 菜单态不该动列表选中行
-        app.settings_section = SettingsSection::Books;
+        app.settings_section = SettingsSection::Categories;
         let before = app.settings_index();
         app.on_key(Key::Down);
+        assert_eq!(
+            app.settings_section,
+            SettingsSection::Connection,
+            "菜单态 ↓ 换的是分区"
+        );
+        app.on_key(Key::Up);
         assert_eq!(app.settings_index(), before, "菜单态不动条目");
 
         // Enter 进列表，之后 ↑↓ 才动条目
-        app.settings_focus = SettingsFocus::Menu;
+        assert_eq!(app.settings_focus, SettingsFocus::Menu);
         app.on_key(Key::Enter);
         assert_eq!(app.settings_focus, SettingsFocus::Detail);
         app.on_key(Key::Down);
@@ -3427,7 +3322,7 @@ mod tests {
     fn switching_pages_resets_settings_focus() {
         let mut app = sample_app();
         app.page = Page::Settings;
-        app.settings_section = SettingsSection::Books;
+        app.settings_section = SettingsSection::Categories;
         app.settings_focus = SettingsFocus::Detail;
 
         app.on_key(Key::Right);
@@ -3575,7 +3470,7 @@ mod tests {
     fn settings_selection_is_per_section() {
         let mut app = sample_app();
         app.page = Page::Settings;
-        app.settings_section = SettingsSection::Books;
+        app.settings_section = SettingsSection::Categories;
         app.settings_focus = SettingsFocus::Detail;
 
         assert_eq!(app.settings_row_count(), 2);
@@ -3584,21 +3479,14 @@ mod tests {
         app.on_key(Key::Down);
         assert_eq!(app.settings_index(), 0, "到底应回绕");
 
-        // 分类分区有自己的选中行
-        app.settings_section = SettingsSection::Categories;
-        assert_eq!(app.settings_index(), 0);
-        app.on_key(Key::Down);
-        assert_eq!(app.settings_index(), 1);
-
-        // 回到账本分区，选中行还是原来那个
-        app.settings_section = SettingsSection::Books;
-        assert_eq!(app.settings_index(), 0);
-
-        // 连接分区没有列表，上下键无害
+        // 连接分区没有列表，上下键无害，也不动分类的选中行
         app.settings_section = SettingsSection::Connection;
         assert_eq!(app.settings_row_count(), 0);
         app.on_key(Key::Down);
         assert_eq!(app.settings_index(), 0);
+
+        app.settings_section = SettingsSection::Categories;
+        assert_eq!(app.settings_index(), 0, "回到分类分区，选中行还是原来那个");
     }
 
     #[test]
@@ -3647,22 +3535,10 @@ mod tests {
                 assert_eq!(form.target, Some(EditTarget::Bill(7)));
                 assert_eq!(form.value("方向"), "支出");
                 assert_eq!(form.value("金额"), "12.34");
-                assert_eq!(form.value("账本"), "微信");
+                assert_eq!(form.value("计划"), "微信");
                 assert_eq!(form.value("分类"), "餐饮");
             }
             other => panic!("账单页应打开编辑表单，实际 {other:?}"),
-        }
-
-        let mut app = sample_app();
-        app.page = Page::Settings;
-        app.settings_section = SettingsSection::Books;
-        app.on_key(Key::Char('e'));
-        match &app.modal {
-            Some(Modal::Form(form)) => {
-                assert_eq!(form.target, Some(EditTarget::Book(1)));
-                assert_eq!(form.value("名称"), "微信");
-            }
-            other => panic!("账本页应打开编辑表单，实际 {other:?}"),
         }
 
         let mut app = sample_app();
@@ -3785,7 +3661,7 @@ mod tests {
         app.on_key(Key::Down);
         app.on_key(Key::Esc);
         match &app.modal {
-            Some(Modal::Form(form)) => assert_eq!(form.value("账本"), "支付宝"),
+            Some(Modal::Form(form)) => assert_eq!(form.value("计划"), "支付宝"),
             other => panic!("应回到表单，实际 {other:?}"),
         }
     }
@@ -3858,7 +3734,7 @@ mod tests {
     fn equals_on_plain_field_just_inserts_character() {
         let mut app = sample_app();
         app.page = Page::Settings;
-        app.settings_section = SettingsSection::Books;
+        app.settings_section = SettingsSection::Categories;
         app.on_key(Key::Char('a'));
 
         app.on_key(Key::Char('='));
@@ -4076,7 +3952,7 @@ mod tests {
         ));
 
         app.page = Page::Settings;
-        app.settings_section = SettingsSection::Books;
+        app.settings_section = SettingsSection::Categories;
         assert!(matches!(app.on_key(Key::Char('x')), Action::None));
     }
 
@@ -4097,38 +3973,37 @@ mod tests {
     }
 
     #[test]
-    fn plan_page_opens_item_forms() {
-        use crate::plan::model::PlanItem;
-
+    fn plan_page_opens_plan_forms() {
         let mut app = sample_app();
         app.page = Page::Plan;
-        app.plan = SpendingPlan::new(vec![
-            PlanItem::new("日常开销", 3_000_00),
-            PlanItem::new("存款", 9_000_00),
-        ]);
+        app.plans = vec![
+            PlanRow::new(plan_row("日常开销", Some(3_000_00)), 0),
+            PlanRow::new(plan_row("存款", None), 0),
+        ];
 
         app.on_key(Key::Char('a'));
         match &app.modal {
             Some(Modal::Form(form)) => {
                 assert_eq!(form.kind, FormKind::PlanItem);
-                assert_eq!(form.title, "新增计划块");
+                assert_eq!(form.title, "新建计划");
                 assert!(form.target.is_none());
             }
-            other => panic!("计划页按 a 应打开新增计划块，实际 {other:?}"),
+            other => panic!("计划页按 a 应打开新建计划，实际 {other:?}"),
         }
 
         app.modal = None;
-        app.selected[Page::Plan.index()] = 1;
+        app.selected[Page::Plan.slot()] = 1;
         app.on_key(Key::Char('e'));
         match &app.modal {
             Some(Modal::Form(form)) => {
                 assert_eq!(form.kind, FormKind::PlanItem);
-                assert_eq!(form.title, "编辑计划块");
+                assert_eq!(form.title, "编辑计划");
                 assert_eq!(form.value("名称"), "存款");
-                assert_eq!(form.value("金额"), "9,000.00");
+                // 没上限的计划，上限字段留空——留空就是不设上限
+                assert_eq!(form.value("上限"), "");
                 assert_eq!(form.target, Some(EditTarget::PlanItem(1)));
             }
-            other => panic!("计划页按 e 应打开编辑计划块，实际 {other:?}"),
+            other => panic!("计划页按 e 应打开编辑计划，实际 {other:?}"),
         }
     }
 
@@ -4274,43 +4149,50 @@ mod tests {
     }
 
     #[test]
-    fn plan_item_form_offers_the_category_binding() {
-        let form = Form::plan_item(
-            &SpendingPlan::default(),
-            None,
-            vec!["餐饮".to_string(), "  外卖".to_string()],
+    fn plan_form_asks_name_then_limit() {
+        let form = Form::plan_item(&[], None);
+
+        assert_eq!(form.fields[0].label, "名称");
+        assert_eq!(form.fields[1].label, "上限");
+        assert!(!form.fields[1].is_choice(), "上限是手填，不是选项");
+        assert_eq!(form.value("上限"), "", "新建时上限留空");
+        assert_eq!(plan_limit_from_form(&form).unwrap(), None, "留空就是不设上限");
+    }
+
+    #[test]
+    fn plan_form_prefills_the_existing_limit() {
+        let rows = vec![
+            PlanRow::new(plan_row("吃喝", Some(30_00)), 0),
+            PlanRow::new(plan_row("零花", None), 0),
+        ];
+
+        let form = Form::plan_item(&rows, Some(0));
+        assert_eq!(form.value("名称"), "吃喝");
+        assert_eq!(form.value("上限"), "30.00");
+        assert_eq!(form.focus, 1, "编辑时焦点落在上限上");
+
+        let mut empty = Form::plan_item(&rows, Some(1));
+        empty.fields[1].value.clear();
+        assert_eq!(plan_limit_from_form(&empty).unwrap(), None);
+    }
+
+    #[test]
+    fn plan_form_rejects_an_empty_name_and_a_zero_limit() {
+        let mut form = Form::plan_item(&[], None);
+        assert!(plan_name(&form).is_err(), "计划名不能为空");
+
+        form.fields[0].value = "房租".to_string();
+        form.fields[1].value = "0".to_string();
+        assert!(
+            plan_limit_from_form(&form).is_err(),
+            "上限 0 要报错，想不设上限就留空"
         );
 
-        assert_eq!(form.fields[2].label, "分类（可选）");
-        assert!(form.fields[2].is_choice());
-        assert_eq!(form.value("分类（可选）"), UNBOUND_CATEGORY, "默认不绑分类");
-    }
-
-    #[test]
-    fn plan_item_form_prefills_the_bound_category() {
-        let plan = SpendingPlan::new(vec![PlanItem::new("吃喝", 30_00).with_category(Some("餐饮"))]);
-
-        let form = Form::plan_item(&plan, Some(0), vec!["餐饮".to_string()]);
-        assert_eq!(form.value("分类（可选）"), "餐饮");
-        assert_eq!(form.value("金额"), "30.00");
-    }
-
-    #[test]
-    fn plan_form_reads_category_and_falls_back_to_its_name() {
-        let mut form = Form::plan_item(&SpendingPlan::default(), None, vec!["餐饮".to_string()]);
-        form.fields[2].value = "餐饮".to_string();
-
-        let category = plan_category_from_form(&form);
-        assert_eq!(category.as_deref(), Some("餐饮"));
+        form.fields[1].value = "3000 - 500".to_string();
         assert_eq!(
-            plan_item_name(&form, category.as_deref()).unwrap(),
-            "餐饮",
-            "名称留空时用分类名兜底"
+            plan_limit_from_form(&form).unwrap(),
+            Some(2_500_00),
+            "上限也支持算式"
         );
-
-        // 选回「不绑定」→ 没有分类，名称又空了，这时候才报错
-        form.fields[2].value = UNBOUND_CATEGORY.to_string();
-        assert_eq!(plan_category_from_form(&form), None);
-        assert!(plan_item_name(&form, None).is_err());
     }
 }
