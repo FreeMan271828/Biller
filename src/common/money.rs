@@ -59,8 +59,7 @@ pub fn parse_amount(input: &str) -> Result<AmountType> {
     }
     let cents: AmountType = cents_str.parse().expect("已校验为纯数字");
 
-    yuan
-        .checked_mul(100)
+    yuan.checked_mul(100)
         .and_then(|value| value.checked_add(cents))
         .ok_or_else(|| anyhow!("金额超出可表示范围：{input}"))
 }
@@ -220,7 +219,9 @@ impl ExpressionParser {
                 }
                 Ok(value)
             }
-            Some(character) if character.is_ascii_digit() || character == '.' => self.parse_number(),
+            Some(character) if character.is_ascii_digit() || character == '.' => {
+                self.parse_number()
+            }
             _ => bail!("算式不完整或含非法字符"),
         }
     }
@@ -317,7 +318,11 @@ mod tests {
             "1,234.00",
             "千分位"
         );
-        assert_eq!(evaluate_expression("12 ＋ 3").unwrap(), "15.00", "全角与空格");
+        assert_eq!(
+            evaluate_expression("12 ＋ 3").unwrap(),
+            "15.00",
+            "全角与空格"
+        );
         assert_eq!(evaluate_expression("2×3").unwrap(), "6.00");
         assert_eq!(evaluate_expression(".5+0.5").unwrap(), "1.00");
     }

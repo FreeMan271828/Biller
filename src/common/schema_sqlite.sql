@@ -46,7 +46,7 @@ CREATE TABLE IF NOT EXISTS month_balances (
     start_balance INTEGER NOT NULL DEFAULT 0
 );
 
--- 应用级键值状态（上次记账日期/账本、开销计划都在这里）。
+-- 应用级键值状态（上次记账日期/账本、资金计划都在这里）。
 CREATE TABLE IF NOT EXISTS app_state (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL

@@ -20,9 +20,11 @@ use crate::bill::service::{BillService, NewBill};
 use crate::common::db::Pool;
 use crate::common::types::BillId;
 
-/// 没命中任何记忆时用的账本/分类名（不存在时账单服务会自动建）。
-pub const DEFAULT_BOOK: &str = "默认";
-pub const DEFAULT_CATEGORY: &str = "默认";
+/// 没命中任何记忆时用的账本/分类名。
+///
+/// 定义在账单模块（那是「默认落到哪」这条规则的归属地），这里重导出，
+/// 银行同步和界面继续按原来的路径引用。
+pub use crate::bill::service::{DEFAULT_BOOK, DEFAULT_CATEGORY};
 
 /// 界面上那两个按钮。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -123,11 +125,7 @@ impl BankService {
     ///
     /// 今日：[今天, 今天]；
     /// 本周：[max(本周一, 本地最新账单+1), min(今天, 本周日)]，为空时返回 `None`。
-    pub async fn window(
-        &self,
-        kind: SyncKind,
-        today: NaiveDate,
-    ) -> Result<Option<SyncWindow>> {
+    pub async fn window(&self, kind: SyncKind, today: NaiveDate) -> Result<Option<SyncWindow>> {
         match kind {
             SyncKind::Today => Ok(Some(SyncWindow::today(today))),
             SyncKind::Week => {
@@ -384,17 +382,17 @@ mod tests {
             .await
             .unwrap();
 
-        let (food,): (i64,) = sqlx::query_as(&pool.shared(
-            "INSERT INTO categories (parent_id, name) VALUES (NULL, ?) RETURNING id",
-        ))
+        let (food,): (i64,) = sqlx::query_as(
+            &pool.shared("INSERT INTO categories (parent_id, name) VALUES (NULL, ?) RETURNING id"),
+        )
         .bind("餐饮")
         .fetch_one(pool.any())
         .await
         .unwrap();
 
-        let (night,): (i64,) = sqlx::query_as(&pool.shared(
-            "INSERT INTO categories (parent_id, name) VALUES (?, ?) RETURNING id",
-        ))
+        let (night,): (i64,) = sqlx::query_as(
+            &pool.shared("INSERT INTO categories (parent_id, name) VALUES (?, ?) RETURNING id"),
+        )
         .bind(food)
         .bind("夜宵")
         .fetch_one(pool.any())
@@ -426,7 +424,10 @@ mod tests {
         let (pool, service, dir) = setup().await;
 
         let window = service
-            .window(SyncKind::Today, NaiveDate::from_ymd_opt(2026, 10, 18).unwrap())
+            .window(
+                SyncKind::Today,
+                NaiveDate::from_ymd_opt(2026, 10, 18).unwrap(),
+            )
             .await
             .unwrap()
             .expect("今日总有窗口");
@@ -445,7 +446,10 @@ mod tests {
 
         // 空库：从本周一开始
         let window = service
-            .window(SyncKind::Week, NaiveDate::from_ymd_opt(2026, 10, 18).unwrap())
+            .window(
+                SyncKind::Week,
+                NaiveDate::from_ymd_opt(2026, 10, 18).unwrap(),
+            )
             .await
             .unwrap()
             .expect("应有窗口");
@@ -460,7 +464,10 @@ mod tests {
         service.confirm(&txn, "微信", "餐饮").await.unwrap();
 
         let window = service
-            .window(SyncKind::Week, NaiveDate::from_ymd_opt(2026, 10, 18).unwrap())
+            .window(
+                SyncKind::Week,
+                NaiveDate::from_ymd_opt(2026, 10, 18).unwrap(),
+            )
             .await
             .unwrap()
             .expect("应有窗口");
@@ -476,7 +483,10 @@ mod tests {
 
         assert!(
             service
-                .window(SyncKind::Week, NaiveDate::from_ymd_opt(2026, 10, 18).unwrap())
+                .window(
+                    SyncKind::Week,
+                    NaiveDate::from_ymd_opt(2026, 10, 18).unwrap()
+                )
                 .await
                 .unwrap()
                 .is_none(),
@@ -595,7 +605,13 @@ mod tests {
         assert_eq!(fresh[0].fingerprint, "fp-b");
 
         // 空输入直接返回空
-        assert!(service.new_transactions(Vec::new()).await.unwrap().is_empty());
+        assert!(
+            service
+                .new_transactions(Vec::new())
+                .await
+                .unwrap()
+                .is_empty()
+        );
 
         pool.close().await;
         let _ = std::fs::remove_dir_all(&dir);
@@ -619,20 +635,22 @@ mod tests {
 
         assert_eq!(bill.kind, BillKind::Expense);
         assert_eq!(bill.amount, 3400);
-        assert_eq!(bill.created_at.date_naive(), NaiveDate::from_ymd_opt(2026, 10, 16).unwrap());
+        assert_eq!(
+            bill.created_at.date_naive(),
+            NaiveDate::from_ymd_opt(2026, 10, 16).unwrap()
+        );
         assert_eq!(bill.book.name, "微信");
         assert_eq!(bill.category.name, "餐饮");
         assert_eq!(bill.remark.as_deref(), Some("财付通-微信支付-Apple"));
 
         // 已导入记录也带上了账单 id
         assert_eq!(service.imported_total().await.unwrap(), 1);
-        let (bill_id,): (Option<i64>,) = sqlx::query_as(&pool.shared(
-            "SELECT bill_id FROM bank_imports WHERE fingerprint = ?",
-        ))
-        .bind("fp-night")
-        .fetch_one(pool.any())
-        .await
-        .unwrap();
+        let (bill_id,): (Option<i64>,) =
+            sqlx::query_as(&pool.shared("SELECT bill_id FROM bank_imports WHERE fingerprint = ?"))
+                .bind("fp-night")
+                .fetch_one(pool.any())
+                .await
+                .unwrap();
         assert_eq!(bill_id, Some(bill.id as i64));
 
         pool.close().await;
@@ -714,13 +732,12 @@ mod tests {
         assert_eq!(bill_count, 1, "重复确认不能多记一笔账");
         assert_eq!(service.imported_total().await.unwrap(), 1);
 
-        let (bill_id,): (Option<i64>,) = sqlx::query_as(&pool.shared(
-            "SELECT bill_id FROM bank_imports WHERE fingerprint = ?",
-        ))
-        .bind("fp-dup")
-        .fetch_one(pool.any())
-        .await
-        .unwrap();
+        let (bill_id,): (Option<i64>,) =
+            sqlx::query_as(&pool.shared("SELECT bill_id FROM bank_imports WHERE fingerprint = ?"))
+                .bind("fp-dup")
+                .fetch_one(pool.any())
+                .await
+                .unwrap();
         assert_eq!(bill_id, Some(bill.id as i64));
 
         pool.close().await;
@@ -745,7 +762,8 @@ mod tests {
         service.save_account(&second, "主力卡").await.unwrap();
 
         let accounts = service.stored_accounts().await.unwrap();
-        let defaults: Vec<&StoredAccount> = accounts.iter().filter(|item| item.is_default).collect();
+        let defaults: Vec<&StoredAccount> =
+            accounts.iter().filter(|item| item.is_default).collect();
         assert_eq!(defaults.len(), 1, "默认账户必须唯一：{accounts:?}");
         assert_eq!(defaults[0].account.account_uid, "P-2");
 
@@ -760,7 +778,10 @@ mod tests {
         let (night, _food) = seed_categories(&pool).await;
 
         // 先读一次，把空规则缓存起来
-        assert_eq!(service.suggest("正新鸡排").await.unwrap().source, SuggestionSource::Default);
+        assert_eq!(
+            service.suggest("正新鸡排").await.unwrap().source,
+            SuggestionSource::Default
+        );
 
         service
             .set_keyword("正新鸡排", night as crate::common::types::CategoryId)

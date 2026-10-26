@@ -124,15 +124,21 @@ pub enum MemoryCmd {
 pub async fn run(service: &BankService, cmd: SyncCmd) -> Result<()> {
     match cmd {
         SyncCmd::Probe { port } => probe(port).await,
-        SyncCmd::ProxyCapture { port, timeout, browser } => {
-            proxy_capture(service, port, timeout, browser).await
-        }
+        SyncCmd::ProxyCapture {
+            port,
+            timeout,
+            browser,
+        } => proxy_capture(service, port, timeout, browser).await,
         SyncCmd::CaInit => ca_init(),
         SyncCmd::CaStatus => ca_status(),
         SyncCmd::Paste { file } => paste(file).await,
         SyncCmd::Capture { port, timeout } => capture(service, port, timeout).await,
-        SyncCmd::Today { dry_run, yes, port } => sync_window(service, SyncKind::Today, port, dry_run, yes).await,
-        SyncCmd::Week { dry_run, yes, port } => sync_window(service, SyncKind::Week, port, dry_run, yes).await,
+        SyncCmd::Today { dry_run, yes, port } => {
+            sync_window(service, SyncKind::Today, port, dry_run, yes).await
+        }
+        SyncCmd::Week { dry_run, yes, port } => {
+            sync_window(service, SyncKind::Week, port, dry_run, yes).await
+        }
         SyncCmd::Account { cmd } => account(service, cmd).await,
         SyncCmd::Keyword { cmd } => keyword(service, cmd).await,
         SyncCmd::Memory { cmd } => memory(service, cmd).await,
@@ -199,11 +205,9 @@ async fn proxy_capture(
         println!("在那个窗口里登录招行并点一次「查询」即可。");
     }
 
-    let captured = crate::bank::capture_proxy::capture(
-        port,
-        std::time::Duration::from_secs(timeout_secs),
-    )
-    .await?;
+    let captured =
+        crate::bank::capture_proxy::capture(port, std::time::Duration::from_secs(timeout_secs))
+            .await?;
 
     println!("\n✓ 捕获成功：{}", captured.describe());
     let path = crate::bank::capture::save(&captured)?;
@@ -272,9 +276,8 @@ async fn capture(service: &BankService, port: u16, timeout_secs: u64) -> Result<
 
 async fn paste(file: Option<std::path::PathBuf>) -> Result<()> {
     let text = match file {
-        Some(path) => {
-            std::fs::read_to_string(&path).with_context(|| format!("读取 {} 失败", path.display()))?
-        }
+        Some(path) => std::fs::read_to_string(&path)
+            .with_context(|| format!("读取 {} 失败", path.display()))?,
         None => {
             use std::io::Read;
             let mut buffer = String::new();
@@ -351,10 +354,7 @@ async fn sync_window(
     let today = BankService::today();
 
     let Some(window) = service.window(kind, today).await? else {
-        println!(
-            "本周本地已经记到最新（{}），没有需要同步的日子。",
-            today
-        );
+        println!("本周本地已经记到最新（{}），没有需要同步的日子。", today);
         return Ok(());
     };
 
@@ -510,7 +510,9 @@ async fn account(service: &BankService, cmd: AccountCmd) -> Result<()> {
         AccountCmd::List => {
             let accounts = service.stored_accounts().await?;
             if accounts.is_empty() {
-                println!("还没有保存过账户。用 `biller sync account add <accountUid> <subAccountNo>` 保存。");
+                println!(
+                    "还没有保存过账户。用 `biller sync account add <accountUid> <subAccountNo>` 保存。"
+                );
                 return Ok(());
             }
 

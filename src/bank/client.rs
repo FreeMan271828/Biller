@@ -197,7 +197,11 @@ mod tests {
 
     #[test]
     fn js_carries_path_body_and_client_no() {
-        let js = querytrans_js(&account(), &window(), "67db80ad-3f05-4933-9be9-8b3445c023dc-1792331235813");
+        let js = querytrans_js(
+            &account(),
+            &window(),
+            "67db80ad-3f05-4933-9be9-8b3445c023dc-1792331235813",
+        );
 
         assert!(js.contains(TRANS_PATH), "应包含接口路径");
         assert!(js.contains("\"startDate\":\"20261012\""), "请求体应嵌进去");
@@ -234,7 +238,10 @@ mod tests {
     fn rejects_empty_or_malformed_js_result() {
         assert!(unwrap_js_result("").is_err());
         assert!(unwrap_js_result("not json").is_err());
-        assert!(unwrap_js_result(r#"{"status":200}"#).is_err(), "缺 text 字段");
+        assert!(
+            unwrap_js_result(r#"{"status":200}"#).is_err(),
+            "缺 text 字段"
+        );
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! 账本的数据访问层：只写 SQL，不做业务判断。
 
-use anyhow::Result;
 use crate::common::db::Pool;
+use anyhow::Result;
 
 use crate::bill_book::model::BillBook;
 use crate::common::types::BookId;
@@ -32,9 +32,11 @@ impl BookDao {
     }
 
     pub async fn insert(&self, name: &str) -> Result<BookId> {
-        let (id,): (i64,) = sqlx::query_as(&self.pool.shared(
-            "INSERT INTO bill_books (name) VALUES (?) RETURNING id",
-        ))
+        let (id,): (i64,) = sqlx::query_as(
+            &self
+                .pool
+                .shared("INSERT INTO bill_books (name) VALUES (?) RETURNING id"),
+        )
         .bind(name)
         .fetch_one(self.pool.any())
         .await?;
@@ -104,14 +106,10 @@ impl BookDao {
     }
 
     pub async fn delete(&self, id: BookId) -> Result<u64> {
-        let result = sqlx::query(
-            &self
-                .pool
-                .shared("DELETE FROM bill_books WHERE id = ?"),
-        )
-        .bind(id as i64)
-        .execute(self.pool.any())
-        .await?;
+        let result = sqlx::query(&self.pool.shared("DELETE FROM bill_books WHERE id = ?"))
+            .bind(id as i64)
+            .execute(self.pool.any())
+            .await?;
         Ok(result.rows_affected())
     }
 }

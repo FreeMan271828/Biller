@@ -58,11 +58,7 @@ impl BillMonthCollection {
         rank_pairs(self.expense_by_category_book.clone())
     }
 
-    pub fn from_bills(
-        month: NaiveDate,
-        start_balance: AmountType,
-        bills: &[BillEntity],
-    ) -> Self {
+    pub fn from_bills(month: NaiveDate, start_balance: AmountType, bills: &[BillEntity]) -> Self {
         let mut acc = Self::new(month, start_balance);
 
         for b in bills {
@@ -70,7 +66,7 @@ impl BillMonthCollection {
                 continue;
             }
             // 注意：月报/年报**始终全额计入**。
-            // bills.excluded 只影响「支出日历」与「开销计划」，不影响报表口径。
+            // bills.excluded 只影响「支出日历」，不影响报表口径。
 
             match b.kind {
                 BillKind::Income => {

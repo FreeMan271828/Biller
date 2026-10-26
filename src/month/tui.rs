@@ -54,14 +54,34 @@ fn print_report(report: &MonthReport) {
     let collection = &report.collection;
 
     println!("═══ {} 月度记账 ═══", time::format_month(collection.month));
-    println!("起始金额   {}", money::format_amount(collection.start_balance));
-    println!("收入合计   {}", money::format_amount(collection.total_income));
-    println!("支出合计   {}", money::format_amount(collection.total_expense));
+    println!(
+        "起始金额   {}",
+        money::format_amount(collection.start_balance)
+    );
+    println!(
+        "收入合计   {}",
+        money::format_amount(collection.total_income)
+    );
+    println!(
+        "支出合计   {}",
+        money::format_amount(collection.total_expense)
+    );
     println!("本月净额   {}", money::format_amount(collection.net()));
-    println!("月末结余   {}", money::format_amount(collection.remaining()));
+    println!(
+        "月末结余   {}",
+        money::format_amount(collection.remaining())
+    );
 
-    print_group("按账本 · 收入", &collection.income_by_book, &report.book_names);
-    print_group("按账本 · 支出", &collection.expense_by_book, &report.book_names);
+    print_group(
+        "按账本 · 收入",
+        &collection.income_by_book,
+        &report.book_names,
+    );
+    print_group(
+        "按账本 · 支出",
+        &collection.expense_by_book,
+        &report.book_names,
+    );
     print_group(
         "按分类 · 收入",
         &collection.income_by_category,
@@ -79,10 +99,7 @@ fn print_group(title: &str, values: &HashMap<u64, i64>, names: &HashMap<u64, Str
         return;
     }
 
-    let mut entries: Vec<(u64, i64)> = values
-        .iter()
-        .map(|(id, amount)| (*id, *amount))
-        .collect();
+    let mut entries: Vec<(u64, i64)> = values.iter().map(|(id, amount)| (*id, *amount)).collect();
     entries.sort_by(|left, right| right.1.cmp(&left.1));
 
     let rows = entries

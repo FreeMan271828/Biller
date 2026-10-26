@@ -76,8 +76,8 @@ pub fn browser_args(port: u16, user_data_dir: &Path, url: &str) -> Vec<String> {
 
 /// 用独立配置目录 + 调试端口启动浏览器。
 pub fn launch(port: u16, url: &str) -> Result<Child> {
-    let browser = find_browser()
-        .context("没找到 Chrome 或 Edge，请先安装其中一个（用于复用登录会话）")?;
+    let browser =
+        find_browser().context("没找到 Chrome 或 Edge，请先安装其中一个（用于复用登录会话）")?;
     let directory = user_data_dir();
     std::fs::create_dir_all(&directory)
         .with_context(|| format!("创建浏览器配置目录失败：{}", directory.display()))?;
@@ -160,7 +160,10 @@ pub fn parse_targets(text: &str) -> Result<Vec<TargetInfo>> {
             let web_socket_url = item
                 .get("webSocketDebuggerUrl")
                 .and_then(|value| value.as_str())?;
-            let url = item.get("url").and_then(|value| value.as_str()).unwrap_or("");
+            let url = item
+                .get("url")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
 
             Some(TargetInfo {
                 url: url.to_string(),
@@ -172,9 +175,7 @@ pub fn parse_targets(text: &str) -> Result<Vec<TargetInfo>> {
 
 /// 从标签页里挑出货银行页面。
 pub fn pick_bank_target(targets: &[TargetInfo]) -> Option<&TargetInfo> {
-    targets
-        .iter()
-        .find(|target| target.url.starts_with(ORIGIN))
+    targets.iter().find(|target| target.url.starts_with(ORIGIN))
 }
 
 /// 在目标页面里跑一段 JS，返回它的字符串结果。
@@ -307,7 +308,10 @@ pub fn parse_client_no(raw: &str) -> Option<String> {
     // 第二优先：键名里有 clientno（大小写不敏感）
     for item in items {
         let key = item.get("key").and_then(|item| item.as_str()).unwrap_or("");
-        let value = item.get("value").and_then(|item| item.as_str()).unwrap_or("");
+        let value = item
+            .get("value")
+            .and_then(|item| item.as_str())
+            .unwrap_or("");
 
         if key.to_ascii_lowercase().contains("clientno") && !value.trim().is_empty() {
             return Some(value.trim().to_string());
@@ -482,9 +486,7 @@ pub async fn reload_page(web_socket_url: &str) {
         (3, "Page.reload", json!({ "ignoreCache": false })),
     ] {
         let request = json!({ "id": id, "method": method, "params": params });
-        let _ = socket
-            .send(Message::Text(request.to_string().into()))
-            .await;
+        let _ = socket.send(Message::Text(request.to_string().into())).await;
         // 给浏览器一点时间把命令吃进去，否则 reload 可能没发出去连接就断了
         let _ = tokio::time::sleep(Duration::from_millis(200)).await;
     }
@@ -501,9 +503,7 @@ pub async fn sniff_session(web_socket_url: &str, timeout: Duration) -> Result<Sn
 
     // 只打开网络事件，不刷新
     let request = json!({ "id": 1, "method": "Network.enable", "params": {} });
-    let _ = socket
-        .send(Message::Text(request.to_string().into()))
-        .await;
+    let _ = socket.send(Message::Text(request.to_string().into())).await;
 
     let mut session = SniffedSession::default();
     let deadline = tokio::time::Instant::now() + timeout;
@@ -538,7 +538,10 @@ pub async fn sniff_session(web_socket_url: &str, timeout: Duration) -> Result<Sn
             continue;
         }
 
-        let method = value.get("method").and_then(|item| item.as_str()).unwrap_or("");
+        let method = value
+            .get("method")
+            .and_then(|item| item.as_str())
+            .unwrap_or("");
         let params = value.get("params").cloned().unwrap_or(Value::Null);
 
         match method {
@@ -632,9 +635,7 @@ pub async fn wait_for_transaction(
         .with_context(|| format!("连接浏览器调试通道失败：{web_socket_url}"))?;
 
     let request = json!({ "id": 1, "method": "Network.enable", "params": {} });
-    let _ = socket
-        .send(Message::Text(request.to_string().into()))
-        .await;
+    let _ = socket.send(Message::Text(request.to_string().into())).await;
 
     let mut found = SniffedTransaction::default();
     let mut deadline = tokio::time::Instant::now() + timeout;
@@ -696,7 +697,9 @@ pub async fn wait_for_transaction(
                 if let Some(headers) = params.pointer("/request/headers") {
                     found.client_no = header_value(headers, "clientNo");
                 }
-                if let Some(body) = params.pointer("/request/postData").and_then(|item| item.as_str())
+                if let Some(body) = params
+                    .pointer("/request/postData")
+                    .and_then(|item| item.as_str())
                 {
                     found.request_body = Some(body.to_string());
                     let (uid, sub) = extract_account_fields(body);
@@ -778,7 +781,6 @@ mod tests {
 
     #[test]
     fn filters_by_the_bank_origin() {
-
         assert!(url_matches(
             "https://cbsh.ebank.cmbchina.com/CmbBank_Web_Account/accountquery/querytrans"
         ));
@@ -797,7 +799,10 @@ mod tests {
 
         assert!(header_value(&headers, "clientno").is_some());
         assert!(header_value(&headers, "CLIENTNO").is_some());
-        assert_eq!(header_value(&headers, "cookie").as_deref(), Some("a=base; b=base"));
+        assert_eq!(
+            header_value(&headers, "cookie").as_deref(),
+            Some("a=base; b=base")
+        );
         assert_eq!(header_value(&headers, "missing"), None);
         // 空值不算取到
         let empty = json!({"ClientNo": "   "});
@@ -809,7 +814,10 @@ mod tests {
         // 需求里给的真实请求体
         let body = r#"{"accountUid":"P-DKJ43rfy*Anf9tAIgUFCScwRGkcs9c9IdP5bBZm1s_","subAccountNo":"125621564370001","startDate":"20261012","endDate":"20261018"}"#;
         let (uid, sub) = extract_account_fields(body);
-        assert_eq!(uid.as_deref(), Some("P-DKJ43rfy*Anf9tAIgUFCScwRGkcs9c9IdP5bBZm1s_"));
+        assert_eq!(
+            uid.as_deref(),
+            Some("P-DKJ43rfy*Anf9tAIgUFCScwRGkcs9c9IdP5bBZm1s_")
+        );
         assert_eq!(sub.as_deref(), Some("125621564370001"));
     }
 
@@ -890,7 +898,10 @@ mod tests {
 
         let targets = parse_targets(text).unwrap();
         assert_eq!(targets.len(), 2, "没有 WebSocket 地址的条目应跳过");
-        assert_eq!(targets[1].url, "https://cbsh.ebank.cmbchina.com/CmbBank_Web_Account/account/querytrans");
+        assert_eq!(
+            targets[1].url,
+            "https://cbsh.ebank.cmbchina.com/CmbBank_Web_Account/account/querytrans"
+        );
     }
 
     #[test]

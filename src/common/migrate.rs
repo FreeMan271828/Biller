@@ -103,12 +103,14 @@ pub async fn migrate_all(source: &Pool, target: &Pool) -> Result<MigrationReport
             .await
             .context("读取源库分类失败")?;
     for (id, parent_id, name) in order_categories(&rows) {
-        sqlx::query(&target.shared("INSERT INTO categories (id, parent_id, name) VALUES (?, ?, ?)"))
-            .bind(id)
-            .bind(parent_id)
-            .bind(&name)
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query(
+            &target.shared("INSERT INTO categories (id, parent_id, name) VALUES (?, ?, ?)"),
+        )
+        .bind(id)
+        .bind(parent_id)
+        .bind(&name)
+        .execute(&mut *tx)
+        .await?;
         report.categories += 1;
     }
 
@@ -153,17 +155,17 @@ pub async fn migrate_all(source: &Pool, target: &Pool) -> Result<MigrationReport
             .await
             .context("读取源库月度起始金额失败")?;
     for (month, balance) in &months {
-        sqlx::query(&target.shared(
-            "INSERT INTO month_balances (month, start_balance) VALUES (?::date, ?)",
-        ))
-            .bind(month)
-            .bind(balance)
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query(
+            &target.shared("INSERT INTO month_balances (month, start_balance) VALUES (?::date, ?)"),
+        )
+        .bind(month)
+        .bind(balance)
+        .execute(&mut *tx)
+        .await?;
         report.months += 1;
     }
 
-    // 应用级状态（上次使用的日期/账本、开销计划等）
+    // 应用级状态（上次使用的日期/账本、资金计划等）
     let settings: Vec<(String, String)> =
         sqlx::query_as("SELECT key, value FROM app_state ORDER BY key")
             .fetch_all(source.any())

@@ -68,7 +68,7 @@ enum Command {
         #[command(subcommand)]
         cmd: MonthCmd,
     },
-    /// 开销计划（预计金额 / 攒钱金额 → 上限开销）
+    /// 资金计划（收入分成若干块 → 合计与覆盖校验）
     Plan {
         #[command(subcommand)]
         cmd: PlanCmd,

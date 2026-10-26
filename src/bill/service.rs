@@ -2,9 +2,9 @@
 //!
 //! 跨领域只依赖对方的 service：账本走 [`BookService`]，分类走 [`CategoryService`]。
 
+use crate::common::db::{Pool, Tx};
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, NaiveDate, Utc};
-use crate::common::db::{Pool, Tx};
 
 use crate::bill::dao::{BillDao, BillFilter};
 use crate::bill::model::{BillEntity, BillKind};
@@ -13,6 +13,13 @@ use crate::bill_book::service::BookService;
 use crate::category::model::Category;
 use crate::category::service::CategoryService;
 use crate::common::types::{AmountType, BillId};
+
+/// 没记账本 / 分类时落到哪：这两个名字在库里不存在就自动创建。
+///
+/// 放在账单一侧而不是银行一侧，因为「新增账单默认落到默认账本/分类」
+/// 是本模块的规则，银行同步只是恰好也用它。
+pub const DEFAULT_BOOK: &str = "默认";
+pub const DEFAULT_CATEGORY: &str = "默认";
 
 /// 新增账单的入参：账本/分类用名称表达，由 service 负责解析。
 #[derive(Debug, Clone)]
@@ -41,6 +48,8 @@ use crate::common::state::StateStore;
 const KEY_LAST_USED_DATE: &str = "bill.last_used_date";
 /// `app_state` 里存「上次记账用的账本名」的键。
 const KEY_LAST_USED_BOOK: &str = "bill.last_used_book";
+/// `app_state` 里存「上次记账用的分类名」的键。
+const KEY_LAST_USED_CATEGORY: &str = "bill.last_used_category";
 
 #[derive(Clone)]
 pub struct BillService {
@@ -90,6 +99,23 @@ impl BillService {
         self.state.set(KEY_LAST_USED_BOOK, name).await
     }
 
+    /// 上次记账用的分类名：下次新增账单时默认选中它。
+    ///
+    /// 与账本一样只返回名字；分类被删掉时由调用方回落到列表里的第一个。
+    pub async fn default_entry_category(&self) -> Result<Option<String>> {
+        Ok(self
+            .state
+            .get(KEY_LAST_USED_CATEGORY)
+            .await?
+            .map(|text| text.trim().to_string())
+            .filter(|text| !text.is_empty()))
+    }
+
+    /// 记下这次用的分类，供下次新增账单时默认选中。
+    pub async fn remember_entry_category(&self, name: &str) -> Result<()> {
+        self.state.set(KEY_LAST_USED_CATEGORY, name).await
+    }
+
     /// 记一笔账。
     ///
     /// 返回账单本体，以及本次自动创建了哪些账本/分类（供终端提示）。
@@ -108,10 +134,11 @@ impl BillService {
             )
             .await?;
 
-        // 记住这次用的日期与账本，下次新增账单默认沿用
+        // 记住这次用的日期、账本与分类，下次新增账单默认沿用
         self.remember_entry_date(new.created_at.date_naive())
             .await?;
         self.remember_entry_book(&book.name).await?;
+        self.remember_entry_category(&category.name).await?;
 
         Ok((entity(id, &new, book, category), auto_created))
     }
@@ -127,10 +154,7 @@ impl BillService {
         }
 
         let (book, book_created) = self.books.resolve_or_create(&new.book).await?;
-        let (category, category_created) = self
-            .categories
-            .resolve_or_create(&new.category)
-            .await?;
+        let (category, category_created) = self.categories.resolve_or_create(&new.category).await?;
 
         let mut auto_created = Vec::new();
         if book_created {
@@ -261,7 +285,7 @@ impl BillService {
 
     /// 切换一条账单「是否纳入统计」。
     ///
-    /// 不纳入统计的账单仍然存在、仍能在列表里看到，只是不参与收支汇总与开销计划。
+    /// 不纳入统计的账单仍然存在、仍能在列表里看到，只是不参与支出日历的口径。
     pub async fn set_excluded(&self, id: BillId, excluded: bool) -> Result<()> {
         if self.dao.set_excluded(id, excluded).await? == 0 {
             bail!("账单 id={id} 不存在");

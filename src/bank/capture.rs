@@ -210,7 +210,10 @@ fn find_body(text: &str) -> Option<String> {
     }
 
     // 原始 HTTP：空行之后
-    if let Some((_, body)) = text.split_once("\r\n\r\n").or_else(|| text.split_once("\n\n")) {
+    if let Some((_, body)) = text
+        .split_once("\r\n\r\n")
+        .or_else(|| text.split_once("\n\n"))
+    {
         let body = body.trim();
         if !body.is_empty() {
             return Some(body.to_string());
@@ -275,9 +278,18 @@ pub fn save(captured: &CapturedRequest) -> Result<PathBuf> {
         "# 由 `biller sync paste` 生成：从浏览器请求里捕获的会话信息。\n\
          # 含登录凭证，请勿提交到任何仓库；会话过期后重新粘贴即可。\n",
     );
-    text.push_str(&format!("client_no = \"{}\"\n", escape(captured.client_no.as_deref().unwrap_or(""))));
-    text.push_str(&format!("cookie = \"{}\"\n", escape(captured.cookie.as_deref().unwrap_or(""))));
-    text.push_str(&format!("account_uid = \"{}\"\n", escape(captured.account_uid.as_deref().unwrap_or(""))));
+    text.push_str(&format!(
+        "client_no = \"{}\"\n",
+        escape(captured.client_no.as_deref().unwrap_or(""))
+    ));
+    text.push_str(&format!(
+        "cookie = \"{}\"\n",
+        escape(captured.cookie.as_deref().unwrap_or(""))
+    ));
+    text.push_str(&format!(
+        "account_uid = \"{}\"\n",
+        escape(captured.account_uid.as_deref().unwrap_or(""))
+    ));
     text.push_str(&format!(
         "sub_account_no = \"{}\"\n",
         escape(captured.sub_account_no.as_deref().unwrap_or(""))
@@ -327,7 +339,10 @@ pub fn load() -> Result<Option<CapturedRequest>> {
 }
 
 fn escape(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', " ")
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', " ")
 }
 
 fn unescape(value: &str) -> String {
@@ -378,10 +393,10 @@ pub async fn replay(
         .header("ClientNo", client_no)
         .header("Cookie", cookie)
         .header("Origin", client::ORIGIN)
-        .header("Referer", format!(
-            "{}/CmbBank_Web_Account/account/querytrans",
-            client::ORIGIN
-        ))
+        .header(
+            "Referer",
+            format!("{}/CmbBank_Web_Account/account/querytrans", client::ORIGIN),
+        )
         .header(
             "request-timestamp",
             chrono::Utc::now().timestamp_millis().to_string(),
@@ -442,7 +457,11 @@ Origin: https://cbsh.ebank.cmbchina.com
         );
         assert_eq!(captured.sub_account_no.as_deref(), Some("125621564370001"));
         assert!(
-            captured.cookie.as_deref().unwrap_or("").contains("33dd74597660bfb607ef1d8e314e6df2"),
+            captured
+                .cookie
+                .as_deref()
+                .unwrap_or("")
+                .contains("33dd74597660bfb607ef1d8e314e6df2"),
             "Cookie 应被抓到"
         );
         assert!(captured.is_usable(), "三个值齐全才算可用");
@@ -461,7 +480,8 @@ Origin: https://cbsh.ebank.cmbchina.com
     #[test]
     fn parses_curl_without_body() {
         // 只有头没有 body：ClientNo 能拿到，账户拿不到
-        let text = r#"curl "https://cbsh.ebank.cmbchina.com/x" -H "ClientNo: abc-123" -H "Cookie: a=1""#;
+        let text =
+            r#"curl "https://cbsh.ebank.cmbchina.com/x" -H "ClientNo: abc-123" -H "Cookie: a=1""#;
         let captured = parse(text).unwrap();
         assert_eq!(captured.client_no.as_deref(), Some("abc-123"));
         assert_eq!(captured.cookie.as_deref(), Some("a=1"));
@@ -497,6 +517,10 @@ Origin: https://cbsh.ebank.cmbchina.com
             account_uid: Some("P".to_string()),
             sub_account_no: Some("1".to_string()),
         };
-        assert!(captured.describe().contains("2 个键"), "{}", captured.describe());
+        assert!(
+            captured.describe().contains("2 个键"),
+            "{}",
+            captured.describe()
+        );
     }
 }

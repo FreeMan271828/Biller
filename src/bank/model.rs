@@ -308,7 +308,9 @@ pub fn parse_cents(text: &str) -> Result<AmountType> {
     let integer: i64 = if integer.is_empty() {
         0
     } else {
-        integer.parse().with_context(|| format!("金额整数部分溢出：{text}"))?
+        integer
+            .parse()
+            .with_context(|| format!("金额整数部分溢出：{text}"))?
     };
 
     let cents: i64 = match fraction.len() {
@@ -409,8 +411,8 @@ mod tests {
     #[test]
     fn week_window_starts_after_the_latest_local_bill() {
         // 本地已经记到 10-15，那本次应从 10-16 开始
-        let window = SyncWindow::this_week(date(2026, 10, 18), Some(date(2026, 10, 15)))
-            .expect("应有窗口");
+        let window =
+            SyncWindow::this_week(date(2026, 10, 18), Some(date(2026, 10, 15))).expect("应有窗口");
 
         assert_eq!(window.start, date(2026, 10, 16));
         assert_eq!(window.end, date(2026, 10, 18));
@@ -419,8 +421,8 @@ mod tests {
     #[test]
     fn week_window_is_clamped_to_monday() {
         // 本地最新账单在上周，起点仍然不早于本周一
-        let window = SyncWindow::this_week(date(2026, 10, 14), Some(date(2026, 10, 1)))
-            .expect("应有窗口");
+        let window =
+            SyncWindow::this_week(date(2026, 10, 14), Some(date(2026, 10, 1))).expect("应有窗口");
 
         assert_eq!(window.start, date(2026, 10, 12), "不能跨出本周");
     }
@@ -457,7 +459,10 @@ mod tests {
     fn rejects_malformed_money() {
         assert!(parse_cents("").is_err());
         assert!(parse_cents("abc").is_err());
-        assert!(parse_cents("1.234").is_err(), "超过两位小数应报错，不静默四舍五入");
+        assert!(
+            parse_cents("1.234").is_err(),
+            "超过两位小数应报错，不静默四舍五入"
+        );
         assert!(parse_cents("1,2x").is_err());
     }
 
@@ -476,7 +481,10 @@ mod tests {
             "消费-友宝智能货柜"
         );
         // 没有前缀的原样返回
-        assert_eq!(memo_key("  江南体育中心   自助售货机 "), "江南体育中心 自助售货机");
+        assert_eq!(
+            memo_key("  江南体育中心   自助售货机 "),
+            "江南体育中心 自助售货机"
+        );
         // 只有前缀也不能剥成空
         assert_eq!(memo_key("支付宝-"), "支付宝-");
     }
@@ -497,10 +505,7 @@ mod tests {
 
         assert_eq!(txn.as_utc().date_naive(), date(2026, 10, 16));
         // 墙上时间原样保留（晚上 01:18 仍显示 01:18）
-        assert_eq!(
-            txn.as_utc().format("%H:%M:%S").to_string(),
-            "01:18:48"
-        );
+        assert_eq!(txn.as_utc().format("%H:%M:%S").to_string(), "01:18:48");
     }
 
     // ---------- 响应解析 ----------
@@ -568,7 +573,10 @@ mod tests {
         let first = &list[0];
         assert_eq!(first.kind, BillKind::Expense);
         assert_eq!(first.amount, 1420, "支出金额取绝对值");
-        assert_eq!(first.memo, "网银在线-京东商城-正新鸡排", "memo 应去掉尾部空格");
+        assert_eq!(
+            first.memo, "网银在线-京东商城-正新鸡排",
+            "memo 应去掉尾部空格"
+        );
         assert_eq!(first.balance, Some(1_113_577));
         assert_eq!(first.raw_type, "网联协议支付");
         assert_eq!(
@@ -598,7 +606,8 @@ mod tests {
         assert_eq!(fingerprints, again);
 
         // 三笔流水指纹互不相同
-        let unique: std::collections::HashSet<&String> = first.iter().map(|txn| &txn.fingerprint).collect();
+        let unique: std::collections::HashSet<&String> =
+            first.iter().map(|txn| &txn.fingerprint).collect();
         assert_eq!(unique.len(), 3);
         assert!(first[0].fingerprint.contains("2026-10-18 20:38:03"));
     }
@@ -629,8 +638,8 @@ mod tests {
 
     #[test]
     fn html_login_page_gives_a_friendly_error() {
-        let error = parse_querytrans_response("<html><body>请登录</body></html>")
-            .expect_err("HTML 应报错");
+        let error =
+            parse_querytrans_response("<html><body>请登录</body></html>").expect_err("HTML 应报错");
         assert!(
             error.to_string().contains("会话已失效"),
             "应提示重新登录而不是 JSON 语法错误：{error}"

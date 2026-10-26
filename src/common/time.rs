@@ -82,7 +82,9 @@ pub fn parse_datetime(input: Option<&str>) -> Result<DateTime<Utc>> {
         }
     }
 
-    bail!("时间格式无法识别：{raw}（示例：2026-10-05、\"2026-10-05 13:20:00\"、2026-10-05T13:20:00Z）")
+    bail!(
+        "时间格式无法识别：{raw}（示例：2026-10-05、\"2026-10-05 13:20:00\"、2026-10-05T13:20:00Z）"
+    )
 }
 
 #[cfg(test)]
@@ -102,7 +104,10 @@ mod tests {
     #[test]
     fn parses_datetimes() {
         let date_only = parse_datetime(Some("2026-10-05")).unwrap();
-        assert_eq!(date_only.format("%Y-%m-%d %H:%M:%S").to_string(), "2026-10-05 00:00:00");
+        assert_eq!(
+            date_only.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "2026-10-05 00:00:00"
+        );
 
         let with_time = parse_datetime(Some("2026-10-05 13:20:00")).unwrap();
         assert_eq!(with_time.format("%H:%M:%S").to_string(), "13:20:00");

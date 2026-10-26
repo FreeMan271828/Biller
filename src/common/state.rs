@@ -3,8 +3,8 @@
 //! 用于跨会话记住一些「上次用了什么」的小状态（目前是新增账单时上次使用的日期）。
 //! 存数据库而不是本地文件：换机器、重启都还能沿用。
 
-use anyhow::Result;
 use crate::common::db::Pool;
+use anyhow::Result;
 
 #[derive(Clone)]
 pub struct StateStore {
@@ -17,11 +17,14 @@ impl StateStore {
     }
 
     pub async fn get(&self, key: &str) -> Result<Option<String>> {
-        let row: Option<(String,)> =
-            sqlx::query_as(&self.pool.shared("SELECT value FROM app_state WHERE key = ?"))
-                .bind(key)
-                .fetch_optional(self.pool.any())
-                .await?;
+        let row: Option<(String,)> = sqlx::query_as(
+            &self
+                .pool
+                .shared("SELECT value FROM app_state WHERE key = ?"),
+        )
+        .bind(key)
+        .fetch_optional(self.pool.any())
+        .await?;
         Ok(row.map(|(value,)| value))
     }
 

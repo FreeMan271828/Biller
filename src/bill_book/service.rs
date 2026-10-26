@@ -1,7 +1,7 @@
 //! 账本业务规则：本领域对外的唯一入口，账单领域通过它解析账本。
 
-use anyhow::{Context, Result, bail};
 use crate::common::db::Pool;
+use anyhow::{Context, Result, bail};
 
 use crate::bill_book::dao::BookDao;
 use crate::bill_book::model::BillBook;
@@ -44,9 +44,10 @@ impl BookService {
     /// 按名称查找，不存在则报错。
     pub async fn resolve(&self, name: &str) -> Result<BillBook> {
         let name = normalize(name)?;
-        self.dao.find_by_name(name).await?.with_context(|| {
-            format!("账本「{name}」不存在，可先执行：biller book add {name}")
-        })
+        self.dao
+            .find_by_name(name)
+            .await?
+            .with_context(|| format!("账本「{name}」不存在，可先执行：biller book add {name}"))
     }
 
     /// 按名称查找，不存在则自动创建；返回 (账本, 是否新建)。

@@ -12,64 +12,95 @@ use chrono::{Datelike, Months, NaiveDate, Utc};
 use crate::bank::model::BankTransaction;
 use crate::bank::service::{BankService, Suggestion, SyncKind};
 use crate::bill::model::{BillEntity, BillKind};
-use crate::bill::service::{BillQuery, NewBill};
+use crate::bill::service::{BillQuery, DEFAULT_BOOK, DEFAULT_CATEGORY, NewBill};
 use crate::bill_book::model::BillBook;
 use crate::category::model::Category;
 use crate::category::service::{CategoryNode, descendants_of, subtree_of};
 use crate::common::db::ConnectionSettings;
-use crate::plan::model::{PlanMode, PlanProgress, SpendingPlan, days_in_month};
 use crate::common::money;
 use crate::common::types::{AmountType, BookId, CategoryId};
 use crate::month::service::{MonthReport, YearReport};
+use crate::plan::model::{
+    PlanCoverage, PlanProgress, SpendingPlan, days_in_month,
+};
 use crate::tui::Services;
 use crate::tui::input::Key;
 
 /// 页签。
+///
+/// 只有四个：概览、计划、账单、报表。月报与年报是同一个问题的两种时间尺度，
+/// 合成一页（页内 `m` / `y` 切）；设置一年点不了几次，` , ` 随时进出，不占导航位。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Page {
     Overview,
+    /// 资金分配：这个月的钱分成哪几块、合起来能不能盖住收入。
+    Plan,
     Bills,
-    Months,
-    Years,
+    /// 报表：月报 + 年报。
+    Reports,
+    /// 设置不在页签队列里，` , ` 打开。
     Settings,
 }
 
 impl Page {
-    pub const ALL: [Page; 5] = [
-        Page::Overview,
-        Page::Bills,
-        Page::Months,
-        Page::Years,
-        Page::Settings,
-    ];
+    /// 顶栏页签队列。设置不在里面。
+    pub const ALL: [Page; 4] = [Page::Overview, Page::Plan, Page::Bills, Page::Reports];
 
     pub fn title(self) -> &'static str {
         match self {
             Page::Overview => "概览",
+            Page::Plan => "计划",
             Page::Bills => "账单",
-            Page::Months => "月报",
-            Page::Years => "年报",
+            Page::Reports => "报表",
             Page::Settings => "设置",
         }
     }
 
     /// 该页是否支持上下选择行。
     pub fn is_list(self) -> bool {
-        matches!(self, Page::Bills | Page::Months)
+        matches!(self, Page::Plan | Page::Bills | Page::Reports)
     }
 
     pub fn index(self) -> usize {
         Page::ALL.iter().position(|page| *page == self).unwrap_or(0)
     }
 
-    pub fn next(self) -> Self {
-        Page::ALL[(self.index() + 1) % Page::ALL.len()]
+    /// 选中行下标的槽位。设置不在页签里，单独占最后一格，免得和概览抢同一格。
+    pub fn slot(self) -> usize {
+        match self {
+            Page::Settings => Page::ALL.len(),
+            other => other.index(),
+        }
     }
 
-    pub fn previous(self) -> Self {
-        let index = self.index();
-        Page::ALL[(index + Page::ALL.len() - 1) % Page::ALL.len()]
+    /// 下一个页签。设置不在队列里，从它往右等于从队首开始。
+    pub fn next(self) -> Self {
+        match self {
+            Page::Settings => Page::ALL[0],
+            _ => Page::ALL[(self.index() + 1) % Page::ALL.len()],
+        }
     }
+
+    /// 上一个页签。设置不在队列里，从它往左等于回到队尾。
+    pub fn previous(self) -> Self {
+        match self {
+            Page::Settings => Page::ALL[Page::ALL.len() - 1],
+            _ => {
+                let index = self.index();
+                Page::ALL[(index + Page::ALL.len() - 1) % Page::ALL.len()]
+            }
+        }
+    }
+}
+
+/// 报表页的两个时间尺度。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReportTab {
+    /// 月报：本月分类 + 账本排行、明细。
+    #[default]
+    Month,
+    /// 年报：按账本汇总 + 逐月走势。
+    Year,
 }
 
 /// 设置页里的三个分区，焦点在菜单上时用 `↑` `↓` 切换。
@@ -83,10 +114,11 @@ pub enum SettingsSection {
 }
 
 impl SettingsSection {
+    /// 顺序即菜单顺序：日常记账（账本 / 分类）在前，数据库运维沉到最后。
     pub const ALL: [SettingsSection; 3] = [
-        SettingsSection::Connection,
         SettingsSection::Books,
         SettingsSection::Categories,
+        SettingsSection::Connection,
     ];
 
     pub fn index(self) -> usize {
@@ -99,7 +131,7 @@ impl SettingsSection {
     /// 分区标题，同时也是面板边框上的字。
     pub fn title(self) -> &'static str {
         match self {
-            SettingsSection::Connection => "数据库连接",
+            SettingsSection::Connection => "运维 · 数据库",
             SettingsSection::Books => "账本",
             SettingsSection::Categories => "分类",
         }
@@ -266,12 +298,35 @@ impl Field {
     }
 }
 
+/// 计划块「不绑定分类」的选择项文案。
+///
+/// 单独拎成常量是因为要跟表单值、`plan_category_from_form` 的判定保持一致，
+/// 改文案时不会漏掉某一处。
+pub const UNBOUND_CATEGORY: &str = "(不绑定)";
+
+/// 账单页分页结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BillPage {
+    /// 从 0 开始：第几页。
+    pub page: usize,
+    /// 总页数，空列表也算 1 页。
+    pub pages: usize,
+    /// 本页第一条在 [`App::bills`] 里的下标（含）。
+    pub start: usize,
+    /// 本页结束下标（不含）。
+    pub end: usize,
+    /// 每页行数预算，测试与调试用。
+    pub budget: usize,
+}
+
 /// 正在新增什么。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FormKind {
     NewBill,
     NewBook,
     NewCategory,
+    /// 计划里的资金块（计划页）。
+    PlanItem,
     /// 设置某月起始金额（概览页）。
     SetStartBalance,
     /// 数据库连接设置（设置页）。
@@ -286,6 +341,8 @@ pub enum EditTarget {
     Bill(u64),
     Book(u64),
     Category(u64),
+    /// 计划里的第 index 块（位置即展示顺序）。
+    PlanItem(usize),
     /// 某月的起始金额（携带该月）。
     MonthBalance(NaiveDate),
 }
@@ -304,18 +361,38 @@ pub struct Form {
 impl Form {
     /// 新增账单。
     ///
-    /// `preferred_book` 是上次记账用过的账本（没有则传 `None`，回落到列表第一个）。
-    /// `book_options` / `category_options` 由调用方从数据库里已读取的账本、分类填充
-    /// （分类带层级缩进）；列表为空时该字段退化成文本框，直接输入会由 service 自动创建，
-    /// 这样空库也能记第一笔账。
+    /// 账本 / 分类都**不留空**：空值提交时会被 service 拒绝（并且提示很难懂），
+    /// 所以这里直接给出一个合法的落点——
+    ///
+    /// * 账本：上次记账用过的那个（`preferred_book`）→ 否则「默认」→ 否则第一个；
+    /// * 分类：「默认」（不存在时取第一个）；
+    /// * 候选列表整个为空（刚建的库）时，塞一个同名候选，让表单仍然可用——
+    ///   提交时 service 会按需自动创建这两个条目。
     ///
     /// 「日期」默认留空表示今天，需要在字段上按空格才填入上次用过的日期；
-    /// 焦点默认落在「金额」——打开表单第一件事就是输钱，输完再挑账本和分类。
+    /// 焦点默认落在「金额」——打开表单第一件事就是输钱，输完再挑分类和账本。
+    /// 字段顺序也照这个动线排：金额 → 分类 → 账本 → 日期 → 备注，
+    /// 因为「这笔钱花在哪」每次都要想，「记在哪个账本」基本是固定的。
     pub fn new_bill(
         book_options: Vec<String>,
         category_options: Vec<String>,
         preferred_book: Option<&str>,
     ) -> Self {
+        Self::new_bill_with(book_options, category_options, preferred_book, None)
+    }
+
+    /// 带「上次用过的分类」的新增账单表单，见 [`Form::new_bill`]。
+    pub fn new_bill_with(
+        book_options: Vec<String>,
+        category_options: Vec<String>,
+        preferred_book: Option<&str>,
+        preferred_category: Option<&str>,
+    ) -> Self {
+        let book_options = with_fallback(book_options, DEFAULT_BOOK);
+        let category_options = with_fallback(category_options, DEFAULT_CATEGORY);
+        let preferred_book = Some(preferred_book.unwrap_or(DEFAULT_BOOK));
+        let preferred_category = Some(preferred_category.unwrap_or(DEFAULT_CATEGORY));
+
         Self {
             kind: FormKind::NewBill,
             title: "新增账单",
@@ -327,16 +404,16 @@ impl Form {
                 ),
                 Field::amount("金额", "可写算式（+ - * / 与括号），按 = 求值"),
                 picker(
+                    "分类",
+                    category_options,
+                    preferred_category,
+                    "Enter 展开选择；新增请到「分类」页",
+                ),
+                picker(
                     "账本",
                     book_options,
                     preferred_book,
                     "Enter 展开选择；新增请到「账本」页",
-                ),
-                picker(
-                    "分类",
-                    category_options,
-                    None,
-                    "Enter 展开选择；新增请到「分类」页",
                 ),
                 Field::date("日期", "留空即今天；按空格填入上次使用的时间"),
                 Field::text("备注", "", "可留空"),
@@ -390,8 +467,8 @@ impl Form {
             BillKind::Expense => "支出".to_string(),
         };
         form.fields[1].value = money::format_amount(bill.amount);
-        set_field_value(&mut form.fields[2], &bill.book.name);
-        set_field_value(&mut form.fields[3], &bill.category.name);
+        set_field_value(&mut form.fields[2], &bill.category.name);
+        set_field_value(&mut form.fields[3], &bill.book.name);
         form.fields[4].value = crate::common::time::format_datetime(bill.created_at);
         form.fields[5].value = bill.remark.clone().unwrap_or_default();
         // 账单详情里也能改「计入日历」
@@ -403,7 +480,7 @@ impl Form {
             } else {
                 "计入".to_string()
             },
-            "只影响支出日历与开销计划；月报/年报始终全额计入",
+            "只影响支出日历；月报/年报与本月收入始终全额计入",
         ));
         form
     }
@@ -431,42 +508,71 @@ impl Form {
         form
     }
 
-    /// 本月设置（概览页按 `e`）：起始金额与开销计划一起改。
+    /// 本月设置（概览页按 `e`）：只改起始金额。
     ///
-    /// 计划只有两个数：**上限开销 = 预计 − 攒钱**，不单独存。
-    pub fn month_settings(month: NaiveDate, current: AmountType, plan: SpendingPlan) -> Self {
+    /// 钱怎么分已经挪到「计划」页维护，两件事各归各：
+    /// 起始金额是**账上余额的起点**，计划是**这个月打算把钱分到哪几块**。
+    pub fn month_settings(month: NaiveDate, current: AmountType) -> Self {
         Self {
             kind: FormKind::SetStartBalance,
-            title: "本月设置（起始金额 + 开销计划）",
-            fields: vec![
-                Field::text(
-                    "起始金额",
-                    money::format_amount(current),
-                    "元，例如 1000 或 1000.50",
-                ),
-                Field::text(
-                    "预计金额",
-                    money::format_amount(plan.expected),
-                    "本月预计到手多少（元）",
-                ),
-                Field::text(
-                    "攒钱金额",
-                    money::format_amount(plan.savings),
-                    "打算攒下多少；上限开销 = 预计 − 攒钱",
-                ),
-                Field::choice_with(
-                    "超支判断",
-                    vec![
-                        PlanMode::Cumulative.label().to_string(),
-                        PlanMode::DailyOnly.label().to_string(),
-                    ],
-                    plan.mode.label().to_string(),
-                    "累计标红：超了之后一路红；只看当天：每天独立判断",
-                ),
-            ],
+            title: "本月设置（起始金额）",
+            fields: vec![Field::text(
+                "起始金额",
+                money::format_amount(current),
+                "元，例如 1000 或 1000.50",
+            )],
             focus: 0,
             target: Some(EditTarget::MonthBalance(month)),
         }
+    }
+
+    /// 计划页新增/编辑一块资金。
+    ///
+    /// `index` 为 `None` 时是新增；为 `Some` 时预填该块的名称与金额，
+    /// 提交后按位置覆盖——位置就是计划里的展示顺序。
+    ///
+    /// 「分类（可选）」是这块预算和账单分类的绑定：绑了之后，
+    /// 这个分类（含子分类）当月的支出会自动算进「已花」，
+    /// 计划页就能看到「额度 3000 / 已花 1200」这种对账，不用手动填两遍。
+    pub fn plan_item(
+        plan: &SpendingPlan,
+        index: Option<usize>,
+        category_options: Vec<String>,
+    ) -> Self {
+        let mut options = vec![UNBOUND_CATEGORY.to_string()];
+        options.extend(category_options);
+
+        let mut form = Self {
+            kind: FormKind::PlanItem,
+            title: "新增计划块",
+            fields: vec![
+                Field::text("名称", "", "例如 日常开销 / 存款 / 房租；留空则用分类名"),
+                Field::amount("金额", "元，例如 3000 或 3000.50；可写算式"),
+                Field::choice_with(
+                    "分类（可选）",
+                    options,
+                    UNBOUND_CATEGORY.to_string(),
+                    "←/→ 选择；绑定后自动对账，子分类也算进来",
+                ),
+            ],
+            focus: 0,
+            target: None,
+        };
+
+        if let Some(index) = index {
+            if let Some(item) = plan.get(index) {
+                form.title = "编辑计划块";
+                form.target = Some(EditTarget::PlanItem(index));
+                form.fields[0].value = item.name.clone();
+                form.fields[1].value = money::format_amount(item.amount);
+                // 名称/金额都可能改，但金额改动最多：焦点落在金额上
+                form.focus = 1;
+                if let Some(category) = &item.category {
+                    set_field_value(&mut form.fields[2], category);
+                }
+            }
+        }
+        form
     }
 
     /// 数据库连接设置（设置页按 `e`）。
@@ -487,7 +593,11 @@ impl Form {
                     initial.to_string(),
                     "本地文件 = 零配置；PostgreSQL = 远程库",
                 ),
-                Field::text("文件路径", sqlite_path.to_string(), "本地库文件，目录会自动创建"),
+                Field::text(
+                    "文件路径",
+                    sqlite_path.to_string(),
+                    "本地库文件，目录会自动创建",
+                ),
                 Field::text("主机", settings.host.clone(), "IP 或主机名"),
                 Field::text("端口", settings.port.to_string(), "默认 5432"),
                 Field::text("用户名", settings.user.clone(), "PostgreSQL 用户"),
@@ -512,7 +622,11 @@ impl Form {
                 Field::text("端口", settings.port.to_string(), "默认 5432"),
                 Field::text("用户名", settings.user.clone(), "PostgreSQL 用户"),
                 Field::text("密码", settings.password.clone(), "会以明文写进 .env"),
-                Field::text("数据库", settings.database.clone(), "目标库：会被清空后写入源库的全部数据"),
+                Field::text(
+                    "数据库",
+                    settings.database.clone(),
+                    "目标库：会被清空后写入源库的全部数据",
+                ),
             ],
             focus: 0,
             target: None,
@@ -588,6 +702,8 @@ pub enum Modal {
         title: String,
         message: String,
     },
+    /// 帮助：全量快捷键 + 几个概念的解释。`?` 打开，任意键关掉。
+    Help,
 }
 
 /// 状态栏消息。
@@ -623,6 +739,8 @@ pub enum Action {
     ShiftYear(i32),
     SubmitForm(Form),
     DeleteBill(u64),
+    /// 删除计划里的一块（位置，计划页 `d`）。
+    DeletePlanItem(usize),
     DeleteBook(u64),
     /// 删除分类；`recursive` 为真时连同子孙一起删（终端会先提示）。
     DeleteCategory {
@@ -645,9 +763,7 @@ pub enum Action {
 #[derive(Debug, Clone)]
 pub enum ConnectionTarget {
     /// 本地 SQLite 文件（默认，零配置）。
-    Local {
-        path: String,
-    },
+    Local { path: String },
     /// 远程 PostgreSQL。
     Remote(ConnectionSettings),
 }
@@ -699,10 +815,19 @@ pub struct App {
     pub settings_focus: SettingsFocus,
     /// 三个分区各自的选中行。
     settings_selected: [usize; SettingsSection::ALL.len()],
-    /// 开销计划（预计金额 / 攒钱金额），全局生效。
+    /// 资金分配计划：这个月的钱分成哪几块，全局生效。
     pub plan: SpendingPlan,
     /// 当月计划的执行情况与日历配色，在 `reload` 时算一次。
     pub progress: Option<PlanProgress>,
+    /// 计划合计 vs 当月收入（盖不盖得住），同样在 `reload` 时算一次。
+    pub coverage: Option<PlanCoverage>,
+    /// 每块计划**已经花了多少**：与 `plan.items` 等长，未绑分类的是 `None`。
+    pub plan_spent: Vec<Option<AmountType>>,
+    /// 终端视口高度，由事件循环每帧写回。
+    ///
+    /// 账单页按它决定「一页放多少条」，所以渲染和翻页读的是同一份值——
+    /// 否则页码和实际能看到的行数会各算各的。
+    pub viewport_height: u16,
     /// 概览页正在查看的那一天（1..=当月天数），`←` `→` 移动。
     pub selected_day: u32,
     /// 还没连上数据库：界面显示配置引导页，而不是直接不给进。
@@ -716,8 +841,11 @@ pub struct App {
     pub last_entry_date: Option<NaiveDate>,
     /// 新增账单时默认选中的账本：上次记账用过的账本名（跨会话记忆）。
     pub last_entry_book: Option<String>,
+    /// 上次记账用过的分类名，下次新增账单默认选中。
+    pub last_entry_category: Option<String>,
     /// 每页各自记住选中行。
-    pub selected: [usize; Page::ALL.len()],
+    /// 每个页签记住自己的选中行；末尾多一格给设置页（它不在页签队列里）。
+    pub selected: [usize; Page::ALL.len() + 1],
     pub books: Vec<BillBook>,
     /// 分类按层级展开，`depth` 用于渲染缩进与父分类候选。
     pub categories: Vec<CategoryNode>,
@@ -727,6 +855,12 @@ pub struct App {
     pub modal: Option<Modal>,
     pub status: Option<Status>,
     pub should_quit: bool,
+    /// 年报里空月份默认折叠成一行提示，`x` 展开成完整 12 个月。
+    pub year_expanded: bool,
+    /// 报表页当前看的是月报还是年报。
+    pub report_tab: ReportTab,
+    /// 从设置页按 `,` / `Esc` 出来时回到哪一页。
+    settings_return: Page,
 }
 
 impl App {
@@ -741,11 +875,14 @@ impl App {
             connection_url: connection_url.to_string(),
             sqlite_path: sqlite_path.to_string(),
             last_deleted: None,
-            settings_section: SettingsSection::Connection,
+            settings_section: SettingsSection::Books,
             settings_focus: SettingsFocus::Menu,
             settings_selected: [0; SettingsSection::ALL.len()],
             plan: SpendingPlan::default(),
             progress: None,
+            coverage: None,
+            plan_spent: Vec::new(),
+            viewport_height: 40,
             // 看本月就默认从今天开始看，看历史月份从 1 号开始
             selected_day: if today.year() == month.year() && today.month() == month.month() {
                 today.day()
@@ -757,7 +894,8 @@ impl App {
             sync_total: 0,
             last_entry_date: None,
             last_entry_book: None,
-            selected: [0; Page::ALL.len()],
+            last_entry_category: None,
+            selected: [0; Page::ALL.len() + 1],
             books: Vec::new(),
             categories: Vec::new(),
             bills: Vec::new(),
@@ -766,6 +904,9 @@ impl App {
             modal: None,
             status: None,
             should_quit: false,
+            year_expanded: false,
+            report_tab: ReportTab::default(),
+            settings_return: Page::Overview,
         }
     }
 
@@ -851,9 +992,17 @@ impl App {
     /// 当前页可供选择的行数。
     pub fn row_count(&self, page: Page) -> usize {
         match page {
+            Page::Plan => self.plan.items().len(),
             Page::Bills => self.bills.len(),
-            Page::Months => self.month_expense_pairs().len(),
-            Page::Overview | Page::Years | Page::Settings => 0,
+            // 报表页只有「月报」那一半是可选的排行列表
+            Page::Reports => {
+                if self.report_tab == ReportTab::Month {
+                    self.month_expense_pairs().len()
+                } else {
+                    0
+                }
+            }
+            Page::Overview | Page::Settings => 0,
         }
     }
 
@@ -872,7 +1021,7 @@ impl App {
     pub fn month_selected_bills(&self) -> Vec<&BillEntity> {
         let Some((category_id, book_id, _)) = self
             .month_expense_pairs()
-            .get(self.selected_index(Page::Months))
+            .get(self.selected_index(Page::Reports))
             .copied()
         else {
             return Vec::new();
@@ -888,7 +1037,7 @@ impl App {
     pub fn month_selected_label(&self) -> Option<String> {
         let (category_id, book_id, _) = self
             .month_expense_pairs()
-            .get(self.selected_index(Page::Months))
+            .get(self.selected_index(Page::Reports))
             .copied()?;
 
         let report = self.report.as_ref()?;
@@ -987,7 +1136,7 @@ impl App {
         if self.page == Page::Settings {
             self.settings_selected[self.settings_section.index()] = index;
         } else {
-            self.selected[self.page.index()] = index;
+            self.selected[self.page.slot()] = index;
         }
     }
 
@@ -1005,8 +1154,95 @@ impl App {
         if count == 0 {
             0
         } else {
-            self.selected[page.index()].min(count - 1)
+            self.selected[page.slot()].min(count - 1)
         }
+    }
+
+    /// 账单页一页能放多少行（含日期表头）。
+    ///
+    /// 视口高度减去固定开销：顶栏 1 + 底栏 2 + 边框上下 2 + 页脚页码 1 = 6。
+    /// 终端越高，一页看到的账单越多——不再写死 10 条把下半屏空着。
+    pub fn bill_page_budget(&self) -> usize {
+        usize::from(self.viewport_height).saturating_sub(6).max(2)
+    }
+
+    /// 当前选中的账单落在第几页、这一页覆盖哪几条。
+    pub fn bill_page(&self) -> BillPage {
+        self.bill_page_with(self.bill_page_budget())
+    }
+
+    /// 同上，但一页放多少行由调用方给。
+    ///
+    /// 渲染侧用**真实面板高度**算出来传进来：视口高度是渲染前一拍记下的，
+    /// 窗口刚缩放的那一帧可能还对不上；以面板实际高度为准，页码才不会和内容错位。
+    pub fn bill_page_with(&self, budget: usize) -> BillPage {
+        self.bill_page_of(self.bills.len(), self.selected_index(Page::Bills), budget)
+    }
+
+    /// 按「整日优先、必要时才断开某一天」的贪心切页。
+    ///
+    /// 单位是**行**而不是账单条数：一个日期表头也占一行，所以这一天第一笔
+    /// 要算 2 行。换页时该行会重新出一遍表头，翻到一半也知道自己在哪一天。
+    fn bill_page_of(&self, total: usize, selected: usize, budget: usize) -> BillPage {
+        let budget = budget.max(2);
+        if total == 0 {
+            return BillPage {
+                page: 0,
+                pages: 1,
+                start: 0,
+                end: 0,
+                budget,
+            };
+        }
+
+        let mut ranges: Vec<(usize, usize)> = Vec::new();
+        let mut start = 0usize;
+        let mut used = 0usize;
+        let mut index = 0usize;
+        for (_, group) in crate::tui::view::bills_by_day(&self.bills) {
+            for offset in 0..group.len() {
+                // 一天的开始或者刚换页，都要表头
+                let need = if offset == 0 || index == start { 2 } else { 1 };
+                if used + need > budget && index > start {
+                    ranges.push((start, index));
+                    start = index;
+                    used = need;
+                } else {
+                    used += need;
+                }
+                index += 1;
+            }
+        }
+        ranges.push((start, index));
+
+        let page = ranges
+            .iter()
+            .position(|(start, end)| selected >= *start && selected < *end)
+            .unwrap_or(ranges.len() - 1);
+        let (start, end) = ranges[page];
+
+        BillPage {
+            page,
+            pages: ranges.len(),
+            start,
+            end,
+            budget,
+        }
+    }
+
+    /// PgUp / PgDn：账单页按**整页**跳，步长由视口高度决定。
+    fn move_bill_page(&mut self, delta: i32) {
+        let current = self.bill_page();
+        let count = self.bills.len();
+        if count == 0 {
+            return;
+        }
+        let target = if delta < 0 {
+            current.start.saturating_sub(1)
+        } else {
+            current.end.min(count.saturating_sub(1))
+        };
+        self.selected[Page::Bills.index()] = target;
     }
 
     fn move_selection(&mut self, delta: i32) {
@@ -1027,6 +1263,16 @@ impl App {
 
     /// 翻页签。离开设置页时把两级焦点归位到菜单：
     /// 下次进来先看到「有哪几个分区」，而不是直接落在某个列表里。
+    /// `,`（或老手感 `6`）进出设置页：进来记住来路，出去回到原地。
+    fn toggle_settings(&mut self) -> Action {
+        if self.page == Page::Settings {
+            self.switch_page(self.settings_return)
+        } else {
+            self.settings_return = self.page;
+            self.switch_page(Page::Settings)
+        }
+    }
+
     fn switch_page(&mut self, page: Page) -> Action {
         self.page = page;
         self.settings_focus = SettingsFocus::Menu;
@@ -1065,9 +1311,9 @@ impl App {
         for page in Page::ALL {
             let count = self.row_count(page);
             if count == 0 {
-                self.selected[page.index()] = 0;
+                self.selected[page.slot()] = 0;
             } else {
-                self.selected[page.index()] = self.selected[page.index()].min(count - 1);
+                self.selected[page.slot()] = self.selected[page.slot()].min(count - 1);
             }
         }
     }
@@ -1106,11 +1352,7 @@ impl App {
             if excluded.contains(&node.category.id) {
                 continue;
             }
-            options.push(format!(
-                "{}{}",
-                "  ".repeat(node.depth),
-                node.category.name
-            ));
+            options.push(format!("{}{}", "  ".repeat(node.depth), node.category.name));
         }
         options
     }
@@ -1149,14 +1391,37 @@ impl App {
                 SettingsSection::Books => Form::new_book(),
                 SettingsSection::Categories => Form::new_category(self.parent_options(None)),
             },
-            // 概览/账单/月报/年报都认为你要记账
-            Page::Overview | Page::Bills | Page::Months | Page::Years => Form::new_bill(
+            // 计划页按 `a` 新增一块资金
+            Page::Plan => Form::plan_item(&self.plan, None, self.category_names()),
+            // 概览/账单/报表都认为你要记账
+            Page::Overview | Page::Bills | Page::Reports => Form::new_bill_with(
                 self.book_names(),
                 self.category_names(),
                 self.last_entry_book.as_deref(),
+                self.last_entry_category.as_deref(),
             ),
         };
         self.modal = Some(Modal::Form(form));
+    }
+
+    /// 记完一笔后：回概览，并停在刚记的那一天上。
+    ///
+    /// 「高亮新行」在 TUI 里靠日历格子配色体现——把选中日期挪到那笔账的日子，
+    /// 人一眼就能看到它是插进哪一格的（跨月的账不挪，免得月份跳来跳去）。
+    fn land_on_new_bill(&mut self) {
+        self.page = Page::Overview;
+
+        let latest = self
+            .bills
+            .iter()
+            .max_by_key(|bill| bill.id)
+            .map(|bill| bill.created_at.date_naive());
+
+        if let Some(date) = latest {
+            if date.year() == self.month.year() && date.month() == self.month.month() {
+                self.selected_day = date.day();
+            }
+        }
     }
 
     /// 设置页按 `t`：打开「数据迁移」表单（目标库默认预填当前连接）。
@@ -1166,14 +1431,21 @@ impl App {
 
     fn open_edit_form(&mut self) {
         let form = match self.page {
-            // 概览 / 月报 / 年报的「可编辑内容」都是本月起始金额 + 开销计划
-            Page::Overview | Page::Months | Page::Years => {
+            // 概览 / 报表的「可编辑内容」是本月起始金额
+            Page::Overview | Page::Reports => {
                 let current = self
                     .report
                     .as_ref()
                     .map(|report| report.collection.start_balance)
                     .unwrap_or(0);
-                Some(Form::month_settings(self.month, current, self.plan))
+                Some(Form::month_settings(self.month, current))
+            }
+            // 计划页按 `e`：改选中的那一块
+            Page::Plan => {
+                let index = self.selected_index(Page::Plan);
+                self.plan
+                    .get(index)
+                    .map(|_| Form::plan_item(&self.plan, Some(index), self.category_names()))
             }
             // 设置页按 `e`：改的是当前分区里的东西
             Page::Settings => match self.settings_section {
@@ -1294,6 +1566,16 @@ impl App {
                         Action::DeleteBill(bill.id),
                     )
                 }),
+            Page::Plan => self.plan.get(self.selected_index(Page::Plan)).map(|item| {
+                (
+                    format!(
+                        "确定要删除计划块「{}」（{} 元）吗？",
+                        item.name,
+                        money::format_amount(item.amount)
+                    ),
+                    Action::DeletePlanItem(self.selected_index(Page::Plan)),
+                )
+            }),
             Page::Settings => match self.settings_section {
                 // 连接分区没有可删的东西
                 SettingsSection::Connection => None,
@@ -1305,8 +1587,8 @@ impl App {
                 }),
                 SettingsSection::Categories => self.category_delete_request(),
             },
-            // 概览/月报/年报没有可删的东西（设置页已经在上面按分区处理了）
-            Page::Overview | Page::Months | Page::Years => None,
+            // 概览/报表没有可删的东西（设置页已经在上面按分区处理了）
+            Page::Overview | Page::Reports => None,
         };
 
         match request {
@@ -1321,9 +1603,9 @@ impl App {
         }
     }
 
-    /// `[` / `]` 的含义随页面变化：年报页换年，其余页换月。
+    /// `[` / `]` 的含义随页面变化：报表页的「年报」那一半换年，其余换月。
     fn shift_period(&self, delta: i32) -> Action {
-        if self.page == Page::Years {
+        if self.page == Page::Reports && self.report_tab == ReportTab::Year {
             Action::ShiftYear(delta)
         } else {
             Action::ShiftMonth(delta)
@@ -1340,7 +1622,9 @@ impl App {
         // 还没连上数据库：只放行「切页 / 退出」。否则用户对着表单填完才发现写不进去。
         if self.needs_setup {
             match key {
-                Key::Char('1'..='5') | Key::Tab | Key::BackTab | Key::Left | Key::Right => {}
+                Key::Char('1'..='6') | Key::Char(',') | Key::Tab | Key::BackTab
+                | Key::Left | Key::Right => {}
+                Key::Char('?') => {}
                 Key::Ctrl('c') | Key::Char('q') => {}
                 _ => return Action::None,
             }
@@ -1363,7 +1647,9 @@ impl App {
         }
 
         match key {
-            Key::Char('1'..='5') => {
+            // 设置不进页签队列：`,` 进出，`6` 留给老手感
+            Key::Char(',') | Key::Char('6') => self.toggle_settings(),
+            Key::Char('1'..='6') => {
                 if let Key::Char(digit) = key {
                     let index = digit as usize - '1' as usize;
                     if let Some(page) = Page::ALL.get(index) {
@@ -1394,10 +1680,13 @@ impl App {
                 }
             }
             Key::PageUp => {
-                // 概览页往前一周，列表页往上翻 10 行
+                // 概览页往前一周；账单页按整页翻；其它列表页往上 10 行
                 if self.page == Page::Overview {
                     self.move_inspected_day(-7);
                     Action::Refresh
+                } else if self.page == Page::Bills {
+                    self.move_bill_page(-1);
+                    Action::None
                 } else {
                     self.move_in_page(-10);
                     Action::None
@@ -1407,6 +1696,9 @@ impl App {
                 if self.page == Page::Overview {
                     self.move_inspected_day(7);
                     Action::Refresh
+                } else if self.page == Page::Bills {
+                    self.move_bill_page(1);
+                    Action::None
                 } else {
                     self.move_in_page(10);
                     Action::None
@@ -1468,7 +1760,7 @@ impl App {
                     }
                 } else if self.page == Page::Overview && !self.pending_sync.is_empty() {
                     Action::ResumeSync
-                } else if self.page == Page::Bills {
+                } else if self.page == Page::Bills || self.page == Page::Plan {
                     // 列表里 Enter = 打开选中那条，和大多数终端工具一致
                     self.open_edit_form();
                     Action::None
@@ -1476,14 +1768,23 @@ impl App {
                     Action::None
                 }
             }
-            // 设置页列表里按 Esc 退回菜单；其余情况 Esc 不做事（弹窗的 Esc 在 on_key_modal 里）
+            // 设置页：列表里 Esc 退回菜单，菜单里 Esc 直接退出设置页
+            // （其余情况 Esc 不做事，弹窗的 Esc 在 on_key_modal 里）
             Key::Esc => {
-                if self.page == Page::Settings && self.settings_focus == SettingsFocus::Detail {
-                    self.settings_focus = SettingsFocus::Menu;
+                if self.page == Page::Settings {
+                    match self.settings_focus {
+                        SettingsFocus::Detail => self.settings_focus = SettingsFocus::Menu,
+                        SettingsFocus::Menu => self.page = self.settings_return,
+                    }
                 }
                 Action::None
             }
             Key::Char('r') => Action::Refresh,
+            // 帮助是全局的：不占版面，按一下才出现
+            Key::Char('?') => {
+                self.modal = Some(Modal::Help);
+                Action::None
+            }
             Key::Char('a') => {
                 self.open_default_form();
                 Action::None
@@ -1509,8 +1810,12 @@ impl App {
             }
             Key::Char('u') => Action::UndoDelete,
             Key::Char('x') => {
+                // 报表页的「年报」：空月份默认折叠，x 展开 / 收起
+                if self.page == Page::Reports && self.report_tab == ReportTab::Year {
+                    self.year_expanded = !self.year_expanded;
+                    Action::None
                 // 账单页：切「是否纳入统计」；报销、代付这类过手钱不该算进开销
-                if self.page == Page::Bills {
+                } else if self.page == Page::Bills {
                     self.bills
                         .get(self.selected_index(Page::Bills))
                         .map(|bill| Action::ToggleExcluded(bill.id))
@@ -1523,8 +1828,21 @@ impl App {
                 self.request_delete();
                 Action::None
             }
+            // 报表页按 y：切到年报（此时 `[` `]` 换的是年份）
+            Key::Char('y') => {
+                if self.page == Page::Reports {
+                    self.report_tab = ReportTab::Year;
+                    Action::Refresh
+                } else {
+                    Action::None
+                }
+            }
             Key::Char('m') => {
                 let today = Self::today();
+                // 报表页按 m：先切回月报，再回到本月
+                if self.page == Page::Reports {
+                    self.report_tab = ReportTab::Month;
+                }
                 // 月份统一用「当月 1 号」表示；直接存今天会让 list_in_month 一笔都查不到
                 self.month = crate::common::time::first_day_of_month(today);
                 self.year = today.year();
@@ -1546,6 +1864,8 @@ impl App {
                 // 提示框不拦人：任意键（含 Esc / Enter）关掉，别让用户猜哪个键能用
                 Action::None
             }
+            // 帮助也一样：看一眼就走，任意键关掉
+            Modal::Help => Action::None,
             Modal::Confirm {
                 title,
                 message,
@@ -1579,7 +1899,8 @@ impl App {
                                     if form.kind == FormKind::Connection =>
                                 {
                                     keep_open = false;
-                                    action = Action::SaveConnection(ConnectionTarget::Local { path });
+                                    action =
+                                        Action::SaveConnection(ConnectionTarget::Local { path });
                                 }
                                 Ok(ConnectionTarget::Remote(settings)) => {
                                     keep_open = false;
@@ -1774,6 +2095,9 @@ impl App {
                 }
             }
             Action::SubmitForm(form) => {
+                // 顺手记的一笔：存完回概览，省得人自己再按一下
+                let quick_entry = form.kind == FormKind::NewBill && self.pending_sync.is_empty();
+
                 if !self.pending_sync.is_empty() && form.kind == FormKind::NewBill {
                     // 核对流程里，提交表单就是「确认这一条」
                     self.confirm_reconcile(&form, services).await?;
@@ -1782,6 +2106,10 @@ impl App {
                     self.set_info(message);
                 }
                 self.reload(services).await?;
+
+                if quick_entry {
+                    self.land_on_new_bill();
+                }
             }
             Action::DeleteBill(id) => {
                 // 删之前先把整条记下来，`u` 才有东西可恢复
@@ -1791,6 +2119,21 @@ impl App {
                 self.last_deleted = record;
                 self.set_info(format!("已删除账单 #{id}（按 u 撤销）"));
                 self.reload(services).await?;
+            }
+            Action::DeletePlanItem(index) => {
+                let name = self
+                    .plan
+                    .get(index)
+                    .map(|item| item.name.clone())
+                    .unwrap_or_default();
+
+                if name.is_empty() {
+                    self.set_info("计划里没有这一块");
+                } else {
+                    services.plans.remove_item(&name).await?;
+                    self.set_info(format!("已删除计划块「{name}」"));
+                    self.reload(services).await?;
+                }
             }
             Action::DeleteBook(id) => {
                 let book = services.books.remove(&id.to_string()).await?;
@@ -1901,8 +2244,7 @@ impl App {
             window.describe()
         ));
 
-        let session =
-            crate::bank::sync::ensure_session(crate::bank::browser::DEFAULT_PORT).await?;
+        let session = crate::bank::sync::ensure_session(crate::bank::browser::DEFAULT_PORT).await?;
 
         // 账户优先用监听到的；监听不到才用数据库里保存的兜底
         let account = match session.account() {
@@ -2032,12 +2374,17 @@ impl App {
     /// 关键是**仍然把 UI 交给用户**——不然连不上库就进不去，连改设置的入口都没有。
     pub fn mark_needs_setup(&mut self) {
         self.needs_setup = true;
+        // 连不上库时唯一能干的事就是配连接，别让用户先去翻菜单
+        self.settings_section = SettingsSection::Connection;
+        self.settings_focus = SettingsFocus::Menu;
         self.books.clear();
         self.categories.clear();
         self.bills.clear();
         self.report = None;
         self.year_report = None;
         self.progress = None;
+        self.coverage = None;
+        self.plan_spent.clear();
         self.modal = None;
     }
 
@@ -2053,6 +2400,7 @@ impl App {
         self.year_report = Some(services.months.year_report(self.year).await?);
         self.last_entry_date = services.bills.last_used_date().await?;
         self.last_entry_book = services.bills.default_entry_book().await?;
+        self.last_entry_category = services.bills.default_entry_category().await?;
 
         // 计划是全局的，进度按当前查看的月份算
         self.plan = services.plans.get().await?;
@@ -2064,8 +2412,14 @@ impl App {
         self.progress = Some(
             services
                 .plans
-                .progress(self.month, self.plan, today, &self.bills),
+                .progress(self.month, &self.plan, today, &self.bills),
         );
+        self.coverage = Some(services.plans.coverage(self.month, &self.plan, &self.bills));
+        // 绑了分类的块，当月「已花」直接从账单里算，不用手填
+        self.plan_spent = services
+            .plans
+            .spending_with(self.month, &self.plan, &self.bills)
+            .await?;
         self.clamp_selection();
         Ok(())
     }
@@ -2105,26 +2459,57 @@ async fn submit(form: Form, services: &Services) -> Result<String> {
             Ok(format!("分类「{}」已更新", category.name))
         }
         (FormKind::SetStartBalance, Some(EditTarget::MonthBalance(month))) => {
-            let amount = money::parse_amount(form.value("起始金额"))
-                .map_err(|error| anyhow!("{error}"))?;
-            let plan = SpendingPlan::new(
-                money::parse_amount(form.value("预计金额")).map_err(|error| anyhow!("{error}"))?,
-                money::parse_amount(form.value("攒钱金额")).map_err(|error| anyhow!("{error}"))?,
-            )
-            .with_mode(match form.value("超支判断") {
-                "只看当天" => PlanMode::DailyOnly,
-                _ => PlanMode::Cumulative,
-            });
+            let amount =
+                money::parse_amount(form.value("起始金额")).map_err(|error| anyhow!("{error}"))?;
 
             services.months.set_start_balance(month, amount).await?;
-            services.plans.save(plan).await?;
 
             Ok(format!(
-                "{} 起始金额 {} 元；计划上限 {} 元（{}）",
+                "{} 起始金额 {} 元",
                 crate::common::time::format_month(month),
+                money::format_amount(amount)
+            ))
+        }
+        (FormKind::PlanItem, Some(EditTarget::PlanItem(index))) => {
+            let category = plan_category_from_form(&form);
+            let name = plan_item_name(&form, category.as_deref())?;
+            let amount = parse_plan_amount(form.value("金额"))?;
+            let plan = services
+                .plans
+                .update_item(index, &name, amount, category.as_deref())
+                .await?;
+            let binding = match category.as_deref() {
+                Some(category) => format!(" · 绑定分类「{category}」"),
+                None => " · 不再绑定分类".to_string(),
+            };
+
+            Ok(format!(
+                "计划块「{}」已改为 {} 元{} · 合计 {} 元",
+                name,
                 money::format_amount(amount),
-                money::format_amount(plan.limit()),
-                plan.mode.label()
+                binding,
+                money::format_amount(plan.total())
+            ))
+        }
+        (FormKind::PlanItem, None) => {
+            let category = plan_category_from_form(&form);
+            let name = plan_item_name(&form, category.as_deref())?;
+            let amount = parse_plan_amount(form.value("金额"))?;
+            let plan = services
+                .plans
+                .add_item(&name, amount, category.as_deref())
+                .await?;
+            let binding = match category.as_deref() {
+                Some(category) => format!(" · 绑定分类「{category}」"),
+                None => String::new(),
+            };
+
+            Ok(format!(
+                "已新增计划块「{}」{} 元{} · 合计 {} 元",
+                name,
+                money::format_amount(amount),
+                binding,
+                money::format_amount(plan.total())
             ))
         }
         (FormKind::NewBill, None) => {
@@ -2165,7 +2550,9 @@ async fn submit(form: Form, services: &Services) -> Result<String> {
 
 /// 已有数据时用选择框（←/→ 切换），没有数据时退化成文本框（输入即自动创建）。
 ///
-/// `preferred` 是上次用过的值，存在于候选里时作为默认选中项。
+/// `preferred` 是上次用过的值，存在于候选里时作为默认选中项；
+/// 不存在（比如上次用的账本已经被删掉）则回落到第一个候选，
+/// 不会把表单留成空值 —— 空值提交只会换来一句「账本名称不能为空」。
 fn picker(
     label: &'static str,
     options: Vec<String>,
@@ -2184,6 +2571,19 @@ fn picker(
     }
 }
 
+/// 候选列表为空时补一个兜底候选。
+///
+/// 刚建好的库里没有任何账本 / 分类，表单如果只给一个空文本框，
+/// 用户很容易直接回车提交，然后被 service 以「名称不能为空」打回来。
+/// 塞一个默认名称进去，提交时 service 会按需自动创建。
+fn with_fallback(options: Vec<String>, fallback: &str) -> Vec<String> {
+    if options.is_empty() {
+        vec![fallback.to_string()]
+    } else {
+        options
+    }
+}
+
 /// 把字段值设为 `name`。
 ///
 /// 选择框会在选项里找匹配项（忽略缩进）并取用选项原文，避免选项里
@@ -2196,6 +2596,37 @@ fn set_field_value(field: &mut Field, name: &str) {
         }
     }
     field.value = name.to_string();
+}
+
+/// 计划块要绑定的分类；`(不绑定)` 与空值都表示不绑。
+///
+/// 候选项带层级缩进，但 `Form::value` 已经去掉首尾空白，拿到的就是纯名称。
+fn plan_category_from_form(form: &Form) -> Option<String> {
+    match form.value("分类（可选）") {
+        "" | UNBOUND_CATEGORY => None,
+        name => Some(name.to_string()),
+    }
+}
+
+/// 计划块的显示名称：留空时退化成分类名，两个都空才是错。
+///
+/// 绑了分类的块，名称再手写一遍只是重复信息，所以允许省掉。
+fn plan_item_name(form: &Form, category: Option<&str>) -> Result<String> {
+    match (form.value("名称"), category) {
+        ("", Some(category)) => Ok(category.to_string()),
+        ("", None) => bail!("计划块名称不能为空（绑了分类的话也可以只选分类）"),
+        (name, _) => Ok(name.to_string()),
+    }
+}
+
+/// 计划块的金额：和账单一样支持算式，省得自己算完再填。
+fn parse_plan_amount(raw: &str) -> Result<AmountType> {
+    let text = if raw.chars().any(|character| "+-*/()".contains(character)) {
+        money::evaluate_expression(raw).map_err(|error| anyhow!("{error}"))?
+    } else {
+        raw.to_string()
+    };
+    money::parse_amount(&text).map_err(|error| anyhow!("{error}"))
 }
 
 /// 从表单构造账单入参。
@@ -2324,6 +2755,7 @@ mod tests {
 
     use super::*;
     use crate::month::model::BillMonthCollection;
+    use crate::plan::model::PlanItem;
 
     /// 测试用连接串：各字段值都便于断言。
     const TEST_CONNECTION_URL: &str = "postgres://postgres:postgres@127.0.0.1:5432/biller";
@@ -2393,7 +2825,7 @@ mod tests {
         let mut app = sample_app();
         assert_eq!(app.page, Page::Overview);
         app.on_key(Key::Tab);
-        assert_eq!(app.page, Page::Bills);
+        assert_eq!(app.page, Page::Plan);
         app.on_key(Key::BackTab);
         assert_eq!(app.page, Page::Overview);
         app.on_key(Key::BackTab);
@@ -2407,12 +2839,41 @@ mod tests {
     #[test]
     fn number_keys_jump_to_page() {
         let mut app = sample_app();
+        app.on_key(Key::Char('3'));
+        assert_eq!(app.page, Page::Bills, "第 3 页是账单");
         app.on_key(Key::Char('4'));
-        assert_eq!(app.page, Page::Years, "第 4 页是年报");
+        assert_eq!(app.page, Page::Reports, "第 4 页是报表（月报 + 年报）");
         app.on_key(Key::Char('5'));
-        assert_eq!(app.page, Page::Settings, "第 5 页是设置");
+        assert_eq!(app.page, Page::Reports, "越界数字应被忽略");
+
+        app.on_key(Key::Char('6'));
+        assert_eq!(app.page, Page::Settings, "6 是老手感，仍可进设置");
+        app.on_key(Key::Char('6'));
+        assert_eq!(app.page, Page::Reports, "再按一次回到刚才那一页");
+        app.on_key(Key::Char(','));
+        assert_eq!(app.page, Page::Settings, ", 是设置页的新入口");
+        app.on_key(Key::Esc);
+        assert_eq!(app.page, Page::Reports, "Esc 出设置页，回到来路");
+
         app.on_key(Key::Char('9'));
-        assert_eq!(app.page, Page::Settings, "越界数字应被忽略");
+        assert_eq!(app.page, Page::Reports, "越界数字应被忽略");
+    }
+
+    #[test]
+    fn reports_page_switches_between_month_and_year() {
+        let mut app = sample_app();
+        assert_eq!(app.page, Page::Overview);
+
+        app.on_key(Key::Char('4'));
+        assert_eq!(app.page, Page::Reports);
+        assert_eq!(app.report_tab, ReportTab::Month, "报表页默认看月报");
+
+        app.on_key(Key::Char('y'));
+        assert_eq!(app.report_tab, ReportTab::Year, "y 切年报");
+        assert_eq!(app.page, Page::Reports, "切时间尺度不该换页");
+
+        app.on_key(Key::Char('m'));
+        assert_eq!(app.report_tab, ReportTab::Month, "m 切回月报");
     }
 
     #[test]
@@ -2459,11 +2920,11 @@ mod tests {
 
         // ←→ 在任何页面都还是换页
         app.on_key(Key::Right);
-        assert_eq!(app.page, Page::Bills);
+        assert_eq!(app.page, Page::Plan);
         app.on_key(Key::Right);
-        assert_eq!(app.page, Page::Months);
-        app.on_key(Key::Left);
         assert_eq!(app.page, Page::Bills);
+        app.on_key(Key::Left);
+        assert_eq!(app.page, Page::Plan);
         app.on_key(Key::Left);
         assert_eq!(app.page, Page::Overview);
 
@@ -2507,7 +2968,7 @@ mod tests {
     }
 
     #[test]
-    fn bill_form_falls_back_to_text_on_empty_database() {
+    fn bill_form_keeps_a_usable_default_on_an_empty_database() {
         let mut app = App::new(
             NaiveDate::from_ymd_opt(2026, 10, 1).unwrap(),
             TEST_CONNECTION_URL,
@@ -2518,8 +2979,12 @@ mod tests {
 
         match &app.modal {
             Some(Modal::Form(form)) => {
-                assert!(!form.fields[2].is_choice(), "没有账本时应退化成文本框");
-                assert!(!form.fields[3].is_choice(), "没有分类时应退化成文本框");
+                // 空库也不能留空值：空着提交只会被 service 打回「名称不能为空」，
+                // 所以退化成「只有一个默认候选」的选择框，提交时自动创建
+                assert!(form.fields[2].is_choice(), "账本应给出默认候选");
+                assert_eq!(form.value("账本"), DEFAULT_BOOK);
+                assert!(form.fields[3].is_choice(), "分类应给出默认候选");
+                assert_eq!(form.value("分类"), DEFAULT_CATEGORY);
             }
             other => panic!("应打开新增账单表单，实际 {other:?}"),
         }
@@ -2555,13 +3020,69 @@ mod tests {
     }
 
     #[test]
+    fn new_bill_form_prefers_last_used_category() {
+        let books = vec!["微信".to_string()];
+        let categories = vec!["餐饮".to_string(), "交通".to_string()];
+
+        // 上次记的是「交通」→ 默认选中它
+        let form = Form::new_bill_with(books.clone(), categories.clone(), None, Some("交通"));
+        assert_eq!(form.value("分类"), "交通");
+
+        // 上次那个分类已被删除 → 回落到列表第一个
+        let form = Form::new_bill_with(books, categories, None, Some("已删除的分类"));
+        assert_eq!(form.value("分类"), "餐饮");
+    }
+
+    #[test]
+    fn bill_form_asks_category_before_book() {
+        let form = Form::new_bill(vec!["微信".to_string()], vec!["餐饮".to_string()], None);
+
+        // 记账动线：金额 → 分类（每次都变）→ 账本（基本固定）
+        assert_eq!(form.fields[1].label, "金额");
+        assert_eq!(form.fields[2].label, "分类");
+        assert_eq!(form.fields[3].label, "账本");
+    }
+
+    #[test]
+    fn quick_entry_lands_back_on_overview() {
+        let mut app = sample_app();
+        app.page = Page::Bills;
+        app.selected_day = 1;
+        let bill = sample_bill(9, 1234);
+        let day = bill.created_at.date_naive().day() as u32;
+        app.bills = vec![bill];
+
+        app.land_on_new_bill();
+
+        assert_eq!(app.page, Page::Overview, "记完一笔应回到概览");
+        assert_eq!(
+            app.selected_day, day,
+            "选中的日期应挪到刚记的那一天，日历上就能看到它"
+        );
+    }
+
+    #[test]
+    fn quick_entry_keeps_month_when_bill_is_elsewhere() {
+        let mut app = sample_app();
+        app.page = Page::Bills;
+        app.selected_day = 3;
+        app.bills = vec![];
+        app.month = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+
+        app.land_on_new_bill();
+
+        assert_eq!(app.page, Page::Overview);
+        assert_eq!(app.selected_day, 3, "查不到本月的账时不动选中日期");
+    }
+
+    #[test]
     fn space_on_empty_date_field_fills_last_used_date() {
         let mut app = sample_app();
         app.last_entry_date = Some(NaiveDate::from_ymd_opt(2026, 9, 30).unwrap());
         app.page = Page::Bills;
         app.on_key(Key::Char('a'));
 
-        // 焦点：金额(1) → 账本(2) → 分类(3) → 日期(4)
+        // 焦点：金额(1) → 分类(2) → 账本(3) → 日期(4)
         app.on_key(Key::Tab);
         app.on_key(Key::Tab);
         app.on_key(Key::Tab);
@@ -2621,12 +3142,23 @@ mod tests {
         app.on_key(Key::Char('d'));
 
         match &app.modal {
-            Some(Modal::Confirm { message, action, .. }) => {
+            Some(Modal::Confirm {
+                message, action, ..
+            }) => {
                 assert!(message.contains("餐饮"), "{message}");
-                assert!(message.contains("子分类"), "应提示会连带删除子分类：{message}");
+                assert!(
+                    message.contains("子分类"),
+                    "应提示会连带删除子分类：{message}"
+                );
                 assert!(message.contains("午餐"), "应列出子分类名称：{message}");
                 assert!(
-                    matches!(action, Action::DeleteCategory { recursive: true, .. }),
+                    matches!(
+                        action,
+                        Action::DeleteCategory {
+                            recursive: true,
+                            ..
+                        }
+                    ),
                     "有子分类时应标记为递归删除"
                 );
             }
@@ -2643,11 +3175,16 @@ mod tests {
         app.on_key(Key::Char('d'));
 
         match &app.modal {
-            Some(Modal::Confirm { message, action, .. }) => {
+            Some(Modal::Confirm {
+                message, action, ..
+            }) => {
                 assert!(message.contains("午餐"), "{message}");
                 assert!(matches!(
                     action,
-                    Action::DeleteCategory { recursive: false, .. }
+                    Action::DeleteCategory {
+                        recursive: false,
+                        ..
+                    }
                 ));
             }
             other => panic!("应弹出确认框，实际 {other:?}"),
@@ -2722,10 +3259,7 @@ mod tests {
     #[test]
     fn delete_asks_for_confirmation_and_targets_selected_row() {
         let mut app = sample_app();
-        app.bills = vec![
-            sample_bill(7, 1000),
-            sample_bill(9, 2000),
-        ];
+        app.bills = vec![sample_bill(7, 1000), sample_bill(9, 2000)];
         app.page = Page::Bills;
         app.selected[Page::Bills.index()] = 1;
 
@@ -2766,8 +3300,14 @@ mod tests {
         // 先按 Enter 进列表：↑↓ 在菜单态是换分区，不换条目
         app.settings_focus = SettingsFocus::Detail;
         app.books = vec![
-            BillBook { id: 1, name: "微信".into() },
-            BillBook { id: 2, name: "支付宝".into() },
+            BillBook {
+                id: 1,
+                name: "微信".into(),
+            },
+            BillBook {
+                id: 2,
+                name: "支付宝".into(),
+            },
         ];
         app.on_key(Key::Up);
         assert_eq!(app.settings_index(), 1, "向上应回绕到末行");
@@ -2805,20 +3345,23 @@ mod tests {
         let mut app = sample_app();
         app.page = Page::Settings;
 
-        // 全局约定：← → 只翻页签，设置页也不例外
+        // 全局约定：← → 只翻页签；设置不在页签队列里，从它出发落到队列两端
         assert!(matches!(app.on_key(Key::Right), Action::Refresh));
-        assert_eq!(app.page, Page::Overview, "设置页是最后一页，应回绕到概览");
+        assert_eq!(app.page, Page::Overview, "设置在队列外，→ 落到第一页");
         app.on_key(Key::Left);
-        assert_eq!(app.page, Page::Settings, "应回绕到设置页");
+        assert_eq!(app.page, Page::Reports, "← 从概览回绕到最后一页");
 
         // Tab / BackTab 同义
+        app.page = Page::Settings;
         app.on_key(Key::Tab);
         assert_eq!(app.page, Page::Overview);
         app.on_key(Key::BackTab);
-        assert_eq!(app.page, Page::Settings);
+        assert_eq!(app.page, Page::Reports);
 
         // 数字键直达
         app.on_key(Key::Char('2'));
+        assert_eq!(app.page, Page::Plan);
+        app.on_key(Key::Char('3'));
         assert_eq!(app.page, Page::Bills);
     }
 
@@ -2828,19 +3371,27 @@ mod tests {
         app.page = Page::Settings;
         app.settings_focus = SettingsFocus::Menu;
 
-        assert_eq!(app.settings_section, SettingsSection::Connection);
+        assert_eq!(
+            app.settings_section,
+            SettingsSection::Books,
+            "默认停在日常记账，数据库运维不该占首屏"
+        );
         assert!(matches!(app.on_key(Key::Down), Action::None));
-        assert_eq!(app.settings_section, SettingsSection::Books, "菜单态 ↓ 换分区");
-        app.on_key(Key::Down);
-        assert_eq!(app.settings_section, SettingsSection::Categories);
+        assert_eq!(
+            app.settings_section,
+            SettingsSection::Categories,
+            "菜单态 ↓ 换分区"
+        );
         app.on_key(Key::Down);
         assert_eq!(
             app.settings_section,
             SettingsSection::Connection,
-            "分区也要能回绕"
+            "数据库运维排在最后"
         );
+        app.on_key(Key::Down);
+        assert_eq!(app.settings_section, SettingsSection::Books, "分区也要能回绕");
         app.on_key(Key::Up);
-        assert_eq!(app.settings_section, SettingsSection::Categories);
+        assert_eq!(app.settings_section, SettingsSection::Connection);
 
         // 菜单态不该动列表选中行
         app.settings_section = SettingsSection::Books;
@@ -2969,17 +3520,18 @@ mod tests {
 
     #[test]
     fn months_and_years_open_month_settings_on_e() {
-        for page in [Page::Months, Page::Years] {
+        for tab in [ReportTab::Month, ReportTab::Year] {
             let mut app = sample_app();
-            app.page = page;
+            app.page = Page::Reports;
+            app.report_tab = tab;
             app.on_key(Key::Char('e'));
             match &app.modal {
                 Some(Modal::Form(form)) => assert_eq!(
                     form.kind,
                     FormKind::SetStartBalance,
-                    "月报/年报页按 e 应打开本月设置（和底栏提示一致）"
+                    "报表页按 e 应打开本月设置（和底栏提示一致）"
                 ),
-                other => panic!("{page:?} 页按 e 应打开本月设置，实际 {other:?}"),
+                other => panic!("{tab:?} 页按 e 应打开本月设置，实际 {other:?}"),
             }
         }
     }
@@ -3015,7 +3567,7 @@ mod tests {
         assert!(app.modal.is_none(), "不该弹出任何表单");
 
         // 但仍能翻到设置页去配库
-        assert!(matches!(app.on_key(Key::Char('5')), Action::Refresh));
+        assert!(matches!(app.on_key(Key::Char('6')), Action::Refresh));
         assert_eq!(app.page, Page::Settings);
     }
 
@@ -3070,8 +3622,15 @@ mod tests {
             id,
             kind: BillKind::Expense,
             amount,
-            book: BillBook { id: 1, name: "微信".into() },
-            category: Category { id: 1, parent_id: None, name: "餐饮".into() },
+            book: BillBook {
+                id: 1,
+                name: "微信".into(),
+            },
+            category: Category {
+                id: 1,
+                parent_id: None,
+                name: "餐饮".into(),
+            },
             created_at: Utc::now(),
             remark: None,
             excluded: false,
@@ -3127,7 +3686,11 @@ mod tests {
         // 新增分类时：全部候选，带缩进表示层级
         assert_eq!(
             app.parent_options(None),
-            vec!["(顶层)".to_string(), "餐饮".to_string(), "  午餐".to_string()]
+            vec![
+                "(顶层)".to_string(),
+                "餐饮".to_string(),
+                "  午餐".to_string()
+            ]
         );
 
         // 编辑「餐饮」：自己与子孙都不能当父分类
@@ -3179,14 +3742,14 @@ mod tests {
         app.page = Page::Bills;
         app.on_key(Key::Char('a'));
 
-        // 焦点默认在「金额」；移到「账本」选择框上再回车
+        // 焦点默认在「金额」；移到紧随其后的「分类」选择框上再回车
         match &app.modal {
             Some(Modal::Form(form)) => assert_eq!(form.fields[form.focus].label, "金额"),
             other => panic!("{other:?}"),
         }
         app.on_key(Key::Tab);
         match &app.modal {
-            Some(Modal::Form(form)) => assert_eq!(form.fields[form.focus].label, "账本"),
+            Some(Modal::Form(form)) => assert_eq!(form.fields[form.focus].label, "分类"),
             other => panic!("{other:?}"),
         }
 
@@ -3210,7 +3773,7 @@ mod tests {
         app.on_key(Key::Enter);
         match &app.modal {
             Some(Modal::Form(form)) => {
-                assert_eq!(form.value("账本"), "支付宝");
+                assert_eq!(form.value("分类"), "午餐");
                 assert_eq!(form.focus, 3, "确认后应跳到下一个字段");
             }
             other => panic!("应回到表单，实际 {other:?}"),
@@ -3228,18 +3791,19 @@ mod tests {
     }
 
     #[test]
-    fn brackets_switch_year_on_year_page_only() {
+    fn brackets_switch_period_depending_on_report_tab() {
         let mut app = sample_app();
         let month = app.month;
         let year = app.year;
 
-        app.page = Page::Years;
+        app.page = Page::Reports;
+        app.report_tab = ReportTab::Year;
         assert!(matches!(app.on_key(Key::Char(']')), Action::ShiftYear(1)));
         assert!(matches!(app.on_key(Key::Char('[')), Action::ShiftYear(-1)));
-        assert_eq!(app.month, month, "年报页换年不应动月份");
+        assert_eq!(app.month, month, "年报换年不应动月份");
         assert_eq!(app.year, year, "动作由外壳执行，状态机本身不变更年份");
 
-        app.page = Page::Months;
+        app.report_tab = ReportTab::Month;
         assert!(matches!(app.on_key(Key::Char(']')), Action::ShiftMonth(1)));
     }
 
@@ -3308,6 +3872,7 @@ mod tests {
     fn settings_page_edits_connection() {
         let mut app = sample_app();
         app.page = Page::Settings;
+        app.settings_section = SettingsSection::Connection;
 
         app.on_key(Key::Char('e'));
         match &app.modal {
@@ -3347,6 +3912,7 @@ mod tests {
     fn connection_form_can_switch_to_local_file() {
         let mut app = sample_app();
         app.page = Page::Settings;
+        app.settings_section = SettingsSection::Connection;
         app.connection_url = "sqlite:C:/Users/test/.biller/biller.db".to_string();
 
         app.on_key(Key::Char('e'));
@@ -3372,6 +3938,7 @@ mod tests {
     fn connection_form_rejects_bad_port() {
         let mut app = sample_app();
         app.page = Page::Settings;
+        app.settings_section = SettingsSection::Connection;
         app.on_key(Key::Char('e'));
         app.on_key(Key::Tab);
 
@@ -3438,7 +4005,7 @@ mod tests {
     #[test]
     fn month_expense_pairs_are_split_by_category_and_book() {
         let mut app = sample_app();
-        app.page = Page::Months;
+        app.page = Page::Reports;
 
         assert_eq!(
             app.month_expense_pairs(),
@@ -3514,20 +4081,54 @@ mod tests {
     }
 
     #[test]
-    fn overview_e_edits_start_balance_and_plan_together() {
+    fn overview_e_edits_start_balance_only() {
         let mut app = sample_app();
-        app.plan = SpendingPlan::new(12_000_00, 8_000_00);
 
         app.on_key(Key::Char('e'));
         match &app.modal {
             Some(Modal::Form(form)) => {
                 assert_eq!(form.kind, FormKind::SetStartBalance);
                 assert_eq!(form.value("起始金额"), "1,000.00");
-                assert_eq!(form.value("预计金额"), "12,000.00");
-                assert_eq!(form.value("攒钱金额"), "8,000.00");
-                assert_eq!(form.value("超支判断"), "累计标红");
+                // 计划已经搬到计划页：本月设置只剩起始金额一项
+                assert_eq!(form.fields.len(), 1);
             }
             other => panic!("概览页应打开本月设置，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_page_opens_item_forms() {
+        use crate::plan::model::PlanItem;
+
+        let mut app = sample_app();
+        app.page = Page::Plan;
+        app.plan = SpendingPlan::new(vec![
+            PlanItem::new("日常开销", 3_000_00),
+            PlanItem::new("存款", 9_000_00),
+        ]);
+
+        app.on_key(Key::Char('a'));
+        match &app.modal {
+            Some(Modal::Form(form)) => {
+                assert_eq!(form.kind, FormKind::PlanItem);
+                assert_eq!(form.title, "新增计划块");
+                assert!(form.target.is_none());
+            }
+            other => panic!("计划页按 a 应打开新增计划块，实际 {other:?}"),
+        }
+
+        app.modal = None;
+        app.selected[Page::Plan.index()] = 1;
+        app.on_key(Key::Char('e'));
+        match &app.modal {
+            Some(Modal::Form(form)) => {
+                assert_eq!(form.kind, FormKind::PlanItem);
+                assert_eq!(form.title, "编辑计划块");
+                assert_eq!(form.value("名称"), "存款");
+                assert_eq!(form.value("金额"), "9,000.00");
+                assert_eq!(form.target, Some(EditTarget::PlanItem(1)));
+            }
+            other => panic!("计划页按 e 应打开编辑计划块，实际 {other:?}"),
         }
     }
 
@@ -3585,5 +4186,131 @@ mod tests {
             }
             other => panic!("应记录成分类树，实际 {other:?}"),
         }
+    }
+
+    /// 造一笔指定日期的账单（分页测试要控制日期分组）。
+    fn bill_on(date: NaiveDate, id: u64) -> BillEntity {
+        let mut bill = sample_bill(id, 100);
+        bill.created_at = date.and_hms_opt(12, 0, 0).unwrap().and_utc();
+        bill
+    }
+
+    /// 往 app 里塞 days 天、每天 per_day 笔账单（日期从 10-25 往前倒）。
+    fn app_with_bills(days: u32, per_day: u32, viewport: u16) -> App {
+        let mut app = sample_app();
+        app.page = Page::Bills;
+        app.viewport_height = viewport;
+
+        let mut id = 1;
+        let mut bills = Vec::new();
+        for offset in 0..days {
+            let date = NaiveDate::from_ymd_opt(2026, 10, 25).unwrap()
+                - chrono::Duration::days(offset as i64);
+            for _ in 0..per_day {
+                bills.push(bill_on(date, id));
+                id += 1;
+            }
+        }
+        app.bills = bills;
+        app
+    }
+
+    #[test]
+    fn bill_page_budget_follows_the_viewport() {
+        let mut app = sample_app();
+        app.viewport_height = 40;
+        // 40 行终端 → 内容区 34 行左右，一页远不止 10 条
+        assert_eq!(app.bill_page_budget(), 34);
+        assert!(app.bill_page_budget() > 10, "高终端应能一页放下更多账单");
+
+        app.viewport_height = 10;
+        assert_eq!(app.bill_page_budget(), 4);
+        app.viewport_height = 1;
+        assert_eq!(app.bill_page_budget(), 2, "极矮时也要留出行数，不能为 0");
+    }
+
+    #[test]
+    fn tall_viewport_shows_every_bill_on_a_single_page() {
+        let app = app_with_bills(3, 3, 40);
+
+        let paging = app.bill_page();
+        assert_eq!(paging.pages, 1, "9 笔 + 3 个日期表头在 40 行终端放得下");
+        assert_eq!(paging.start, 0);
+        assert_eq!(paging.end, 9, "一页就要覆盖全部账单，不能只显示 10 条然后空着");
+    }
+
+    #[test]
+    fn short_viewport_splits_pages_on_day_boundaries() {
+        // 视口 15 → 每页 9 行；每天 2 笔 = 3 行（表头 + 2 行），正好三整天
+        let app = app_with_bills(6, 2, 15);
+        assert_eq!(app.bill_page_budget(), 9);
+
+        let first = app.bill_page();
+        assert_eq!(first.page, 0);
+        assert_eq!(first.pages, 2, "6 天 × 3 行 = 18 行，两页");
+        assert_eq!(first.end, 6, "第一页装 3 天共 6 笔，日期不被劈开");
+
+        let second = app.bill_page_of(12, 9, 9);
+        assert_eq!(second.page, 1);
+        assert_eq!(second.start, 6);
+        assert_eq!(second.end, 12);
+    }
+
+    #[test]
+    fn page_down_jumps_a_whole_page_and_page_up_comes_back() {
+        let mut app = app_with_bills(6, 2, 15);
+        let page = app.bill_page();
+
+        app.on_key(Key::PageDown);
+        assert_eq!(
+            app.selected_index(Page::Bills),
+            page.end,
+            "PgDn 应落到下一页第一笔，而不是走 10 条"
+        );
+        assert_eq!(app.bill_page().page, 1);
+
+        app.on_key(Key::PageUp);
+        assert_eq!(app.bill_page().page, 0, "PgUp 应回到上一页");
+    }
+
+    #[test]
+    fn plan_item_form_offers_the_category_binding() {
+        let form = Form::plan_item(
+            &SpendingPlan::default(),
+            None,
+            vec!["餐饮".to_string(), "  外卖".to_string()],
+        );
+
+        assert_eq!(form.fields[2].label, "分类（可选）");
+        assert!(form.fields[2].is_choice());
+        assert_eq!(form.value("分类（可选）"), UNBOUND_CATEGORY, "默认不绑分类");
+    }
+
+    #[test]
+    fn plan_item_form_prefills_the_bound_category() {
+        let plan = SpendingPlan::new(vec![PlanItem::new("吃喝", 30_00).with_category(Some("餐饮"))]);
+
+        let form = Form::plan_item(&plan, Some(0), vec!["餐饮".to_string()]);
+        assert_eq!(form.value("分类（可选）"), "餐饮");
+        assert_eq!(form.value("金额"), "30.00");
+    }
+
+    #[test]
+    fn plan_form_reads_category_and_falls_back_to_its_name() {
+        let mut form = Form::plan_item(&SpendingPlan::default(), None, vec!["餐饮".to_string()]);
+        form.fields[2].value = "餐饮".to_string();
+
+        let category = plan_category_from_form(&form);
+        assert_eq!(category.as_deref(), Some("餐饮"));
+        assert_eq!(
+            plan_item_name(&form, category.as_deref()).unwrap(),
+            "餐饮",
+            "名称留空时用分类名兜底"
+        );
+
+        // 选回「不绑定」→ 没有分类，名称又空了，这时候才报错
+        form.fields[2].value = UNBOUND_CATEGORY.to_string();
+        assert_eq!(plan_category_from_form(&form), None);
+        assert!(plan_item_name(&form, None).is_err());
     }
 }

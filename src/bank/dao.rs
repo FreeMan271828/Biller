@@ -108,9 +108,8 @@ impl BankDao {
                FROM bank_accounts ORDER BY is_default DESC, id",
         );
 
-        let rows: Vec<(String, String, String, i64)> = sqlx::query_as(&sql)
-            .fetch_all(self.pool.any())
-            .await?;
+        let rows: Vec<(String, String, String, i64)> =
+            sqlx::query_as(&sql).fetch_all(self.pool.any()).await?;
 
         Ok(rows
             .into_iter()
@@ -140,12 +139,18 @@ impl BankDao {
         let mut tx = self.pool.any().begin().await?;
 
         // `(0 = 1)` / `(1 = 1)`：PostgreSQL 得到 false/true，SQLite 得到 0/1
-        sqlx::query(&self.pool.shared("UPDATE bank_accounts SET is_default = (0 = 1)"))
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query(&self.pool.shared(
-            "UPDATE bank_accounts SET is_default = (1 = 1) WHERE account_uid = ?",
-        ))
+        sqlx::query(
+            &self
+                .pool
+                .shared("UPDATE bank_accounts SET is_default = (0 = 1)"),
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            &self
+                .pool
+                .shared("UPDATE bank_accounts SET is_default = (1 = 1) WHERE account_uid = ?"),
+        )
         .bind(account_uid)
         .execute(&mut *tx)
         .await?;
@@ -178,7 +183,11 @@ impl BankDao {
     }
 
     /// 记录一笔流水已导入（幂等：重复调用不会出错）。
-    pub async fn mark_imported(&self, txn: &BankTransaction, bill_id: Option<BillId>) -> Result<()> {
+    pub async fn mark_imported(
+        &self,
+        txn: &BankTransaction,
+        bill_id: Option<BillId>,
+    ) -> Result<()> {
         let sql = self.mark_imported_sql();
 
         sqlx::query(&sql)
@@ -348,17 +357,16 @@ impl BankDao {
 
     /// 最近用过的记忆，界面上展示、也方便用户清理。
     pub async fn memory_list(&self) -> Result<Vec<MemoryEntry>> {
-        let rows: Vec<(String, i64, String, i64, String, i64)> =
-            sqlx::query_as(&self.pool.shared(
-                "SELECT m.memo_key, m.book_id, b.name, m.category_id, c.name, m.hits
+        let rows: Vec<(String, i64, String, i64, String, i64)> = sqlx::query_as(&self.pool.shared(
+            "SELECT m.memo_key, m.book_id, b.name, m.category_id, c.name, m.hits
                    FROM merchant_memory m
                    JOIN bill_books b ON b.id = m.book_id
                    JOIN categories c ON c.id = m.category_id
                   ORDER BY m.last_used_at DESC
                   LIMIT 200",
-            ))
-            .fetch_all(self.pool.any())
-            .await?;
+        ))
+        .fetch_all(self.pool.any())
+        .await?;
 
         Ok(rows
             .into_iter()
@@ -435,10 +443,14 @@ impl BankDao {
     }
 
     pub async fn remove_keyword(&self, keyword: &str) -> Result<u64> {
-        let result = sqlx::query(&self.pool.shared("DELETE FROM keyword_rules WHERE keyword = ?"))
-            .bind(keyword.trim())
-            .execute(self.pool.any())
-            .await?;
+        let result = sqlx::query(
+            &self
+                .pool
+                .shared("DELETE FROM keyword_rules WHERE keyword = ?"),
+        )
+        .bind(keyword.trim())
+        .execute(self.pool.any())
+        .await?;
         Ok(result.rows_affected())
     }
 
@@ -482,12 +494,9 @@ impl BankDao {
             "SELECT MAX(substr(created_at, 1, 10)) FROM bills",
         );
 
-        let (latest,): (Option<String>,) = sqlx::query_as(&sql)
-            .fetch_one(self.pool.any())
-            .await?;
+        let (latest,): (Option<String>,) = sqlx::query_as(&sql).fetch_one(self.pool.any()).await?;
 
-        Ok(latest
-            .and_then(|text| chrono::NaiveDate::parse_from_str(text.trim(), "%Y-%m-%d").ok()))
+        Ok(latest.and_then(|text| chrono::NaiveDate::parse_from_str(text.trim(), "%Y-%m-%d").ok()))
     }
 }
 
@@ -525,17 +534,17 @@ mod tests {
                 .await
                 .unwrap();
 
-        let (food,): (i64,) = sqlx::query_as(&pool.shared(
-            "INSERT INTO categories (parent_id, name) VALUES (NULL, ?) RETURNING id",
-        ))
+        let (food,): (i64,) = sqlx::query_as(
+            &pool.shared("INSERT INTO categories (parent_id, name) VALUES (NULL, ?) RETURNING id"),
+        )
         .bind("餐饮")
         .fetch_one(pool.any())
         .await
         .unwrap();
 
-        let (night,): (i64,) = sqlx::query_as(&pool.shared(
-            "INSERT INTO categories (parent_id, name) VALUES (?, ?) RETURNING id",
-        ))
+        let (night,): (i64,) = sqlx::query_as(
+            &pool.shared("INSERT INTO categories (parent_id, name) VALUES (?, ?) RETURNING id"),
+        )
         .bind(food)
         .bind("夜宵")
         .fetch_one(pool.any())
@@ -575,7 +584,10 @@ mod tests {
         assert_eq!(stored.len(), 1);
         assert_eq!(stored[0].alias, "工资卡");
         assert!(stored[0].is_default);
-        assert_eq!(dao.default_account().await.unwrap().unwrap().account, account);
+        assert_eq!(
+            dao.default_account().await.unwrap().unwrap().account,
+            account
+        );
 
         // 再存一次是更新而不是插两条
         dao.save_account(&account, "主力卡", true).await.unwrap();
@@ -606,7 +618,8 @@ mod tests {
         dao.set_default_account("P-2").await.unwrap();
 
         let accounts = dao.accounts().await.unwrap();
-        let defaults: Vec<&StoredAccount> = accounts.iter().filter(|item| item.is_default).collect();
+        let defaults: Vec<&StoredAccount> =
+            accounts.iter().filter(|item| item.is_default).collect();
         assert_eq!(defaults.len(), 1, "默认账户只能有一个");
         assert_eq!(defaults[0].account.account_uid, "P-2");
 
@@ -647,7 +660,12 @@ mod tests {
         let dao = BankDao::new(pool.clone());
 
         // 第一次：记忆里没有
-        assert!(dao.memory_for("财付通-微信支付-正新鸡排").await.unwrap().is_none());
+        assert!(
+            dao.memory_for("财付通-微信支付-正新鸡排")
+                .await
+                .unwrap()
+                .is_none()
+        );
 
         dao.remember("财付通-微信支付-正新鸡排", book, food)
             .await
@@ -699,8 +717,11 @@ mod tests {
         dao.set_keyword("餐饮", night).await.unwrap();
         let rules = dao.keywords().await.unwrap();
         assert_eq!(rules.len(), 2, "不应重复插入");
-        assert!(rules.iter().any(|rule| rule.keyword == "餐饮"
-            && rule.category_id == night));
+        assert!(
+            rules
+                .iter()
+                .any(|rule| rule.keyword == "餐饮" && rule.category_id == night)
+        );
 
         // 空关键词直接忽略
         dao.set_keyword("   ", food).await.unwrap();
@@ -723,7 +744,10 @@ mod tests {
             .mark_imported(&transaction("fp-bad", "无主"), Some(42))
             .await
             .expect_err("外键应拦住");
-        assert!(format!("{error:?}").to_lowercase().contains("foreign key"), "{error:?}");
+        assert!(
+            format!("{error:?}").to_lowercase().contains("foreign key"),
+            "{error:?}"
+        );
 
         // 不给 bill_id 就能正常写入
         dao.mark_imported(&transaction("fp-ok", "无主"), None)
@@ -826,7 +850,9 @@ mod tests {
         dao.remember("财付通-微信支付-自测店家", book_id, category_id)
             .await
             .unwrap();
-        dao.remember("自测店家", book_id, category_id).await.unwrap();
+        dao.remember("自测店家", book_id, category_id)
+            .await
+            .unwrap();
 
         let entry = dao.memory_for("自测店家").await.unwrap().expect("应有记忆");
         assert_eq!(entry.hits, 2, "两次应累加");

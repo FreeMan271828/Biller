@@ -288,7 +288,9 @@ impl BillDao {
 
     /// 按 id 取单条账单（供编辑预填）。
     pub async fn get(&self, id: BillId) -> Result<Option<BillEntity>> {
-        let sql = self.pool.sql(SELECT_BILL_BY_ID_PG, SELECT_BILL_BY_ID_SQLITE);
+        let sql = self
+            .pool
+            .sql(SELECT_BILL_BY_ID_PG, SELECT_BILL_BY_ID_SQLITE);
 
         let row = sqlx::query_as::<_, BillRow>(&sql)
             .bind(id as i64)

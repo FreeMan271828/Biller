@@ -83,9 +83,7 @@ pub fn generate() -> Result<LocalCa> {
     // 十年，够用；过期后重新生成并重装信任
     params.not_after = rcgen::date_time_ymd(2036, 1, 1);
 
-    let certificate = params
-        .self_signed(&key_pair)
-        .context("签发 CA 证书失败")?;
+    let certificate = params.self_signed(&key_pair).context("签发 CA 证书失败")?;
 
     let cert_pem = certificate.pem();
     let key_pem = key_pair.serialize_pem();
@@ -136,11 +134,14 @@ pub fn status_lines() -> Result<Vec<String>> {
         "ca.key  ：{}（务必要保密）",
         if key.is_file() { "已存在" } else { "缺失" }
     ));
-    lines.push(format!("安装信任：{}", if cert.is_file() {
-        install_command()
-    } else {
-        "先运行 `biller proxy init` 生成证书".to_string()
-    }));
+    lines.push(format!(
+        "安装信任：{}",
+        if cert.is_file() {
+            install_command()
+        } else {
+            "先运行 `biller proxy init` 生成证书".to_string()
+        }
+    ));
     lines.push(format!("删除信任：{}", remove_command()));
 
     Ok(lines)
@@ -162,8 +163,12 @@ mod tests {
     fn ca_paths_live_under_the_biller_directory() {
         let directory = ca_dir();
         assert_eq!(directory.file_name().unwrap(), "proxy");
-        assert!(ca_cert_path().ends_with("proxy/ca.pem") || ca_cert_path().ends_with("proxy\\ca.pem"));
-        assert!(ca_key_path().ends_with("proxy/ca.key") || ca_key_path().ends_with("proxy\\ca.key"));
+        assert!(
+            ca_cert_path().ends_with("proxy/ca.pem") || ca_cert_path().ends_with("proxy\\ca.pem")
+        );
+        assert!(
+            ca_key_path().ends_with("proxy/ca.key") || ca_key_path().ends_with("proxy\\ca.key")
+        );
     }
 
     #[test]

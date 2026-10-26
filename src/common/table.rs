@@ -34,6 +34,16 @@ pub fn pad_right(text: &str, width: usize) -> String {
     }
 }
 
+/// 左侧补空格到指定显示宽度（数字列右对齐）。超宽就原样返回。
+pub fn pad_left(text: &str, width: usize) -> String {
+    let current = display_width(text);
+    if current >= width {
+        text.to_string()
+    } else {
+        format!("{}{text}", " ".repeat(width - current))
+    }
+}
+
 /// 打印一张表；`rows` 为空时打印提示而不是空白。
 pub fn print_table(headers: &[&str], rows: &[Vec<String>]) {
     let columns = headers.len();
@@ -83,5 +93,12 @@ mod tests {
         assert_eq!(display_width("餐饮"), 4);
         assert_eq!(display_width("a餐"), 3);
         assert_eq!(pad_right("餐", 4), "餐  ");
+    }
+
+    #[test]
+    fn pad_left_right_aligns_numbers() {
+        assert_eq!(pad_left("12", 4), "  12");
+        assert_eq!(pad_left("1,234.00", 8), "1,234.00");
+        assert_eq!(pad_left("餐", 2), "餐");
     }
 }

@@ -13,12 +13,12 @@ pub mod view;
 
 use std::time::Duration;
 
+use crate::common::db::Pool;
 use anyhow::{Result, bail};
 use chrono::NaiveDate;
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event as ct;
 use ratatui::crossterm::event::Event;
-use crate::common::db::Pool;
 
 use crate::bill::service::BillService;
 use crate::bill_book::service::BookService;
@@ -70,9 +70,9 @@ pub async fn run(
 ) -> Result<()> {
     let mut terminal = match ratatui::try_init() {
         Ok(terminal) => terminal,
-        Err(error) => bail!(
-            "无法初始化终端：{error}\n请在真实终端中运行（不要重定向输出或通过管道调用）"
-        ),
+        Err(error) => {
+            bail!("无法初始化终端：{error}\n请在真实终端中运行（不要重定向输出或通过管道调用）")
+        }
     };
 
     let result = async {
@@ -102,6 +102,11 @@ async fn event_loop(
     while !app.should_quit {
         // 只在状态变化后重绘：没有输入时不重复刷屏，避免闪烁与空转
         if dirty {
+            // 账单页按视口高度决定一页几条，所以每帧都把当前尺寸写回状态：
+            // 用户拉大窗口后，翻页步长会跟着变，不会还按老高度算页数。
+            if let Ok(size) = terminal.size() {
+                app.viewport_height = size.height;
+            }
             terminal.draw(|frame| view::render(frame, app))?;
             dirty = false;
         }
@@ -182,7 +187,9 @@ async fn apply_action(
                     }
                 }
                 Err(error) => {
-                    app.set_error(format!("设置已保存，但连接失败（旧连接继续可用）：{error:#}"));
+                    app.set_error(format!(
+                        "设置已保存，但连接失败（旧连接继续可用）：{error:#}"
+                    ));
                 }
             }
         }
@@ -282,9 +289,7 @@ async fn initialize_database(url: &str) -> Result<(db::DatabaseOutcome, Pool)> {
         }
         Err(connect_error) => {
             // 连不上（多半是库还不存在）再建库后重试；失败时抛出原始连接错误更好定位
-            let outcome = db::ensure_database(url)
-                .await
-                .map_err(|_| connect_error)?;
+            let outcome = db::ensure_database(url).await.map_err(|_| connect_error)?;
             let pool = db::connect(url).await?;
             db::init_schema(&pool).await?;
             Ok((outcome, pool))

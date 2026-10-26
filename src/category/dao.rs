@@ -34,9 +34,11 @@ impl CategoryDao {
     }
 
     pub async fn insert(&self, parent_id: Option<CategoryId>, name: &str) -> Result<CategoryId> {
-        let (id,): (i64,) = sqlx::query_as(&self.pool.shared(
-            "INSERT INTO categories (parent_id, name) VALUES (?, ?) RETURNING id",
-        ))
+        let (id,): (i64,) = sqlx::query_as(
+            &self
+                .pool
+                .shared("INSERT INTO categories (parent_id, name) VALUES (?, ?) RETURNING id"),
+        )
         .bind(parent_id.map(|id| id as i64))
         .bind(name)
         .fetch_one(self.pool.any())
@@ -59,20 +61,24 @@ impl CategoryDao {
     }
 
     pub async fn get(&self, id: CategoryId) -> Result<Option<Category>> {
-        let row = sqlx::query_as::<_, CategoryRow>(&self.pool.shared(
-            "SELECT id, parent_id, name FROM categories WHERE id = ?",
-        ))
-                .bind(id as i64)
-                .fetch_optional(self.pool.any())
-                .await?;
+        let row = sqlx::query_as::<_, CategoryRow>(
+            &self
+                .pool
+                .shared("SELECT id, parent_id, name FROM categories WHERE id = ?"),
+        )
+        .bind(id as i64)
+        .fetch_optional(self.pool.any())
+        .await?;
         Ok(row.map(Category::from))
     }
 
     /// 按名称查找（不限层级），可能返回多个同名分类。
     pub async fn list_by_name(&self, name: &str) -> Result<Vec<Category>> {
-        let rows = sqlx::query_as::<_, CategoryRow>(&self.pool.shared(
-            "SELECT id, parent_id, name FROM categories WHERE name = ? ORDER BY id",
-        ))
+        let rows = sqlx::query_as::<_, CategoryRow>(
+            &self
+                .pool
+                .shared("SELECT id, parent_id, name FROM categories WHERE name = ? ORDER BY id"),
+        )
         .bind(name)
         .fetch_all(self.pool.any())
         .await?;
@@ -103,11 +109,14 @@ impl CategoryDao {
     }
 
     pub async fn count_children(&self, id: CategoryId) -> Result<i64> {
-        let (count,): (i64,) =
-            sqlx::query_as(&self.pool.shared("SELECT COUNT(*) FROM categories WHERE parent_id = ?"))
-                .bind(id as i64)
-                .fetch_one(self.pool.any())
-                .await?;
+        let (count,): (i64,) = sqlx::query_as(
+            &self
+                .pool
+                .shared("SELECT COUNT(*) FROM categories WHERE parent_id = ?"),
+        )
+        .bind(id as i64)
+        .fetch_one(self.pool.any())
+        .await?;
         Ok(count)
     }
 
@@ -118,24 +127,29 @@ impl CategoryDao {
         parent_id: Option<CategoryId>,
         name: &str,
     ) -> Result<u64> {
-        let result = sqlx::query(&self.pool.shared(
-            "UPDATE categories SET parent_id = ?, name = ? WHERE id = ?",
-        ))
-            .bind(parent_id.map(|id| id as i64))
-            .bind(name)
-            .bind(id as i64)
-            .execute(self.pool.any())
-            .await?;
+        let result = sqlx::query(
+            &self
+                .pool
+                .shared("UPDATE categories SET parent_id = ?, name = ? WHERE id = ?"),
+        )
+        .bind(parent_id.map(|id| id as i64))
+        .bind(name)
+        .bind(id as i64)
+        .execute(self.pool.any())
+        .await?;
         Ok(result.rows_affected())
     }
 
     /// 该分类下的账单数量，用于删除前的友好提示。
     pub async fn count_bills(&self, id: CategoryId) -> Result<i64> {
-        let (count,): (i64,) =
-            sqlx::query_as(&self.pool.shared("SELECT COUNT(*) FROM bills WHERE category_id = ?"))
-            .bind(id as i64)
-            .fetch_one(self.pool.any())
-            .await?;
+        let (count,): (i64,) = sqlx::query_as(
+            &self
+                .pool
+                .shared("SELECT COUNT(*) FROM bills WHERE category_id = ?"),
+        )
+        .bind(id as i64)
+        .fetch_one(self.pool.any())
+        .await?;
         Ok(count)
     }
 

@@ -243,7 +243,10 @@ fn ensure_sqlite_parent(url: &str) -> Result<()> {
     let Some(path) = sqlite_file_path(url) else {
         return Ok(());
     };
-    if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("创建目录 {} 失败", parent.display()))?;
     }
@@ -583,9 +586,9 @@ pub fn database_name(url: &str) -> Result<String> {
         .context("DATABASE_URL 缺少 scheme://，例如 postgres://user:pass@127.0.0.1:5432/biller")?;
     let without_query = rest.split('?').next().unwrap_or(rest);
     let without_fragment = without_query.split('#').next().unwrap_or(without_query);
-    let (_, name) = without_fragment.rsplit_once('/').context(
-        "DATABASE_URL 里没有数据库名，例如 postgres://user:pass@127.0.0.1:5432/biller",
-    )?;
+    let (_, name) = without_fragment
+        .rsplit_once('/')
+        .context("DATABASE_URL 里没有数据库名，例如 postgres://user:pass@127.0.0.1:5432/biller")?;
     if name.is_empty() {
         bail!("DATABASE_URL 里没有数据库名，例如 postgres://user:pass@127.0.0.1:5432/biller");
     }
@@ -603,7 +606,9 @@ pub fn with_database(url: &str, database: &str) -> Result<String> {
     };
     let base = match path.rsplit_once('/') {
         Some((base, _)) => base,
-        None => bail!("DATABASE_URL 里没有数据库名，例如 postgres://user:pass@127.0.0.1:5432/biller"),
+        None => {
+            bail!("DATABASE_URL 里没有数据库名，例如 postgres://user:pass@127.0.0.1:5432/biller")
+        }
     };
 
     let mut result = format!("{scheme}://{base}/{database}");
@@ -630,8 +635,13 @@ pub fn is_foreign_key_violation(error: &sqlx::Error) -> bool {
 pub fn is_unique_violation(error: &sqlx::Error) -> bool {
     match error {
         sqlx::Error::Database(db) => {
-            matches!(db.code().as_deref(), Some("23505") | Some("2067") | Some("1555"))
-                || db.message().to_ascii_lowercase().contains("unique constraint")
+            matches!(
+                db.code().as_deref(),
+                Some("23505") | Some("2067") | Some("1555")
+            ) || db
+                .message()
+                .to_ascii_lowercase()
+                .contains("unique constraint")
                 || db
                     .message()
                     .to_ascii_lowercase()
@@ -667,9 +677,7 @@ fn is_safe_identifier(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 63
         && !value.starts_with(|c: char| c.is_ascii_digit())
-        && value
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && value.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 #[cfg(test)]
@@ -678,8 +686,14 @@ mod tests {
 
     #[test]
     fn parses_database_name() {
-        assert_eq!(database_name("postgres://u:p@127.0.0.1:5432/biller").unwrap(), "biller");
-        assert_eq!(database_name("postgres://u:p@h:5432/biller?sslmode=disable").unwrap(), "biller");
+        assert_eq!(
+            database_name("postgres://u:p@127.0.0.1:5432/biller").unwrap(),
+            "biller"
+        );
+        assert_eq!(
+            database_name("postgres://u:p@h:5432/biller?sslmode=disable").unwrap(),
+            "biller"
+        );
         assert!(database_name("postgres://u:p@127.0.0.1:5432").is_err());
     }
 
@@ -697,7 +711,10 @@ mod tests {
 
     #[test]
     fn hides_password() {
-        assert_eq!(redact("postgres://u:secret@h:5432/db"), "postgres://u:***@h:5432/db");
+        assert_eq!(
+            redact("postgres://u:secret@h:5432/db"),
+            "postgres://u:***@h:5432/db"
+        );
         assert_eq!(redact("postgres://h:5432/db"), "postgres://h:5432/db");
     }
 
@@ -789,11 +806,7 @@ mod tests {
 
         let described = describe(error, "账本不存在，无法记账");
         assert_eq!(described.to_string(), "账本不存在，无法记账");
-        assert_eq!(
-            described.chain().count(),
-            1,
-            "友好提示不应再挂带底层原因链"
-        );
+        assert_eq!(described.chain().count(), 1, "友好提示不应再挂带底层原因链");
     }
 
     /// 本地 SQLite 模式跑一遍真实流程：建表 → 记账 → 按月查询 → 起始金额 → 外键约束。
@@ -914,14 +927,7 @@ mod tests {
 
         // 外键约束在 SQLite 下同样生效，且要能被识别成友好提示
         let error = bills
-            .insert(
-                BillKind::Expense,
-                1,
-                999_999,
-                category_id,
-                created_at,
-                None,
-            )
+            .insert(BillKind::Expense, 1, 999_999, category_id, created_at, None)
             .await
             .expect_err("指向不存在的账本，应触发外键冲突");
         let sqlx_error = error
@@ -1204,7 +1210,10 @@ mod tests {
         let bill = bills.get(bill_id).await.expect("取单条").expect("应存在");
         assert!(!bill.excluded, "补出来的列默认是 0（计入日历）");
 
-        bills.set_excluded(bill_id, true).await.expect("切换计入日历");
+        bills
+            .set_excluded(bill_id, true)
+            .await
+            .expect("切换计入日历");
         let bill = bills.get(bill_id).await.expect("取单条").expect("应存在");
         assert!(bill.excluded, "补出来的列也必须能写");
 

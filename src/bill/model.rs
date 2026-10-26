@@ -54,7 +54,7 @@ pub struct BillEntity {
     pub category: Category,
     pub created_at: DateTime<Utc>,
     pub remark: Option<String>,
-    /// 不纳入统计：报销、代付、走账这类过手钱，不该算进收支与开销计划。
+    /// 不纳入统计：报销、代付、走账这类过手钱，不该算进支出日历。
     pub excluded: bool,
 }
 

@@ -85,11 +85,8 @@ mod tests {
         assert_eq!(translate(release), None);
 
         // 长按补发的 Repeat 也必须忽略，否则「回车展开」会被立刻确认掉
-        let repeat = KeyEvent::new_with_kind(
-            KeyCode::Enter,
-            KeyModifiers::NONE,
-            KeyEventKind::Repeat,
-        );
+        let repeat =
+            KeyEvent::new_with_kind(KeyCode::Enter, KeyModifiers::NONE, KeyEventKind::Repeat);
         assert_eq!(translate(repeat), None);
     }
 }

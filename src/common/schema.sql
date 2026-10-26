@@ -31,7 +31,7 @@ CREATE TABLE IF NOT EXISTS bills (
     category_id BIGINT NOT NULL REFERENCES categories (id) ON DELETE RESTRICT,
     created_at  TIMESTAMPTZ NOT NULL,
     remark      TEXT,
-    -- 不纳入统计：报销、代付、走账这类过手钱不该算进收支与开销计划
+    -- 不纳入统计：报销、代付、走账这类过手钱不该算进收支与资金计划
     excluded    BOOLEAN NOT NULL DEFAULT FALSE
 );
 

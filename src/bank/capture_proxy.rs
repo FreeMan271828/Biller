@@ -18,10 +18,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use hudsucker::{
-    certificate_authority::RcgenAuthority,
-    hyper::Request,
-    rustls::crypto::aws_lc_rs,
     Body, HttpContext, HttpHandler, Proxy, RequestOrResponse,
+    certificate_authority::RcgenAuthority, hyper::Request, rustls::crypto::aws_lc_rs,
 };
 use rcgen::{Issuer, KeyPair};
 use tokio::sync::oneshot;
@@ -39,7 +37,8 @@ pub fn should_capture(url: &str, method: &str) -> bool {
     }
 
     // 有 scheme 时按域名边界严格匹配；有的实现只给 path，就退一步看路径
-    let host_ok = url_matches(url) || (!url.contains("://") && url.contains("/CmbBank_Web_Account/"));
+    let host_ok =
+        url_matches(url) || (!url.contains("://") && url.contains("/CmbBank_Web_Account/"));
     host_ok && url.contains("/accountquery/querytrans")
 }
 
@@ -47,9 +46,7 @@ pub fn should_capture(url: &str, method: &str) -> bool {
 pub fn to_captured(headers: &serde_json::Value, body: Option<&str>) -> CapturedRequest {
     let client_no = header_value(headers, "clientNo");
     let cookie = header_value(headers, "cookie");
-    let (account_uid, sub_account_no) = body
-        .map(extract_account_fields)
-        .unwrap_or((None, None));
+    let (account_uid, sub_account_no) = body.map(extract_account_fields).unwrap_or((None, None));
 
     CapturedRequest {
         client_no,
@@ -76,7 +73,12 @@ impl HttpHandler for CaptureHandler {
         let host = request
             .uri()
             .host()
-            .or_else(|| request.headers().get("host").and_then(|value| value.to_str().ok()))
+            .or_else(|| {
+                request
+                    .headers()
+                    .get("host")
+                    .and_then(|value| value.to_str().ok())
+            })
             .unwrap_or("")
             .to_string();
 
@@ -175,7 +177,8 @@ pub async fn capture(port: u16, timeout: Duration) -> Result<CapturedRequest> {
 mod tests {
     use super::*;
 
-    const REAL_URL: &str = "https://cbsh.ebank.cmbchina.com/CmbBank_Web_Account/accountquery/querytrans";
+    const REAL_URL: &str =
+        "https://cbsh.ebank.cmbchina.com/CmbBank_Web_Account/accountquery/querytrans";
 
     #[test]
     fn matches_only_the_real_querytrans_request() {

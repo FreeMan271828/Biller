@@ -5,8 +5,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use anyhow::{Result, bail};
 use crate::common::db::Pool;
+use anyhow::{Result, bail};
 
 use crate::category::dao::CategoryDao;
 use crate::category::model::Category;
@@ -27,7 +27,10 @@ pub struct CategoryNode {
 pub fn flatten_tree(categories: &[Category]) -> Vec<CategoryNode> {
     let mut children: HashMap<Option<CategoryId>, Vec<&Category>> = HashMap::new();
     for category in categories {
-        children.entry(category.parent_id).or_default().push(category);
+        children
+            .entry(category.parent_id)
+            .or_default()
+            .push(category);
     }
     for list in children.values_mut() {
         list.sort_by_key(|category| category.id);
