@@ -383,6 +383,11 @@ const SQLITE_ADDED_COLUMNS: &[(&str, &str, &str)] = &[
         "plan_limit",
         "ALTER TABLE bill_books ADD COLUMN plan_limit INTEGER",
     ),
+    (
+        "bill_books",
+        "plan_kind",
+        "ALTER TABLE bill_books ADD COLUMN plan_kind TEXT NOT NULL DEFAULT 'expense'",
+    ),
 ];
 
 /// 给老 SQLite 库补上后加的列（幂等：先查 `pragma_table_info`，有就跳过）。
@@ -843,7 +848,10 @@ mod tests {
         let bills = BillDao::new(pool.clone());
         let months = MonthDao::new(pool.clone());
 
-        let book_id = books.insert("微信", None).await.expect("建账本");
+        let book_id = books
+            .insert("微信", None, crate::bill_book::model::PlanKind::Expense)
+            .await
+            .expect("建账本");
         let category_id = categories.insert(None, "餐饮").await.expect("建分类");
 
         let created_at = chrono::Utc.with_ymd_and_hms(2026, 10, 5, 12, 0, 0).unwrap();
@@ -951,7 +959,10 @@ mod tests {
         );
 
         // 唯一约束（账本重名）
-        let error = books.insert("微信", None).await.expect_err("重名账本应被拒绝");
+        let error = books
+            .insert("微信", None, crate::bill_book::model::PlanKind::Expense)
+            .await
+            .expect_err("重名账本应被拒绝");
         let sqlx_error = error
             .downcast_ref::<sqlx::Error>()
             .expect("DAO 应把 sqlx 错误原样往上抛");
@@ -1149,7 +1160,7 @@ mod tests {
     /// 造一个「旧版本」的 SQLite 库（`bills` 还没有 excluded 列），
     /// 验证 [`init_schema`] 会像 PG 的 `ADD COLUMN IF NOT EXISTS` 一样把列补上。
     #[tokio::test]
-    async fn sqlite_old_database_gets_the_excluded_column() {
+    async fn sqlite_old_database_gets_every_added_column() {
         use chrono::{TimeZone, Utc};
 
         use crate::bill::dao::BillDao;
@@ -1185,7 +1196,9 @@ mod tests {
                  category_id INTEGER NOT NULL REFERENCES categories (id) ON DELETE RESTRICT,
                  created_at  TEXT    NOT NULL,
                  remark      TEXT
-             );",
+             );
+             -- 补列之前就存在的计划：升级后既不能丢，也得有个类型
+             INSERT INTO bill_books (name) VALUES ('旧库工资');",
         )
         .execute(pool.any())
         .await
@@ -1199,7 +1212,25 @@ mod tests {
         let categories = CategoryDao::new(pool.clone());
         let bills = BillDao::new(pool.clone());
 
-        let book_id = books.insert("旧库账本", None).await.expect("建账本");
+        // 补列前的老计划：读得出来、额度为空、类型默认算开销
+        let old = books
+            .list_plans()
+            .await
+            .expect("老计划要能读出来")
+            .into_iter()
+            .find(|plan| plan.name() == "旧库工资")
+            .expect("补列不该丢掉已有的计划");
+        assert_eq!(
+            old.kind,
+            crate::bill_book::model::PlanKind::Expense,
+            "补出来的 plan_kind 默认 expense：老计划一律按开销计划算"
+        );
+        assert_eq!(old.limit, None, "老计划没有额度");
+
+        let book_id = books
+            .insert("旧库账本", None, crate::bill_book::model::PlanKind::Expense)
+            .await
+            .expect("建账本");
         let category_id = categories.insert(None, "旧库分类").await.expect("建分类");
         let created_at = Utc.with_ymd_and_hms(2026, 10, 1, 8, 0, 0).unwrap();
         let bill_id = bills

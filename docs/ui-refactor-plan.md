@@ -101,7 +101,7 @@ biller  2026-10  [ ] 换月   概览  计划  账单  报表                  Po
 
 ## 四、分阶段计划（每阶段可独立上线）
 
-> **进度**（做完就更新这一栏，别让它变成设想）：**P0 – P5 落地（1.4.0，提交 `75cecf4`）；Q1 – Q6 落地（1.5.0），`cargo test --lib` 255 passed / 0 failed。**
+> **进度**（做完就更新这一栏，别让它变成设想）：**P0 – P5 落地（1.4.0，提交 `75cecf4`）；Q1 – Q6 落地（1.5.0）；R1 – R5 落地（1.6.0）；**1.6.1 概览「当日动账」只列 `↑` `↓` 选中那一天**，顺带把无头基线的样本日钉死（`sample_app` 固定 `selected_day = 5`）；**1.6.2 选中态改成深底亮字**（浅蓝底 + 原字色糊成一片，根因是行内 `Span` 前景色盖掉行样式），并补一条按格子样式断言的测试 —— 计划分收入 / 开销、每页选中态统一配色，`cargo test --lib` **264 passed，全绿**（page1 / modal 那 7 张不再随机器日期漂）。**
 >
 > - ✅ **P0**：`golden/` 18 张基线（6 个页面视图 × 120x40/80x24 + 4 弹窗 + 帮助弹窗 2 张），
 >   `BLESS=1 cargo test --lib golden_screens` 可重写；漏写基线时报「缺少界面基线」，改版式时报「界面排版变了」。
@@ -218,6 +218,42 @@ biller  2026-10  [ ] 换月   概览  计划  账单  报表                  Po
 - **用 heredoc 写长脚本会被截断**（bash 只报一句 `warning: here-document ... wanted 'PYEOF'`，退出码还是 0，
   python 根本没执行）。大脚本一律先 `write` 成文件再 `python .dsh-tmp/xxx.py` 跑。
 
+### 第三轮 · 计划分收入 / 开销（1.6.0）
+
+用户反馈原文：「修改计划的工资，计划也分为开销计划和收入计划，像工资就是收入计划，这里两个计划分开来显示，先收入后支出，每一个框的大小根据数据量动态调整」。
+
+**一句话口径**：计划不再只是「有额度 / 没额度」，而是先分**类型**（收入 / 开销），再谈额度 ——
+收入计划问「这个月该进来多少」，开销计划问「这些钱怎么分出去」，两者共用一套结构、只差一个方向。
+
+| 决策 | 为什么 |
+| --- | --- |
+| 类型存成 `bill_books.plan_kind`（`income` / `expense`，默认 `expense`），不另建表 | 计划本体本来就在账本表上，再开一张表等于把「一个计划」拆到两处，迟早不一致 |
+| `PlanRow.spent` 一个字段按类型解释方向（收入=已入，开销=已花） | 拆两套结构会逼着 TUI / CLI / 报表各写一遍分支，口径容易漂 |
+| 日历额度与覆盖校验**只取开销计划** | 把收入目标摊进日额度，等于把「该进来多少」当成「能花多少」，数字会假 |
+| 收入口径**不过滤「不计入」**（`income_by_plan` 与 `month_income` 同一口径） | 「不计入」只影响日历，不改报表口径 —— 走账的奖金照样算这个月的收入 |
+| 展示顺序（收入在前）在 service 层做稳定排序 `rows.sort_by_key(\|row\| row.plan.kind != PlanKind::Income)` | 选中位次就是列表 index，排序只放一处，才不会出现「选中没变、数据窜位」 |
+| 编辑按 `BookId` 定位而不是列表 index（`EditTarget::PlanItem(BookId)`） | 列表顺序是收入在前，和库里的 id 顺序不同；拿 index 去改会改错计划 |
+
+| 阶段 | 内容 |
+| --- | --- |
+| R1 | 表结构加 `plan_kind`（两套 schema 同步 + `SQLITE_ADDED_COLUMNS` 幂等补列，老计划自动算开销）；`bill_book::model` 新增 `PlanKind`（`label()` / `Plan::describe_limit()` 按类型分口径），`Plan::new(book, limit, kind)` |
+| R2 | `bill_book::service` 的 `add` 收类型、新增 `set_kind`；`plan::model` 新增 `income_by_plan`（收入口径），`total_limit` 只加开销计划；`plan::service` 稳定排序成「收入在前」 |
+| R3 | 计划页左栏拆成两个框（`render_plan_group`）：收入看 目标 / 已入 / 差距 / 进度，开销看 上限 / 已花 / 剩余 / 用量；`plan_group_heights` 按各自行数分高：空框保底 4 行（边框 ×2 + 表头 + 提示），`4 + rows` 是需求行数，空间不够按需求比例分（每框至少 4 行），富余高度再按两边行数摊（只有一边有数据就全给它，空框不会跟着长高） |
+| R4 | 计划表单三字段：名称 → 类型（`Field::choice`，`←` `→` / 空格切）→ 额度；提交分支改成 `EditTarget::PlanItem(id)` 走 `by_id` → `rename` → `set_limit` → `set_kind` 三步 |
+| R5 | CLI `plan add/set --kind income\|expense`（`kind_of` 也认 `收入` / `开销` / `支出`），`plan show` 收入一段、开销一段；golden `page2-120x40` / `page2-80x24` 重刷；README / 本文档同步，`Cargo.toml` 升 1.6.0 |
+
+**这轮踩到的坑（记下来，别再踩）**：
+
+- **`PlanKind` 在 `crate::bill_book::model`，不在 `crate::bill`**：`crate::bill::model` 里那个是 `BillKind`（账单方向），
+  第一版 import 写错位置，直接编译不过。
+- **`Field::choice` 的默认值就是第一个选项**：选项顺序必须是 `["开销", "收入"]`，把「收入」放第一位等于让所有新建计划默认变收入计划。
+- **golden 只重刷 page2 两张**：`BLESS=1` 会顺手把 page1 / modal 也重写，那几张的差异是环境日期漂移（概览渲染「今日」），
+  提交进去等于把噪音当基线；`git checkout -- golden/...` 被安全网挡住时，用 `git show HEAD:golden/<文件> > golden/<文件>` 恢复。
+- **`tools.edit` 的返回值是改动前后全文**：直接 `JSON.stringify` 打印会甩出 200KB+，只打印「OK 哪个改动」。
+- **框高「富余优先给开销框」是假动态**：第一版把多出来的高度全塞给开销框，结果 1 行的开销框长到 20+ 行、
+  3 行的收入框只有 7 行，和「框的大小根据数据量动态调整」对不上；改成富余按两边行数摊（只有一边有数据才全给它），
+  并用 `plan_boxes_get_height_by_row_count` 把 6 组数字钉死。
+
 ## 五、明确不做的事（防止计划失控）
 
 - 不做 Web/GUI 版，不动 `src/bank/*`（约 4000 行 CDP/MITM 与本次无关）。
@@ -237,7 +273,7 @@ biller  2026-10  [ ] 换月   概览  计划  账单  报表                  Po
 ## 七、总验收闸（每个阶段结束都跑）
 
 ```bash
-cargo test --lib          # 255 个测试（1.5.0；1.4.0 时是 259，合并计划时删掉了按分类对账那一批）
+cargo test --lib          # 264 个测试（1.6.2；1.6.1 时 263；1.6.0 时 262；1.5.0 时 255；1.4.0 时 259，合并计划时删掉了按分类对账那一批，分类型又补回来几个）
 cargo test --lib print_layout_preview -- --nocapture   # 人工看 6 个页面快照
 BLESS=1 cargo test --lib golden_screens               # 有意改版式后重写基线
 cargo clippy --all-targets -- -D warnings             # 见下方说明

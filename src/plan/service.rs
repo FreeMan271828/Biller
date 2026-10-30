@@ -1,7 +1,7 @@
-//! 计划的业务层：一个计划 = 一个账本 + 可选上限。
+//! 计划的业务层：一个计划 = 一个账本 + 可选额度 + 类型（收入 / 开销）。
 //!
-//! 计划本体落在 `bill_books`（`plan_limit` 列），本月「已花」按账单所属的计划
-//! 汇总——「账单统合到计划」这件事由 `bills.book_id` 天然表达，不需要第二套绑定。
+//! 计划本体落在 `bill_books`（`plan_limit` / `plan_kind` 列）：收入计划累计这个月
+//! 进账多少，开销计划累计花掉多少——口径都由 `bills.book_id` 天然表达，不需要第二套绑定。
 //!
 //! 跨模块只认这一层：TUI / CLI 都通过 [`PlanService`] 拿计划、进度与覆盖。
 
@@ -9,14 +9,15 @@ use anyhow::{Context, Result, bail};
 use chrono::{Datelike, NaiveDate};
 
 use crate::bill::service::BillService;
-use crate::bill_book::model::Plan;
+use crate::bill_book::model::{Plan, PlanKind};
 use crate::bill_book::service::BookService;
 use crate::common::db::Pool;
 use crate::common::money;
 use crate::common::state::StateStore;
 use crate::common::types::{AmountType, BookId};
 use crate::plan::model::{
-    PlanCoverage, PlanProgress, PlanRow, expense_by_day, expense_by_plan, month_income, total_limit,
+    PlanCoverage, PlanProgress, PlanRow, expense_by_day, expense_by_plan, income_by_plan, month_income,
+    total_limit,
 };
 
 /// 老版本把整份计划存成一行 JSON（`[{name, amount, category?}]`）；迁移完删掉。
@@ -39,9 +40,9 @@ pub struct PlanService {
 ///
 /// 三样都要当月账单，拆成三个方法就得查三遍，干脆一次算完。
 pub struct PlanSnapshot {
-    /// 所有计划（含没设上限的）在本月的执行情况。
+    /// 所有计划（含没设额度的）在本月的执行情况，收入计划在前。
     pub rows: Vec<PlanRow>,
-    /// 当月额度与日历状态；上限取所有有上限计划之和。
+    /// 当月额度与日历状态；额度取所有有额度的开销计划之和。
     pub progress: PlanProgress,
     /// 计划合计 vs 当月收入。
     pub coverage: PlanCoverage,
@@ -61,33 +62,42 @@ impl PlanService {
         self.books.list_plans().await
     }
 
-    /// 新建计划；`limit = None` 表示只累计、不设上限。
-    pub async fn add(&self, name: &str, limit: Option<AmountType>) -> Result<Plan> {
+    /// 新建计划；`limit = None` 表示只累计、不设额度。
+    pub async fn add(&self, name: &str, limit: Option<AmountType>, kind: PlanKind) -> Result<Plan> {
         let limit = clean_limit(limit)?;
-        let book = self.books.add(name, limit).await?;
-        Ok(Plan::new(book, limit))
+        let book = self.books.add(name, limit, kind).await?;
+        Ok(Plan::new(book, limit, kind))
     }
 
-    /// 改某个计划的上限；`None` 表示取消上限。
+    /// 改某个计划的额度；`None` 表示取消额度。类型保持不变。
     pub async fn set_limit(&self, target: &str, limit: Option<AmountType>) -> Result<Plan> {
         let limit = clean_limit(limit)?;
         let book = self.books.find_target(target).await?;
+        let kind = self.by_id(book.id).await?.kind;
         self.books.set_limit(book.id, limit).await?;
-        Ok(Plan::new(book, limit))
+        Ok(Plan::new(book, limit, kind))
+    }
+
+    /// 改类型（收入 / 开销）；额度原样保留。
+    pub async fn set_kind(&self, target: &str, kind: PlanKind) -> Result<Plan> {
+        let book = self.books.find_target(target).await?;
+        let plan = self.by_id(book.id).await?;
+        self.books.set_kind(book.id, kind).await?;
+        Ok(Plan::new(book, plan.limit, kind))
     }
 
     /// 改名。计划靠名字找，所以重名会被拒。
     pub async fn rename(&self, target: &str, new_name: &str) -> Result<Plan> {
         let book = self.books.find_target(target).await?;
-        let limit = self.plan_of(book.id).await?.limit;
+        let plan = self.by_id(book.id).await?;
         let book = self.books.rename(book.id, new_name).await?;
-        Ok(Plan::new(book, limit))
+        Ok(Plan::new(book, plan.limit, plan.kind))
     }
 
     /// 删掉计划；名下还有账单时数据库会拒绝（外键 RESTRICT），这里翻译成人话。
     pub async fn remove(&self, target: &str) -> Result<Plan> {
         let book = self.books.find_target(target).await?;
-        let plan = self.plan_of(book.id).await?;
+        let plan = self.by_id(book.id).await?;
         self.books
             .remove(&book.id.to_string())
             .await
@@ -95,8 +105,14 @@ impl PlanService {
         Ok(plan)
     }
 
-    /// 某个计划（含上限）。
-    async fn plan_of(&self, id: BookId) -> Result<Plan> {
+    /// 按「id 或名称」取某个计划（含额度与类型），CLI 只改类型时用。
+    pub async fn get(&self, target: &str) -> Result<Plan> {
+        let book = self.books.find_target(target).await?;
+        self.by_id(book.id).await
+    }
+
+    /// 按 id 取某个计划（含额度与类型）；TUI 改计划时先按 id 拿到「改之前」的样子。
+    pub(crate) async fn by_id(&self, id: BookId) -> Result<Plan> {
         self.list()
             .await?
             .into_iter()
@@ -157,7 +173,8 @@ impl PlanService {
                     }
                 }
                 Err(_) => {
-                    self.books.add(name, limit).await?;
+                    // 迁移出来的一律是开销计划：老版本没有「收入计划」这个概念
+                    self.books.add(name, limit, PlanKind::Expense).await?;
                     created += 1;
                 }
             }
@@ -200,29 +217,41 @@ impl PlanService {
     }
 }
 
-/// 上限只接受正数；0 或负数当作「没上限」，免得出现除零和「额度 0」的怪状态。
+/// 额度只接受正数；0 或负数当作「没额度」，免得出现除零和「额度 0」的怪状态。
 fn clean_limit(limit: Option<AmountType>) -> Result<Option<AmountType>> {
     match limit {
-        Some(value) if value < 0 => bail!("上限不能是负数"),
+        Some(value) if value < 0 => bail!("额度不能是负数"),
         Some(0) | None => Ok(None),
         Some(value) => Ok(Some(value)),
     }
 }
 
-/// 计划列表 + 当月账单 → 每个计划一行。
+/// 计划列表 + 当月账单 → 每个计划一行，**收入计划在前、开销计划在后**。
+///
+/// 两种类型各取一份汇总表（支出过滤「不计入」，收入不过滤），计划按自己的类型挑表。
 fn build_rows(
     plans: Vec<Plan>,
     bills: &[crate::bill::model::BillEntity],
     month: NaiveDate,
 ) -> Vec<PlanRow> {
-    let by_plan = expense_by_plan(first_of_month(month), bills);
-    plans
+    let month = first_of_month(month);
+    let expenses = expense_by_plan(month, bills);
+    let incomes = income_by_plan(month, bills);
+    let mut rows: Vec<PlanRow> = plans
         .into_iter()
         .map(|plan| {
-            let spent = by_plan.get(&plan.id()).copied().unwrap_or(0);
+            let id = plan.id();
+            let by_plan = match plan.kind {
+                PlanKind::Income => &incomes,
+                PlanKind::Expense => &expenses,
+            };
+            let spent = by_plan.get(&id).copied().unwrap_or(0);
             PlanRow::new(plan, spent)
         })
-        .collect()
+        .collect();
+    // 先收入后开销；stable sort 保住组内原来的 id 顺序。
+    rows.sort_by_key(|row| row.plan.kind != PlanKind::Income);
+    rows
 }
 
 /// 月份统一成 1 号：库里的月份键、账单查询都按 1 号算。
@@ -357,6 +386,10 @@ mod tests {
         let names: Vec<&str> = plans.iter().map(|plan| plan.name()).collect();
         assert_eq!(names, vec!["日常开销", "存款"]);
         assert_eq!(plans[0].limit, Some(400_000), "块的面额就是计划上限");
+        assert!(
+            plans.iter().all(|plan| plan.kind == PlanKind::Expense),
+            "老数据没有收入计划，迁移出来的一律是开销计划"
+        );
         assert!(state.get(LEGACY_KEY_ITEMS).await.unwrap().is_none(), "旧键要清掉");
 
         // 再开一次界面不该翻倍
@@ -368,6 +401,62 @@ mod tests {
                 .unwrap()
                 .len(),
             2
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `plan_kind` 必须真的落在库里：建的时候是收入，读回来还得是收入；
+    /// 改额度不能把类型带走，改类型也不能动额度。
+    #[tokio::test]
+    async fn plan_kind_survives_a_round_trip() {
+        let (pool, dir) = setup().await;
+        let service = PlanService::new(pool.clone());
+
+        // 故意先建开销、后建收入：库里 id 顺序是「房租 → 工资」
+        let expense = service
+            .add("房租", Some(2_500_00), PlanKind::Expense)
+            .await
+            .unwrap();
+        let income = service
+            .add("工资", Some(8_000_00), PlanKind::Income)
+            .await
+            .unwrap();
+        assert_eq!(expense.kind, PlanKind::Expense, "建的时候是开销计划");
+        assert_eq!(income.kind, PlanKind::Income, "建的时候是收入计划");
+
+        let stored = service.get("工资").await.unwrap();
+        assert_eq!(stored.kind, PlanKind::Income, "读回来还得是收入计划");
+        assert_eq!(stored.limit, Some(8_000_00), "额度也要一起存住");
+
+        // 展示顺序：收入在前、开销在后，和 id 顺序无关
+        let month = NaiveDate::from_ymd_opt(2026, 10, 1).expect("2026-10");
+        let names: Vec<String> = service
+            .rows(month)
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| row.plan.name().to_string())
+            .collect();
+        assert_eq!(names, vec!["工资", "房租"], "先收入后开销");
+
+        // 改额度不掉类型
+        let changed = service.set_limit("工资", Some(9_000_00)).await.unwrap();
+        assert_eq!(changed.kind, PlanKind::Income, "改额度不该改类型");
+        assert_eq!(
+            service.get("工资").await.unwrap().kind,
+            PlanKind::Income,
+            "改额度后从库里读出来也还是收入计划"
+        );
+
+        // 改类型不动额度
+        let flipped = service.set_kind("工资", PlanKind::Expense).await.unwrap();
+        assert_eq!(flipped.kind, PlanKind::Expense);
+        assert_eq!(flipped.limit, Some(9_000_00), "改类型不该动额度");
+        assert_eq!(
+            service.get("工资").await.unwrap().limit,
+            Some(9_000_00),
+            "改类型后额度还在库里"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

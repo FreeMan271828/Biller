@@ -1,27 +1,30 @@
-//! 计划的读模型：一个计划 = 一个账本 + 可选上限。
+//! 计划的读模型：一个计划 = 一个账本 + 可选额度 + 类型（收入 / 开销）。
 //!
 //! 计划本体存在 `bill_books`（见 [`crate::bill_book::model::Plan`]），这里只放
 //! 「把这个月的账单摊到计划上」用的派生结构：谁花了多少、还剩多少，
 //! 以及支出日历要的日额度与逐日状态。
 //!
-//! 两种计划共用一个列表：
+//! 两种类型共用一套结构，口径只差一个方向：
 //!
-//! * 设了上限（`plan.limit = Some(n)`）：有额度、能算剩余、能上色日历；
-//! * 没设上限（`None`）：从 0 开始记流水，只看已花。
+//! * **收入计划**（`plan.kind == Income`）：累计这个月进账多少，跟「目标」比；
+//!   「不计入」的账单照样算收入，和 [`month_income`] 一个口径；
+//! * **开销计划**（`Expense`）：累计这个月花掉多少，跟「上限」比，能上色日历；
+//!   「不计入」的账单不算支出。
 
 use std::collections::HashMap;
 
 use chrono::{Datelike, NaiveDate};
 
 use crate::bill::model::{BillEntity, BillKind};
-use crate::bill_book::model::Plan;
+use crate::bill_book::model::{Plan, PlanKind};
 use crate::common::types::{AmountType, BookId};
 
 /// 一个计划在本月的执行情况。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlanRow {
     pub plan: Plan,
-    /// 本月记在这个计划名下的支出合计（「不计入」的账单不算）。
+    /// 本月记在这个计划名下的金额：开销计划是支出合计（「不计入」的账单不算），
+    /// 收入计划是收入合计（「不计入」不影响收入口径）。
     pub spent: AmountType,
 }
 
@@ -34,12 +37,15 @@ impl PlanRow {
         self.plan.name()
     }
 
-    /// 还剩多少：只有设了上限才有意义，没上限返回 `None`（不拿它当 0 用）。
+    /// 还剩多少：只有设了额度才有意义，没额度返回 `None`（不拿它当 0 用）。
+    /// 收入计划里它是「离目标还差多少」，负数表示已经超额完成。
     pub fn remaining(&self) -> Option<AmountType> {
         self.plan.limit.map(|limit| limit - self.spent)
     }
 
-    /// 超支了吗：没上限的计划永远不会超。
+    /// 超支了吗：没额度的计划永远不会超。
+    ///
+    /// 收入计划里 `remaining < 0` 是「超额完成」，不是超支，调用方按类型上色。
     pub fn over(&self) -> bool {
         self.remaining().is_some_and(|rest| rest < 0)
     }
@@ -53,24 +59,16 @@ impl PlanRow {
     }
 }
 
-/// 所有计划的上限合计：日历与概览的「本月额度」都取这个数。
+/// 所有**开销计划**的额度合计：日历与概览的「本月额度」都取这个数。
 ///
-/// 没上限的计划不参与——它们没有额度可摊，摊进去会把日额度算虚。
+/// 收入计划不参与：日历摊的是能花多少钱，把收入目标摊进日额度等于凭空多给钱。
+/// 没额度的计划也不参与——它们没有额度可摊，摊进去会把日额度算虚。
 pub fn total_limit(rows: &[PlanRow]) -> AmountType {
     rows.iter()
+        .filter(|row| row.plan.kind == PlanKind::Expense)
         .filter_map(|row| row.plan.limit)
         .filter(|limit| *limit > 0)
         .sum()
-}
-
-/// 上限的一句话说明：有上限说额度，没上限说它是累计型的。
-///
-/// 计划列表、删除确认、表单提示都要讲这件事，措辞只在这里维护一份。
-pub fn describe_limit(limit: Option<AmountType>) -> String {
-    match limit {
-        Some(limit) if limit > 0 => format!("每月 {} 元", crate::common::money::format_amount(limit)),
-        _ => "不设上限，只从 0 开始累计".to_string(),
-    }
 }
 
 /// 计划合计 vs 当月收入：这张卡回答「钱分完了吗、分超了吗」。
@@ -78,7 +76,7 @@ pub fn describe_limit(limit: Option<AmountType>) -> String {
 pub struct PlanCoverage {
     /// 当月收入（工资）。
     pub income: AmountType,
-    /// 有上限计划的合计。
+    /// 开销计划额度合计。
     pub allocated: AmountType,
 }
 
@@ -164,7 +162,7 @@ pub struct DayCell {
 #[derive(Debug, Clone)]
 pub struct PlanProgress {
     pub month: NaiveDate,
-    /// 本月上限 = 所有有上限计划之和。
+    /// 本月上限 = 所有有上限的**开销**计划之和（收入计划是目标不是预算，不摊进日额度）。
     pub limit: AmountType,
     /// 日额度 = 上限 / 当月天数。
     pub daily_allowance: AmountType,
@@ -290,7 +288,26 @@ pub fn expense_by_day(month: NaiveDate, bills: &[BillEntity]) -> HashMap<u32, Am
     by_day
 }
 
-/// 某月每个计划花了多少：`book_id -> 支出合计`（不含「不计入日历」的支出）。
+/// 某月每个收入计划进账多少：`book_id -> 收入合计`。
+///
+/// 与 [`month_income`] 同口径：`excluded` 只影响支出（日历、开销计划），
+/// 不影响收入，所以这里不过滤「不计入」。
+pub fn income_by_plan(month: NaiveDate, bills: &[BillEntity]) -> HashMap<BookId, AmountType> {
+    let mut by_plan: HashMap<BookId, AmountType> = HashMap::new();
+    for bill in bills {
+        if bill.kind != BillKind::Income {
+            continue;
+        }
+        let date = bill.created_at.date_naive();
+        if date.year() != month.year() || date.month() != month.month() {
+            continue;
+        }
+        *by_plan.entry(bill.book.id).or_insert(0) += bill.amount;
+    }
+    by_plan
+}
+
+/// 某月每个开销计划花了多少：`book_id -> 支出合计`（不含「不计入日历」的支出）。
 pub fn expense_by_plan(month: NaiveDate, bills: &[BillEntity]) -> HashMap<BookId, AmountType> {
     let mut by_plan: HashMap<BookId, AmountType> = HashMap::new();
     for bill in bills {
@@ -318,12 +335,21 @@ mod tests {
     }
 
     fn plan(name: &str, limit: Option<AmountType>) -> Plan {
+        plan_of(name, limit, PlanKind::Expense)
+    }
+
+    fn income_plan(name: &str, limit: Option<AmountType>) -> Plan {
+        plan_of(name, limit, PlanKind::Income)
+    }
+
+    fn plan_of(name: &str, limit: Option<AmountType>, kind: PlanKind) -> Plan {
         Plan::new(
             BillBook {
                 id: 1,
                 name: name.to_string(),
             },
             limit,
+            kind,
         )
     }
 
@@ -375,9 +401,11 @@ mod tests {
     }
 
     #[test]
-    fn total_limit_only_counts_capped_plans() {
+    fn total_limit_only_counts_capped_expense_plans() {
         let rows = [
             PlanRow::new(plan("房租", Some(3000_00)), 0),
+            // 收入计划的目标不占日历额度
+            PlanRow::new(income_plan("工资", Some(8000_00)), 0),
             PlanRow::new(plan("零花", None), 500_00),
         ];
         assert_eq!(total_limit(&rows), 3000_00);
@@ -487,6 +515,40 @@ mod tests {
         income.kind = BillKind::Income;
         let bills = vec![income, bill(6, 100_00, 1, false)];
         assert_eq!(month_income(month(), &bills), 500_00);
+    }
+
+    #[test]
+    fn income_by_plan_sums_income_bills_even_when_excluded() {
+        let mut salary = bill(1, 800_00, 2, false);
+        salary.kind = BillKind::Income;
+        // 收入口径不看「不计入」：走账的奖金也照样算进这个月的收入
+        let mut bonus = bill(2, 200_00, 2, true);
+        bonus.kind = BillKind::Income;
+        let bills = vec![salary, bonus, bill(3, 99_00, 2, false)];
+
+        let by_plan = income_by_plan(month(), &bills);
+        assert_eq!(by_plan.get(&2).copied(), Some(1000_00));
+        assert_eq!(by_plan.get(&1).copied(), None);
+
+        let other = NaiveDate::from_ymd_opt(2026, 9, 1).expect("合法月份");
+        assert!(income_by_plan(other, &bills).is_empty());
+    }
+
+    #[test]
+    fn describe_limit_speaks_the_language_of_each_kind() {
+        assert_eq!(plan("房租", Some(3000_00)).describe_limit(), "每月 3,000.00 元");
+        assert_eq!(
+            plan("零花", None).describe_limit(),
+            "不设上限，只从 0 开始累计"
+        );
+        assert_eq!(
+            income_plan("工资", Some(8000_00)).describe_limit(),
+            "每月目标 8,000.00 元"
+        );
+        assert_eq!(
+            income_plan("外快", None).describe_limit(),
+            "不设目标，只累计入账"
+        );
     }
 
     #[test]

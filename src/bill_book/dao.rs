@@ -3,7 +3,7 @@
 use crate::common::db::Pool;
 use anyhow::Result;
 
-use crate::bill_book::model::{BillBook, Plan};
+use crate::bill_book::model::{BillBook, Plan, PlanKind};
 use crate::common::types::BookId;
 
 #[derive(sqlx::FromRow)]
@@ -11,6 +11,7 @@ struct BookRow {
     id: i64,
     name: String,
     plan_limit: Option<i64>,
+    plan_kind: String,
 }
 
 impl From<BookRow> for BillBook {
@@ -30,6 +31,7 @@ impl From<BookRow> for Plan {
                 name: row.name,
             },
             limit: row.plan_limit,
+            kind: PlanKind::from_code(&row.plan_kind),
         }
     }
 }
@@ -44,14 +46,15 @@ impl BookDao {
         Self { pool }
     }
 
-    pub async fn insert(&self, name: &str, limit: Option<i64>) -> Result<BookId> {
+    pub async fn insert(&self, name: &str, limit: Option<i64>, kind: PlanKind) -> Result<BookId> {
         let (id,): (i64,) = sqlx::query_as(
-            &self
-                .pool
-                .shared("INSERT INTO bill_books (name, plan_limit) VALUES (?, ?) RETURNING id"),
+            &self.pool.shared(
+                "INSERT INTO bill_books (name, plan_limit, plan_kind) VALUES (?, ?, ?) RETURNING id",
+            ),
         )
         .bind(name)
         .bind(limit)
+        .bind(kind.code())
         .fetch_one(self.pool.any())
         .await?;
         Ok(id as BookId)
@@ -61,7 +64,7 @@ impl BookDao {
         let rows = sqlx::query_as::<_, BookRow>(
             &self
                 .pool
-                .shared("SELECT id, name, plan_limit FROM bill_books ORDER BY id"),
+                .shared("SELECT id, name, plan_limit, plan_kind FROM bill_books ORDER BY id"),
         )
         .fetch_all(self.pool.any())
         .await?;
@@ -73,7 +76,7 @@ impl BookDao {
         let rows = sqlx::query_as::<_, BookRow>(
             &self
                 .pool
-                .shared("SELECT id, name, plan_limit FROM bill_books ORDER BY id"),
+                .shared("SELECT id, name, plan_limit, plan_kind FROM bill_books ORDER BY id"),
         )
         .fetch_all(self.pool.any())
         .await?;
@@ -84,7 +87,7 @@ impl BookDao {
         let row = sqlx::query_as::<_, BookRow>(
             &self
                 .pool
-                .shared("SELECT id, name, plan_limit FROM bill_books WHERE id = ?"),
+                .shared("SELECT id, name, plan_limit, plan_kind FROM bill_books WHERE id = ?"),
         )
         .bind(id as i64)
         .fetch_optional(self.pool.any())
@@ -96,7 +99,7 @@ impl BookDao {
         let row = sqlx::query_as::<_, BookRow>(
             &self
                 .pool
-                .shared("SELECT id, name, plan_limit FROM bill_books WHERE name = ?"),
+                .shared("SELECT id, name, plan_limit, plan_kind FROM bill_books WHERE name = ?"),
         )
         .bind(name)
         .fetch_optional(self.pool.any())
@@ -112,6 +115,20 @@ impl BookDao {
                 .shared("UPDATE bill_books SET plan_limit = ? WHERE id = ?"),
         )
         .bind(limit)
+        .bind(id as i64)
+        .execute(self.pool.any())
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// 改类型（收入 / 开销）；返回受影响行数。
+    pub async fn set_kind(&self, id: BookId, kind: PlanKind) -> Result<u64> {
+        let result = sqlx::query(
+            &self
+                .pool
+                .shared("UPDATE bill_books SET plan_kind = ? WHERE id = ?"),
+        )
+        .bind(kind.code())
         .bind(id as i64)
         .execute(self.pool.any())
         .await?;

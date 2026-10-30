@@ -4,7 +4,7 @@ use crate::common::db::Pool;
 use anyhow::{Context, Result, bail};
 
 use crate::bill_book::dao::BookDao;
-use crate::bill_book::model::{BillBook, Plan};
+use crate::bill_book::model::{BillBook, Plan, PlanKind};
 use crate::common::db;
 use crate::common::types::BookId;
 
@@ -20,15 +20,23 @@ impl BookService {
         }
     }
 
-    /// 新增计划（账本）；重名时报错。`limit = None` 表示从 0 开始记录、不设上限。
-    pub async fn add(&self, name: &str, limit: Option<crate::common::types::AmountType>) -> Result<BillBook> {
+    /// 新增计划（账本）；重名时报错。
+    ///
+    /// `limit = None` 表示从 0 开始记录、不设上限（收入计划则是「不设目标」）；
+    /// `kind` 决定它是收入计划还是开销计划。
+    pub async fn add(
+        &self,
+        name: &str,
+        limit: Option<crate::common::types::AmountType>,
+        kind: PlanKind,
+    ) -> Result<BillBook> {
         let name = normalize(name)?;
         if self.dao.find_by_name(name).await?.is_some() {
             bail!("账本「{name}」已存在");
         }
         let id = self
             .dao
-            .insert(name, limit)
+            .insert(name, limit, kind)
             .await
             .map_err(|error| db::describe(error, &format!("账本「{name}」已存在")))?;
         Ok(BillBook {
@@ -59,6 +67,15 @@ impl BookService {
         Ok(())
     }
 
+    /// 改计划类型（收入 / 开销）。
+    pub async fn set_kind(&self, id: BookId, kind: PlanKind) -> Result<()> {
+        let affected = self.dao.set_kind(id, kind).await?;
+        if affected == 0 {
+            bail!("计划 id={id} 不存在");
+        }
+        Ok(())
+    }
+
     /// 按名称查找，不存在则报错。
     pub async fn resolve(&self, name: &str) -> Result<BillBook> {
         let name = normalize(name)?;
@@ -74,7 +91,10 @@ impl BookService {
         match self.dao.find_by_name(name).await? {
             Some(book) => Ok((book, false)),
             None => {
-                let id = self.dao.insert(name, None).await?;
+                let id = self
+                    .dao
+                    .insert(name, None, PlanKind::Expense)
+                    .await?;
                 Ok((
                     BillBook {
                         id,

@@ -11,8 +11,10 @@
 CREATE TABLE IF NOT EXISTS bill_books (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     name       TEXT NOT NULL UNIQUE,
-    -- 计划的上限（分）。NULL = 不设上限：这个计划只从 0 开始累计
-    plan_limit INTEGER
+    -- 计划的额度（分）。NULL = 不设额度：这个计划只从 0 开始累计
+    plan_limit INTEGER,
+    -- 计划类型：income = 收入计划（如工资），expense = 开销计划（如房租）
+    plan_kind  TEXT NOT NULL DEFAULT 'expense'
 );
 
 CREATE TABLE IF NOT EXISTS categories (

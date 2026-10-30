@@ -13,16 +13,14 @@ use crate::bank::model::BankTransaction;
 use crate::bank::service::{BankService, Suggestion, SyncKind};
 use crate::bill::model::{BillEntity, BillKind};
 use crate::bill::service::{BillQuery, DEFAULT_BOOK, DEFAULT_CATEGORY, NewBill};
-use crate::bill_book::model::BillBook;
+use crate::bill_book::model::{BillBook, PlanKind};
 use crate::category::model::Category;
 use crate::category::service::{CategoryNode, descendants_of, subtree_of};
 use crate::common::db::ConnectionSettings;
 use crate::common::money;
 use crate::common::types::{AmountType, BookId, CategoryId};
 use crate::month::service::{MonthReport, YearReport};
-use crate::plan::model::{
-    PlanCoverage, PlanProgress, PlanRow, days_in_month, describe_limit,
-};
+use crate::plan::model::{PlanCoverage, PlanProgress, PlanRow, days_in_month};
 use crate::tui::Services;
 use crate::tui::input::Key;
 
@@ -322,7 +320,7 @@ pub struct BillPage {
 pub enum FormKind {
     NewBill,
     NewCategory,
-    /// 一个计划：名称 + 可选上限（计划页）。
+    /// 一个计划：名称 + 类型（收入 / 开销）+ 可选额度（计划页）。
     PlanItem,
     /// 设置某月起始金额（概览页）。
     SetStartBalance,
@@ -337,8 +335,8 @@ pub enum FormKind {
 pub enum EditTarget {
     Bill(u64),
     Category(u64),
-    /// 计划列表里的第 index 个（位置即展示顺序）。
-    PlanItem(usize),
+    /// 某个计划账本（按 id 定位——计划页展示顺序是「先收入后开销」，和库里的 id 顺序不同）。
+    PlanItem(BookId),
     /// 某月的起始金额（携带该月）。
     MonthBalance(NaiveDate),
 }
@@ -505,18 +503,25 @@ impl Form {
 
     /// 计划页新建 / 改一个计划。
     ///
-    /// `index` 为 `None` 时是新建；为 `Some` 时预填该计划的名称与上限，
-    /// 提交后按位置找回来——位置就是计划列表的展示顺序。
+    /// `index` 为 `None` 时是新建；为 `Some` 时预填该计划的名称、类型与额度。
+    /// 提交后按账本 id 找回原记录——计划页的顺序是「先收入后开销」，
+    /// 位置和库里的 id 顺序对不上，按位置找会改错人。
     ///
-    /// 「上限」留空 = 不设上限：这种计划只从 0 开始累计花了多少，不判超支。
+    /// 「额度」留空 = 不设额度：开销计划只从 0 开始累计花了多少，不判超支；
+    /// 收入计划则是只累计入账、不判达标。
     /// 账单记在哪个计划，就等于归到哪个计划——不再有「绑分类」这层映射。
     pub fn plan_item(rows: &[PlanRow], index: Option<usize>) -> Self {
         let mut form = Self {
             kind: FormKind::PlanItem,
             title: "新建计划",
             fields: vec![
-                Field::text("名称", "", "例如 房租 / 吃饭 / 零花"),
-                Field::text("上限", "", "每月额度（元）；留空就是不设上限"),
+                Field::text("名称", "", "例如 房租 / 吃饭 / 工资"),
+                Field::choice(
+                    "类型",
+                    vec!["开销".to_string(), "收入".to_string()],
+                    "←/→ 或空格切换：开销看上限，收入看目标",
+                ),
+                Field::text("额度", "", "每月额度（元）；留空就是不设额度 / 目标"),
             ],
             focus: 0,
             target: None,
@@ -526,15 +531,21 @@ impl Form {
             && let Some(row) = rows.get(index)
         {
             form.title = "编辑计划";
-            form.target = Some(EditTarget::PlanItem(index));
+            form.target = Some(EditTarget::PlanItem(row.plan.id()));
             form.fields[0].value = row.name().to_string();
-            form.fields[1].value = row
+            form.fields[1] = Field::choice_with(
+                "类型",
+                vec!["开销".to_string(), "收入".to_string()],
+                row.plan.kind.label().to_string(),
+                "←/→ 或空格切换：开销看上限，收入看目标",
+            );
+            form.fields[2].value = row
                 .plan
                 .limit
                 .map(money::format_amount)
                 .unwrap_or_default();
-            // 名称/上限都可能改，但上限改动最多：焦点落在上限上
-            form.focus = 1;
+            // 名称/额度都可能改，但额度改动最多：焦点落在额度上
+            form.focus = 2;
         }
         form
     }
@@ -775,7 +786,7 @@ pub struct App {
     pub settings_focus: SettingsFocus,
     /// 三个分区各自的选中行。
     settings_selected: [usize; SettingsSection::ALL.len()],
-    /// 所有计划（账本 + 可选上限）在本月的执行情况，`reload` 时算一次。
+    /// 所有计划（账本 + 可选额度）在本月的执行情况，`reload` 时算一次。
     pub plans: Vec<PlanRow>,
     /// 当月额度与日历配色，在 `reload` 时算一次。
     pub progress: Option<PlanProgress>,
@@ -1354,13 +1365,12 @@ impl App {
         self.modal = Some(Modal::Form(form));
     }
 
-    /// 记完一笔后：回概览，并停在刚记的那一天上。
+    /// 记完一笔后的收尾：留在当前页签，只把概览页的选中日期挪到刚记的那一天。
     ///
-    /// 「高亮新行」在 TUI 里靠日历格子配色体现——把选中日期挪到那笔账的日子，
-    /// 人一眼就能看到它是插进哪一格的（跨月的账不挪，免得月份跳来跳去）。
-    fn land_on_new_bill(&mut self) {
-        self.page = Page::Overview;
-
+    /// 页签**不动**：人在账单页连着记几笔时，不该记一笔就被踹回概览。
+    /// 「高亮新行」在概览里靠日历格子配色体现——选中日期就是那笔账的日子，
+    /// 人回到概览一眼就能看到它是插进哪一格的（跨月的账不挪，免得月份跳来跳去）。
+    fn focus_new_bill_day(&mut self) {
         let latest = self
             .bills
             .iter()
@@ -1520,7 +1530,7 @@ impl App {
                     format!(
                         "确定要删除计划「{}」（{}）吗？此操作不可撤销。",
                         row.name(),
-                        describe_limit(row.plan.limit)
+                        row.plan.describe_limit()
                     ),
                     Action::DeletePlanItem(self.selected_index(Page::Plan)),
                 )
@@ -2038,7 +2048,7 @@ impl App {
                 }
             }
             Action::SubmitForm(form) => {
-                // 顺手记的一笔：存完回概览，省得人自己再按一下
+                // 顺手记的一笔：存完留在当前页签，只把概览的选中日期挪到刚记的那天
                 let quick_entry = form.kind == FormKind::NewBill && self.pending_sync.is_empty();
 
                 if !self.pending_sync.is_empty() && form.kind == FormKind::NewBill {
@@ -2051,7 +2061,7 @@ impl App {
                 self.reload(services).await?;
 
                 if quick_entry {
-                    self.land_on_new_bill();
+                    self.focus_new_bill_day();
                 }
             }
             Action::DeleteBill(id) => {
@@ -2387,38 +2397,37 @@ async fn submit(form: Form, services: &Services) -> Result<String> {
                 money::format_amount(amount)
             ))
         }
-        (FormKind::PlanItem, Some(EditTarget::PlanItem(index))) => {
+        (FormKind::PlanItem, Some(EditTarget::PlanItem(id))) => {
             let name = plan_name(&form)?;
             let limit = plan_limit_from_form(&form)?;
+            let kind = plan_kind_from_form(&form);
 
-            let current = services
-                .plans
-                .list()
-                .await?
-                .get(index)
-                .map(|plan| plan.name().to_string())
-                .ok_or_else(|| anyhow!("这个计划已经不在列表里了"))?;
-
-            if current != name {
-                services.plans.rename(&current, &name).await?;
+            // 按 id 取原记录：列表顺序是「先收入后开销」，与库里顺序不同，不能按位置找
+            let current = services.plans.by_id(id).await?;
+            if current.name() != name {
+                services.plans.rename(current.name(), &name).await?;
             }
-            let plan = services.plans.set_limit(&name, limit).await?;
+            services.plans.set_limit(&name, limit).await?;
+            let plan = services.plans.set_kind(&name, kind).await?;
 
             Ok(format!(
-                "计划「{}」已改为 {}",
+                "计划「{}」已改为{}计划 · {}",
                 plan.name(),
-                describe_limit(plan.limit)
+                plan.kind.label(),
+                plan.describe_limit()
             ))
         }
         (FormKind::PlanItem, None) => {
             let name = plan_name(&form)?;
             let limit = plan_limit_from_form(&form)?;
-            let plan = services.plans.add(&name, limit).await?;
+            let kind = plan_kind_from_form(&form);
+            let plan = services.plans.add(&name, limit, kind).await?;
 
             Ok(format!(
-                "已新增计划「{}」{}",
+                "已新增{}计划「{}」 · {}",
+                plan.kind.label(),
                 plan.name(),
-                describe_limit(plan.limit)
+                plan.describe_limit()
             ))
         }
         (FormKind::NewBill, None) => {
@@ -2508,9 +2517,17 @@ fn plan_name(form: &Form) -> Result<String> {
     Ok(name.to_string())
 }
 
-/// 计划上限：留空就是不设上限。和账单金额一样支持算式。
+/// 计划类型：表单里选的是「开销 / 收入」，落库用 `PlanKind`。
+fn plan_kind_from_form(form: &Form) -> PlanKind {
+    match form.value("类型") {
+        "收入" => PlanKind::Income,
+        _ => PlanKind::Expense,
+    }
+}
+
+/// 计划额度：留空就是不设额度。和账单金额一样支持算式。
 fn plan_limit_from_form(form: &Form) -> Result<Option<AmountType>> {
-    let raw = form.value("上限");
+    let raw = form.value("额度");
     if raw.trim().is_empty() {
         return Ok(None);
     }
@@ -2521,7 +2538,7 @@ fn plan_limit_from_form(form: &Form) -> Result<Option<AmountType>> {
     };
     let amount = money::parse_amount(&text).map_err(|error| anyhow!("{error}"))?;
     if amount <= 0 {
-        bail!("上限要大于 0；不想设上限就把「上限」留空");
+        bail!("额度要大于 0；不想设额度就把「额度」留空");
     }
     Ok(Some(amount))
 }
@@ -2652,14 +2669,14 @@ mod tests {
 
     use super::*;
     use crate::month::model::BillMonthCollection;
-    use crate::bill_book::model::Plan;
+    use crate::bill_book::model::{Plan, PlanKind};
     use crate::plan::model::PlanRow;
 
     /// 测试用连接串：各字段值都便于断言。
     const TEST_CONNECTION_URL: &str = "postgres://postgres:postgres@127.0.0.1:5432/biller";
     const TEST_SQLITE_PATH: &str = "C:/Users/test/.biller/biller.db";
 
-    /// 造一个计划：测试里只关心名字和上限，账本 id 随便给。
+    /// 造一个计划：测试里只关心名字和额度，账本 id 随便给。
     fn plan_row(name: &str, limit: Option<AmountType>) -> Plan {
         Plan::new(
             BillBook {
@@ -2667,6 +2684,7 @@ mod tests {
                 name: name.into(),
             },
             limit,
+            PlanKind::Expense,
         )
     }
 
@@ -2953,21 +2971,29 @@ mod tests {
     }
 
     #[test]
-    fn quick_entry_lands_back_on_overview() {
-        let mut app = sample_app();
-        app.page = Page::Bills;
-        app.selected_day = 1;
-        let bill = sample_bill(9, 1234);
-        let day = bill.created_at.date_naive().day() as u32;
-        app.bills = vec![bill];
+    fn quick_entry_stays_on_current_page() {
+        // 四个页签都能记一笔：记完原地不动，只把概览的选中日期挪到新账单那天
+        for page in Page::ALL {
+            let mut app = sample_app();
+            app.page = page;
+            app.selected_day = 1;
+            let mut bill = sample_bill(9, 1234);
+            // 固定日期，别让断言跟着系统时间漂
+            bill.created_at = NaiveDate::from_ymd_opt(2026, 10, 12)
+                .unwrap()
+                .and_hms_opt(12, 0, 0)
+                .unwrap()
+                .and_utc();
+            app.bills = vec![bill];
 
-        app.land_on_new_bill();
+            app.focus_new_bill_day();
 
-        assert_eq!(app.page, Page::Overview, "记完一笔应回到概览");
-        assert_eq!(
-            app.selected_day, day,
-            "选中的日期应挪到刚记的那一天，日历上就能看到它"
-        );
+            assert_eq!(app.page, page, "记完一笔应留在当前页签「{}」", page.title());
+            assert_eq!(
+                app.selected_day, 12,
+                "概览的选中日期应挪到刚记的那一天，日历上就能看到它"
+            );
+        }
     }
 
     #[test]
@@ -2978,9 +3004,9 @@ mod tests {
         app.bills = vec![];
         app.month = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
 
-        app.land_on_new_bill();
+        app.focus_new_bill_day();
 
-        assert_eq!(app.page, Page::Overview);
+        assert_eq!(app.page, Page::Bills, "跨月的账也不该换页签");
         assert_eq!(app.selected_day, 3, "查不到本月的账时不动选中日期");
     }
 
@@ -3999,8 +4025,10 @@ mod tests {
                 assert_eq!(form.kind, FormKind::PlanItem);
                 assert_eq!(form.title, "编辑计划");
                 assert_eq!(form.value("名称"), "存款");
-                // 没上限的计划，上限字段留空——留空就是不设上限
-                assert_eq!(form.value("上限"), "");
+                // 没额度的计划，额度字段留空——留空就是不设额度
+                assert_eq!(form.value("额度"), "");
+                assert_eq!(form.value("类型"), "开销");
+                // 编辑目标是账本 id（plan_row 造的这条 id 是 1），不是列表下标
                 assert_eq!(form.target, Some(EditTarget::PlanItem(1)));
             }
             other => panic!("计划页按 e 应打开编辑计划，实际 {other:?}"),
@@ -4149,14 +4177,18 @@ mod tests {
     }
 
     #[test]
-    fn plan_form_asks_name_then_limit() {
+    fn plan_form_asks_name_then_kind_then_limit() {
         let form = Form::plan_item(&[], None);
 
         assert_eq!(form.fields[0].label, "名称");
-        assert_eq!(form.fields[1].label, "上限");
-        assert!(!form.fields[1].is_choice(), "上限是手填，不是选项");
-        assert_eq!(form.value("上限"), "", "新建时上限留空");
-        assert_eq!(plan_limit_from_form(&form).unwrap(), None, "留空就是不设上限");
+        assert_eq!(form.fields[1].label, "类型");
+        assert!(form.fields[1].is_choice(), "类型是选项：开销 / 收入");
+        assert_eq!(form.value("类型"), "开销", "新建默认开销计划");
+        assert_eq!(form.fields[2].label, "额度");
+        assert!(!form.fields[2].is_choice(), "额度是手填，不是选项");
+        assert_eq!(form.value("额度"), "", "新建时额度留空");
+        assert_eq!(plan_limit_from_form(&form).unwrap(), None, "留空就是不设额度");
+        assert_eq!(plan_kind_from_form(&form), PlanKind::Expense);
     }
 
     #[test]
@@ -4168,12 +4200,33 @@ mod tests {
 
         let form = Form::plan_item(&rows, Some(0));
         assert_eq!(form.value("名称"), "吃喝");
-        assert_eq!(form.value("上限"), "30.00");
-        assert_eq!(form.focus, 1, "编辑时焦点落在上限上");
+        assert_eq!(form.value("类型"), "开销");
+        assert_eq!(form.value("额度"), "30.00");
+        assert_eq!(form.focus, 2, "编辑时焦点落在额度上");
 
         let mut empty = Form::plan_item(&rows, Some(1));
-        empty.fields[1].value.clear();
+        empty.fields[2].value.clear();
         assert_eq!(plan_limit_from_form(&empty).unwrap(), None);
+    }
+
+    #[test]
+    fn plan_form_prefills_an_income_plan_as_income() {
+        let income = PlanRow::new(
+            Plan::new(
+                BillBook {
+                    id: 9,
+                    name: "工资".into(),
+                },
+                Some(8_000_00),
+                PlanKind::Income,
+            ),
+            6_000_00,
+        );
+
+        let form = Form::plan_item(&[income], Some(0));
+        assert_eq!(form.value("类型"), "收入", "收入计划打开就是收入，不要回落到默认");
+        assert_eq!(form.value("额度"), "8,000.00");
+        assert_eq!(plan_kind_from_form(&form), PlanKind::Income);
     }
 
     #[test]
@@ -4182,17 +4235,17 @@ mod tests {
         assert!(plan_name(&form).is_err(), "计划名不能为空");
 
         form.fields[0].value = "房租".to_string();
-        form.fields[1].value = "0".to_string();
+        form.fields[2].value = "0".to_string();
         assert!(
             plan_limit_from_form(&form).is_err(),
-            "上限 0 要报错，想不设上限就留空"
+            "额度 0 要报错，想不设额度就留空"
         );
 
-        form.fields[1].value = "3000 - 500".to_string();
+        form.fields[2].value = "3000 - 500".to_string();
         assert_eq!(
             plan_limit_from_form(&form).unwrap(),
             Some(2_500_00),
-            "上限也支持算式"
+            "额度也支持算式"
         );
     }
 }

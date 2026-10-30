@@ -26,7 +26,8 @@ use crate::common::table::{display_width, pad_right};
 use crate::common::types::AmountType;
 use crate::common::{money, time};
 use crate::month::service::MonthReport;
-use crate::plan::model::{DayStatus, total_limit};
+use crate::bill_book::model::PlanKind;
+use crate::plan::model::{DayStatus, PlanRow, total_limit};
 use crate::tui::app::{App, Form, Modal, Page, ReportTab, SettingsFocus, SettingsSection};
 
 // ---------------------------------------------------------------------------
@@ -47,6 +48,10 @@ const TEXT: Color = Color::Reset;
 const MUTED: Color = Color::Rgb(86, 95, 137);
 /// 非焦点面板边框。
 const BORDER: Color = Color::Rgb(59, 66, 97);
+/// 选中行 / 选中格的底色：深蓝。亮底配浅字最容易糊，所以选中态要压暗。
+const SELECT_BG: Color = Color::Rgb(45, 58, 92);
+/// 选中行 / 选中格的字色：近白，压得住深蓝底。
+const SELECT_FG: Color = Color::Rgb(226, 233, 255);
 
 /// 面板左右内边距（列）。
 const PAD: u16 = 1;
@@ -413,8 +418,8 @@ fn render_report_switcher(frame: &mut Frame, area: Rect, app: &App) {
         }
         let style = if tab == app.report_tab {
             Style::default()
-                .fg(Color::Black)
-                .bg(ACCENT)
+                .fg(SELECT_FG)
+                .bg(SELECT_BG)
                 .add_modifier(Modifier::BOLD)
         } else {
             muted()
@@ -459,8 +464,8 @@ fn render_settings_menu(frame: &mut Frame, area: Rect, app: &App) {
         let text = pad_right(&format!("{marker}{}", section.title()), inner);
         let style = if current && menu_focused {
             Style::default()
-                .fg(Color::Black)
-                .bg(ACCENT)
+                .fg(SELECT_FG)
+                .bg(SELECT_BG)
                 .add_modifier(Modifier::BOLD)
         } else if current {
             bold(ACCENT)
@@ -700,14 +705,14 @@ fn render_settings_actions(frame: &mut Frame, area: Rect, app: &App) {
 // 概览
 // ---------------------------------------------------------------------------
 
-/// 概览：本月一块大字条 → 支出日历 | 今日 + 最近动账。
+/// 概览：本月一块大字条 → 支出日历 | 今日 + 当日动账。
 ///
 /// 一屏只回答一个问题：「这个月我还剩多少能花」。日 / 月的细节各自只出现一次，
 /// 键位统一交给底栏和 `?`，页内不再重复。
 fn render_overview(frame: &mut Frame, area: Rect, app: &App) {
     let rows = Layout::vertical([
         Constraint::Length(4), // 本月：已花 / 额度 / 还剩 + 用量条
-        Constraint::Min(8),    // 日历 | 今日 + 最近动账
+        Constraint::Min(8),    // 日历 | 今日 + 当日动账
     ])
     .split(area);
 
@@ -812,36 +817,69 @@ fn render_month_bar(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 
-/// 最近动账：按「日期 + 星期」分组，每天一行小计 + 最多两条明细。
+/// 当日动账：只列 `↑` `↓` 选中的那一天（和「今日」面板同一个日子），
+/// 标题带笔数；面板放不下时最后一行交代还剩几笔，不让人以为只有这么多。
 fn render_recent_bills(frame: &mut Frame, area: Rect, app: &App) {
-    let block = block_with_title(false, "最近动账");
-    let inner = block.inner(area);
-    let width = inner.width as usize;
-
+    // 本月一笔都没有时，「换一天」没有意义，先把记账入口亮出来
     if app.bills.is_empty() {
         render_placeholder(
             frame,
             area,
-            block,
+            block_with_title(false, "当日动账"),
             "本月还没有账单",
             "按 a 记一笔 · [ ] 换个月",
         );
         return;
     }
 
+    let day = app.inspected_day();
+    let date = chrono::NaiveDate::from_ymd_opt(app.month.year(), app.month.month(), day);
+    let bills: Vec<&BillEntity> = match date {
+        Some(date) => app
+            .bills
+            .iter()
+            .filter(|bill| bill.created_at.date_naive() == date)
+            .collect(),
+        None => Vec::new(),
+    };
+
+    if bills.is_empty() {
+        render_placeholder(
+            frame,
+            area,
+            block_with_title(false, "当日动账"),
+            "这一天没有账单",
+            "按 a 记一笔 · ↑ ↓ 换一天",
+        );
+        return;
+    }
+
+    let block = block_with_title(false, format!("当日动账 · {} 笔", bills.len()));
+    let inner = block.inner(area);
     let capacity = inner.height as usize;
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    for (date, group) in bills_by_day(&app.bills) {
-        if lines.len() + 1 > capacity {
-            break;
-        }
-        lines.push(day_header_line(date, &group));
-        for bill in group.iter().take(2) {
-            if lines.len() + 1 > capacity {
-                break;
-            }
-            lines.push(compact_bill_line(bill, width));
-        }
+    if capacity == 0 {
+        frame.render_widget(block, area);
+        return;
+    }
+    let width = inner.width as usize;
+
+    // 溢出一行给「还有 N 笔」，别让列表被硬裁后看着像全貌
+    let hidden = bills.len().saturating_sub(capacity);
+    let shown = if hidden > 0 {
+        capacity - 1
+    } else {
+        bills.len()
+    };
+    let mut lines: Vec<Line<'static>> = bills
+        .iter()
+        .take(shown)
+        .map(|bill| compact_bill_line(bill, width))
+        .collect();
+    if hidden > 0 {
+        lines.push(Line::from(Span::styled(
+            format!("还有 {} 笔没放下 · 去账单页看全", hidden),
+            muted(),
+        )));
     }
 
     frame.render_widget(Paragraph::new(lines).block(block), area);
@@ -1024,10 +1062,10 @@ fn calendar_cell(day: u32, status: DayStatus, selected: bool, cell: usize) -> Sp
     let text = pad_left(&format!("{day:>2}"), cell);
 
     let style = if selected {
-        // 选中的那天整格反色：和表格选中行同一套视觉语言
+        // 选中的那天整格反色：和表格选中行同一套视觉语言（深底亮字）
         Style::default()
-            .fg(Color::Black)
-            .bg(ACCENT)
+            .fg(SELECT_FG)
+            .bg(SELECT_BG)
             .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
     } else if spent {
         Style::default().fg(color).add_modifier(Modifier::BOLD)
@@ -1042,16 +1080,16 @@ fn calendar_cell(day: u32, status: DayStatus, selected: bool, cell: usize) -> Sp
 // 计划
 // ---------------------------------------------------------------------------
 
-/// 计划：左边是全部计划，右边给出「额度合计 vs 收入」的覆盖结论。
+/// 计划：左边是全部计划（收入在上、开销在下），右边给出「额度合计 vs 收入」的覆盖结论。
 ///
-/// 计划 = 一个名字 + 可选上限：账单记在哪个计划名下，那个计划的「已花」就自动涨。
-/// 有上限的判超支，没上限的只从 0 开始累计——两种都在这张表里，不再分两套概念。
+/// 收入计划管「这个月该进来多少」，开销计划管「这些钱怎么分出去」——
+/// 分开看才看得懂钱的来路和去向；两个框的高度按各自行数伸缩，数据多的那块占得更高。
 fn render_plan(frame: &mut Frame, area: Rect, app: &App) {
     let count = app.plans.len();
     let total = total_limit(&app.plans);
     let title = if total > 0 {
         format!(
-            "计划 · 共 {} 个 · 额度合计 {}",
+            "计划 · 共 {} 个 · 开销额度 {}",
             count,
             money::format_amount(total)
         )
@@ -1065,50 +1103,173 @@ fn render_plan(frame: &mut Frame, area: Rect, app: &App) {
             area,
             block_with_title(true, title),
             "还没有计划",
-            "按 a 新建一个 · 想控预算就填上限，只想记花销就留空",
+            "按 a 新建一个 · 收入填目标，开销填上限，留空就只累计",
         );
         return;
     }
 
-    // 宽屏左右分栏（列表 | 校验），窄屏上下叠：先看计划，再看够不够
-    if area.width >= 96 {
+    let income: Vec<&PlanRow> = app
+        .plans
+        .iter()
+        .filter(|row| row.plan.kind == PlanKind::Income)
+        .collect();
+    let expense: Vec<&PlanRow> = app
+        .plans
+        .iter()
+        .filter(|row| row.plan.kind == PlanKind::Expense)
+        .collect();
+    let selected = app.selected_index(Page::Plan);
+
+    // 宽屏左右分栏（两块计划 | 校验），窄屏上下叠：先看计划，再看够不够
+    let (list_area, check_area) = if area.width >= 96 {
         let columns = Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)])
             .split(area);
-        render_plan_list(frame, columns[0], app, title);
-        render_plan_check(frame, columns[1], app);
+        (columns[0], columns[1])
     } else {
-        let rows = Layout::vertical([Constraint::Min(6), Constraint::Length(7)]).split(area);
-        render_plan_list(frame, rows[0], app, title);
-        render_plan_check(frame, rows[1], app);
-    }
+        let rows = Layout::vertical([Constraint::Min(8), Constraint::Length(7)]).split(area);
+        (rows[0], rows[1])
+    };
+
+    let (income_height, expense_height) =
+        plan_group_heights(income.len(), expense.len(), list_area.height);
+    let boxes = Layout::vertical([
+        Constraint::Length(income_height),
+        Constraint::Length(expense_height),
+    ])
+    .split(list_area);
+
+    render_plan_group(
+        frame,
+        boxes[0],
+        app,
+        &income,
+        0,
+        PlanKind::Income,
+        selected < income.len(),
+    );
+    render_plan_group(
+        frame,
+        boxes[1],
+        app,
+        &expense,
+        income.len(),
+        PlanKind::Expense,
+        selected >= income.len(),
+    );
+    render_plan_check(frame, check_area, app);
 }
 
-/// 计划列表：名称 / 上限 / 已花 / 剩余 / 用量，选中行高亮，底部给位置与操作提示。
+/// 两个计划框各分多高：先按各自行数给足（空框保底 4 行：边框 ×2 + 表头 + 提示），
+/// 多出来的高度按行数分给两边（只有一边有数据就全给它）；空间不够就按需求比例分，每框至少 4 行。
 ///
-/// 没上限的计划「上限」列写 `不限`、「剩余」列写 `—`：没有额度就没有「还剩多少」这件事，
-/// 显示 0 会让人以为额度用光了。
-fn render_plan_list(frame: &mut Frame, area: Rect, app: &App, title: String) {
+/// 「按数据量动」的具体含义：行多的一块永远比行少的一块高，且空框不会跟着一起长高。
+fn plan_group_heights(income_rows: usize, expense_rows: usize, available: u16) -> (u16, u16) {
+    if available < 8 {
+        let half = available / 2;
+        return (half, available - half);
+    }
+
+    let need = |rows: usize| -> u32 {
+        if rows == 0 {
+            4
+        } else {
+            4 + rows.min(1000) as u32
+        }
+    };
+    let need_income = need(income_rows);
+    let need_expense = need(expense_rows);
+    let total_need = need_income + need_expense;
+
+    if total_need <= u32::from(available) {
+        let extra = u32::from(available) - total_need;
+        let income_rows = income_rows.min(1000) as u32;
+        let expense_rows = expense_rows.min(1000) as u32;
+        let extra_income = match (income_rows, expense_rows) {
+            (0, 0) => extra / 2,
+            (0, _) => 0,
+            (_, 0) => extra,
+            // 两边都有数据：富余高度按行数摊，行多的那块也拿得多
+            (income_rows, expense_rows) => extra * income_rows / (income_rows + expense_rows),
+        };
+        let income_height = (need_income + extra_income) as u16;
+        return (income_height, available - income_height);
+    }
+
+    let share = u32::from(available) * need_income / total_need;
+    let income_height = (share as u16).clamp(4, available - 4);
+    (income_height, available - income_height)
+}
+
+/// 一块计划表：收入看「目标 / 已入 / 差距」，开销看「上限 / 已花 / 剩余」。
+///
+/// `start` 是这块在全局 `app.plans` 里的起始下标：选中态要换算成本地行号，
+/// 而编辑/删除用的是全局下标，两边不能混。
+fn render_plan_group(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    rows: &[&PlanRow],
+    start: usize,
+    kind: PlanKind,
+    focused: bool,
+) {
+    let income = kind == PlanKind::Income;
+    let title = format!(
+        "{} · 共 {} 个",
+        if income { "收入计划" } else { "开销计划" },
+        rows.len()
+    );
+    let block = block_with_title(focused, title);
+
+    if rows.is_empty() {
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        if inner.height > 0 {
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    format!(
+                        "还没有{} · 按 a 新建，类型选「{}」",
+                        if income { "收入计划" } else { "开销计划" },
+                        if income { "收入" } else { "开销" }
+                    ),
+                    muted(),
+                ))),
+                inner,
+            );
+        }
+        return;
+    }
+
     let selected = app.selected_index(Page::Plan);
+    let local = if selected >= start && selected < start + rows.len() {
+        Some(selected - start)
+    } else {
+        None
+    };
     let width = area.width.saturating_sub(2) as usize;
     // 名称 8 + 三列金额 12×3 + 列间距 4，剩下给用量条
-    let bar_width = width.saturating_sub(8 + 12 * 3 + 4).clamp(MIN_BAR_WIDTH, 16);
+    let bar_width = width
+        .saturating_sub(8 + 12 * 3 + 4)
+        .clamp(MIN_BAR_WIDTH, 16);
 
-    let rows = app
-        .plans
+    let table_rows = rows
         .iter()
         .enumerate()
         .map(|(index, row)| {
-            let chosen = index == selected;
+            let chosen = local == Some(index);
             let limit = row.plan.limit.filter(|limit| *limit > 0);
             let limit_text = match limit {
                 Some(limit) => money::format_amount(limit),
+                None if income => "不设".to_string(),
                 None => "不限".to_string(),
             };
-            // 有上限：剩余可能为负 → 「超 X」；没上限：没有剩余这回事
-            let (remaining_text, remaining_style) = match (limit, row.remaining()) {
-                (Some(_), Some(rest)) if rest < 0 => {
-                    (format!("超 {}", money::format_amount(rest.abs())), BAD)
-                }
+            // 收入：差距为负 = 收得比目标多，是好事，绝不标红；开销：剩余为负 = 超支，才是红的
+            let (left_text, left_style) = match (limit, row.remaining()) {
+                (Some(_), Some(rest)) if rest < 0 => (
+                    format!("超 {}", money::format_amount(rest.abs())),
+                    if income { GOOD } else { BAD },
+                ),
+                (Some(_), Some(0)) if income => ("达标".to_string(), GOOD),
                 (Some(_), Some(rest)) => (money::format_amount(rest), GOOD),
                 _ => ("—".to_string(), MUTED),
             };
@@ -1116,47 +1277,56 @@ fn render_plan_list(frame: &mut Frame, area: Rect, app: &App, title: String) {
                 Some(limit) => share(row.spent, limit, bar_width).1,
                 None => BAR_EMPTY.repeat(bar_width),
             };
+            let bar_style = if income { GOOD } else { ACCENT };
 
-            let name_line = Line::from(Span::styled(row.name().to_string(), plain()));
-            let limit_line = Line::from(Span::styled(limit_text, bold(TEXT))).right_aligned();
-            let spent_line = Line::from(Span::styled(
-                money::format_amount(row.spent),
-                Style::default().fg(if row.over() { BAD } else { TEXT }),
-            ))
-            .right_aligned();
-            let remaining_line =
-                Line::from(Span::styled(remaining_text, Style::default().fg(remaining_style)))
-                    .right_aligned();
+            let name_text = row.name().to_string();
+            let spent_text = money::format_amount(row.spent);
 
             let cells = if chosen {
+                // 选中行一个前景色都不给：底色由行样式刷成深蓝，字由行样式刷成近白。
+                // 这里再给 Span 上色就会盖掉行样式，浅色的「上限 / 已花」压深底上正好糊成一片。
                 vec![
-                    Cell::from(name_line),
-                    Cell::from(limit_line),
-                    Cell::from(spent_line),
-                    Cell::from(remaining_line),
+                    Cell::from(name_text),
+                    Cell::from(Line::from(limit_text).right_aligned()),
+                    Cell::from(Line::from(spent_text).right_aligned()),
+                    Cell::from(Line::from(left_text).right_aligned()),
                     Cell::from(bar),
                 ]
             } else {
                 vec![
-                    Cell::from(name_line),
-                    Cell::from(limit_line),
-                    Cell::from(spent_line),
-                    Cell::from(remaining_line),
-                    Cell::from(Span::styled(bar, Style::default().fg(ACCENT))),
+                    Cell::from(Line::from(Span::styled(name_text, plain()))),
+                    Cell::from(Line::from(Span::styled(limit_text, bold(TEXT))).right_aligned()),
+                    Cell::from(
+                        Line::from(Span::styled(
+                            spent_text,
+                            Style::default().fg(if row.over() && !income { BAD } else { TEXT }),
+                        ))
+                        .right_aligned(),
+                    ),
+                    Cell::from(
+                        Line::from(Span::styled(left_text, Style::default().fg(left_style)))
+                            .right_aligned(),
+                    ),
+                    Cell::from(Span::styled(bar, Style::default().fg(bar_style))),
                 ]
             };
             Row::new(cells).style(highlight(chosen))
         })
         .collect::<Vec<_>>();
 
-    let block = block_with_title(true, title);
+    let (limit_head, spent_head, left_head, bar_head) = if income {
+        ("目标", "已入", "差距", "进度")
+    } else {
+        ("上限", "已花", "剩余", "用量")
+    };
+
     let content = block.inner(area);
     let table_area = Rect {
         height: content.height.saturating_sub(1),
         ..content
     };
     let table = Table::new(
-        rows,
+        table_rows,
         [
             Constraint::Min(8),
             Constraint::Length(12),
@@ -1168,17 +1338,17 @@ fn render_plan_list(frame: &mut Frame, area: Rect, app: &App, title: String) {
     .header(
         Row::new(vec![
             header_cell("计划"),
-            header_cell_at("上限", Alignment::Right),
-            header_cell_at("已花", Alignment::Right),
-            header_cell_at("剩余", Alignment::Right),
-            header_cell("用量"),
+            header_cell_at(limit_head, Alignment::Right),
+            header_cell_at(spent_head, Alignment::Right),
+            header_cell_at(left_head, Alignment::Right),
+            header_cell(bar_head),
         ])
         .style(header_style()),
     )
     .column_spacing(1);
 
     frame.render_widget(block, area);
-    render_following_table(frame, table_area, table, Some(selected));
+    render_following_table(frame, table_area, table, local);
 
     if content.height > 0 {
         let hint_area = Rect {
@@ -1187,24 +1357,18 @@ fn render_plan_list(frame: &mut Frame, area: Rect, app: &App, title: String) {
             width: content.width,
             height: 1,
         };
+        let hint = match local {
+            Some(local) => format!("第 {} / {} 个 · Enter 编辑 · d 删除", local + 1, rows.len()),
+            None => format!("共 {} 个 · ↑ ↓ 切换", rows.len()),
+        };
         frame.render_widget(
-            Paragraph::new(
-                Line::from(Span::styled(
-                    format!(
-                        "第 {} / {} 个 · Enter 编辑 · d 删除",
-                        selected + 1,
-                        app.plans.len()
-                    ),
-                    muted(),
-                ))
-                .right_aligned(),
-            ),
+            Paragraph::new(Line::from(Span::styled(hint, muted())).right_aligned()),
             hint_area,
         );
     }
 }
 
-/// 覆盖校验：收入 / 额度合计 / 剩余（或缺口）一句话结论 —— 有上限的计划盖不盖得住工资，看这里。
+/// 覆盖校验：收入 / 开销额度合计 / 剩余（或缺口）一句话结论 —— 开销额度盖不盖得住工资，看这里。
 fn render_plan_check(frame: &mut Frame, area: Rect, app: &App) {
     let block = block_with_title(false, "覆盖校验");
     let inner = block.inner(area);
@@ -1232,16 +1396,16 @@ fn render_plan_check(frame: &mut Frame, area: Rect, app: &App) {
     ];
 
     if total == 0 {
-        lines.push(Line::from(Span::styled("还没设上限", muted())));
+        lines.push(Line::from(Span::styled("还没设开销额度", muted())));
         lines.push(Line::from(Span::styled(
-            "留空上限的计划只累计，不参与校验",
+            "留空额度的开销计划只累计，不参与校验",
             muted(),
         )));
     } else {
         match app.coverage.as_ref() {
             Some(coverage) if coverage.covers() => {
                 lines.push(Line::from(vec![Span::styled(
-                    "✔ 额度盖得住收入",
+                    "✔ 开销额度盖得住收入",
                     bold(GOOD),
                 )]));
                 lines.push(Line::from(vec![
@@ -1250,7 +1414,7 @@ fn render_plan_check(frame: &mut Frame, area: Rect, app: &App) {
                 ]));
             }
             Some(coverage) => {
-                lines.push(Line::from(Span::styled("✖ 额度盖不住收入", bold(BAD))));
+                lines.push(Line::from(Span::styled("✖ 开销额度盖不住收入", bold(BAD))));
                 lines.push(Line::from(vec![
                     Span::styled("差 ", muted()),
                     Span::styled(money::format_amount(coverage.shortfall()), bold(BAD)),
@@ -1463,10 +1627,14 @@ fn bill_line(bill: &BillEntity, selected: bool, width: usize) -> Line<'static> {
             .map(|span| span.style(Style::default().fg(MUTED)))
             .collect();
     }
+    if selected {
+        // 选中行只留底色：方向色和备注灰压在深蓝底上都会糊，统一交给行样式
+        spans = select_spans(spans);
+    }
     Line::from(spans).style(highlight(selected))
 }
 
-/// 概览「最近动账」的一行：备注（没有就落到分类）· 金额 · 计划。
+/// 概览「当日动账」的一行：备注（没有就落到分类）· 金额 · 计划。
 fn compact_bill_line(bill: &BillEntity, width: usize) -> Line<'static> {
     let kind_style = match bill.kind {
         BillKind::Income => bold(GOOD),
@@ -2364,8 +2532,8 @@ fn render_picker_modal(
         let marker = if current { "▶ " } else { "  " };
         let style = if current {
             Style::default()
-                .fg(Color::Black)
-                .bg(ACCENT)
+                .fg(SELECT_FG)
+                .bg(SELECT_BG)
                 .add_modifier(Modifier::BOLD)
         } else {
             plain()
@@ -2611,16 +2779,28 @@ fn header_style() -> Style {
     Style::default().fg(MUTED).add_modifier(Modifier::BOLD)
 }
 
-/// 选中行整行反色：ACCENT 底 + 黑字（数字语义色在选中时让位给「这是选中行」）。
+/// 选中行整行反色：深蓝底 + 近白字（数字语义色在选中时让位给「这是选中行」）。
+///
+/// 行样式只是底色：`Span` 自带的前景色会盖在它上面，所以选中行里的每个
+/// `Span` 都必须让出前景色（见 `select_spans`），否则浅色字压在深底上，
+/// 选中行反而成了屏幕上最难读的一行。
 fn highlight(selected: bool) -> Style {
     if selected {
         Style::default()
-            .fg(Color::Black)
-            .bg(ACCENT)
+            .fg(SELECT_FG)
+            .bg(SELECT_BG)
             .add_modifier(Modifier::BOLD)
     } else {
         plain()
     }
+}
+
+/// 把一行里的 `Span` 统一成选中配色：整行一个前景色，深浅交给底色保证。
+fn select_spans(spans: impl IntoIterator<Item = Span<'static>>) -> Vec<Span<'static>> {
+    spans
+        .into_iter()
+        .map(|span| Span::styled(span.content.into_owned(), Style::default().fg(SELECT_FG)))
+        .collect()
 }
 
 /// 「· 第 i/n」；空列表返回空串，标题里自然不出现。
@@ -2720,6 +2900,7 @@ mod tests {
     use chrono::{NaiveDate, TimeZone, Utc};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
 
     fn sample_app() -> App {
         let month = NaiveDate::from_ymd_opt(2026, 10, 1).unwrap();
@@ -2817,12 +2998,17 @@ mod tests {
                     name: "日常开销".into(),
                 },
                 Some(4_000_00),
+                PlanKind::Expense,
             ),
             1234,
         )];
         let mut spending = HashMap::new();
         spending.insert(5, 1234);
         app.progress = Some(PlanProgress::build(month, 4_000_00, None, &spending));
+
+        // 概览的「今日」和「当日动账」都跟 selected_day 走，钉死到 5 号，
+        // 基线就不会因为跑测试那天是几号而漂
+        app.selected_day = 5;
 
         app
     }
@@ -2855,6 +3041,54 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// 直接拿一屏的缓冲区：配色断言要看每个格子的样式，不是文本。
+    fn render_buffer(app: &App, width: u16, height: u16) -> Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("测试终端");
+        terminal
+            .draw(|frame| render(frame, app))
+            .expect("渲染不应失败");
+        terminal.backend().buffer().clone()
+    }
+
+    /// 选中态必须是「深蓝底 + 近白字」。
+    ///
+    /// 这条测试盯的是一个很容易回归的坑：表格行样式只刷底色，行里 Span 自带的
+    /// 前景色会把它盖掉。只要有人在选中行里留一个 `plain()` / `muted()` 的 Span，
+    /// 这一行就会变成浅字压深底 —— 屏幕上直接糊掉，但纯文本基线（golden）永远发现不了。
+    #[test]
+    fn selected_rows_use_a_readable_palette() {
+        for (page, label) in [
+            (Page::Overview, "概览"),
+            (Page::Plan, "计划"),
+            (Page::Bills, "账单"),
+            (Page::Reports, "报表"),
+        ] {
+            let mut app = sample_app();
+            app.page = page;
+            let buffer = render_buffer(&app, 120, 40);
+            let mut highlighted = 0;
+
+            for y in 0..buffer.area.height {
+                for x in 0..buffer.area.width {
+                    let cell = buffer.cell((x, y)).expect("格子在屏内");
+                    if cell.style().bg != Some(SELECT_BG) {
+                        continue;
+                    }
+
+                    highlighted += 1;
+                    assert_eq!(
+                        cell.style().fg,
+                        Some(SELECT_FG),
+                        "{label}页 ({x},{y}) 的「{}」没让出前景色，选中行会糊",
+                        cell.symbol()
+                    );
+                }
+            }
+
+            assert!(highlighted > 0, "{label}页没有选中态，底色没刷上");
+        }
     }
 
     #[test]
@@ -2990,10 +3224,22 @@ mod tests {
             PlanRow::new(
                 Plan::new(
                     BillBook {
+                        id: 3,
+                        name: "工资".into(),
+                    },
+                    Some(8_000_00),
+                    PlanKind::Income,
+                ),
+                6_000_00,
+            ),
+            PlanRow::new(
+                Plan::new(
+                    BillBook {
                         id: 1,
                         name: "吃饭".into(),
                     },
                     Some(1_500_00),
+                    PlanKind::Expense,
                 ),
                 88_50,
             ),
@@ -3004,6 +3250,7 @@ mod tests {
                         name: "存款".into(),
                     },
                     None,
+                    PlanKind::Expense,
                 ),
                 9_000_00,
             ),
@@ -3011,10 +3258,109 @@ mod tests {
 
         // 窄屏走上下叠布局，表格列会被压缩，但不能渲染失败、也不能丢列名
         let screen = render_screen(&app, 76, 30);
+        assert!(screen.contains("收入计划 · 共 1 个"), "{screen}");
+        assert!(screen.contains("开销计划 · 共 2 个"), "{screen}");
+        // 收入看目标，开销看上限：两块各说各的话，数字不串味
+        assert!(screen.contains("目标"), "{screen}");
+        assert!(screen.contains("差距"), "{screen}");
+        assert!(screen.contains("工资"), "{screen}");
         assert!(screen.contains("上限"), "{screen}");
         assert!(screen.contains("已花"), "{screen}");
         assert!(screen.contains("吃饭"), "{screen}");
         assert!(screen.contains("不限"), "没上限的计划要写清楚：\n{screen}");
+        // 收入在上、开销在下：先看到的是工资，不是吃饭
+        let income_at = screen.find("收入计划").unwrap();
+        let expense_at = screen.find("开销计划").unwrap();
+        assert!(income_at < expense_at, "收入计划要排在开销计划前面：\n{screen}");
+    }
+
+    #[test]
+    fn plan_boxes_get_height_by_row_count() {
+        // 需求行数 = 4（边框 ×2 + 表头 + 提示）+ 行数；空间够时先满足两边，富余按行数摊
+        assert_eq!(plan_group_heights(0, 0, 12), (6, 6), "两个空框平分富余");
+        assert_eq!(plan_group_heights(0, 5, 20), (4, 16), "空框不跟着长高，富余全给有数据的那一边");
+        assert_eq!(plan_group_heights(5, 0, 20), (16, 4), "反过来也一样");
+        // 收入 3 行、开销 1 行：行多的那块拿到更多富余
+        assert_eq!(plan_group_heights(3, 1, 40), (28, 12));
+
+        // 空间不够：按需求比例分，每框至少 4 行
+        assert_eq!(plan_group_heights(10, 10, 15), (7, 8));
+        assert_eq!(plan_group_heights(1, 1, 6), (3, 3), "极矮时对半分，先保证都画得出来");
+    }
+
+    #[test]
+    fn plan_page_renders_both_groups_when_each_has_rows() {
+        let mut app = sample_app();
+        app.page = Page::Plan;
+        app.plans = vec![
+            PlanRow::new(
+                Plan::new(
+                    BillBook {
+                        id: 3,
+                        name: "工资".into(),
+                    },
+                    Some(8_000_00),
+                    PlanKind::Income,
+                ),
+                6_000_00,
+            ),
+            PlanRow::new(
+                Plan::new(
+                    BillBook {
+                        id: 4,
+                        name: "外快".into(),
+                    },
+                    None,
+                    PlanKind::Income,
+                ),
+                300_00,
+            ),
+            PlanRow::new(
+                Plan::new(
+                    BillBook {
+                        id: 5,
+                        name: "奖金".into(),
+                    },
+                    Some(1_000_00),
+                    PlanKind::Income,
+                ),
+                1_200_00,
+            ),
+            PlanRow::new(
+                Plan::new(
+                    BillBook {
+                        id: 1,
+                        name: "房租".into(),
+                    },
+                    Some(2_500_00),
+                    PlanKind::Expense,
+                ),
+                3_000_00,
+            ),
+        ];
+
+        // 宽屏：左栏两个框上下排，收入框在上、框高按行数分（3 行 > 1 行）
+        let screen = render_screen(&app, 120, 40);
+        assert!(screen.contains("收入计划 · 共 3 个"), "{screen}");
+        assert!(screen.contains("开销计划 · 共 1 个"), "{screen}");
+        for name in ["工资", "外快", "奖金", "房租"] {
+            assert!(screen.contains(name), "少了计划 {name}：\n{screen}");
+        }
+        // 各看各的列：收入段没有「上限 / 已花 / 剩余」，开销段没有「目标 / 已入 / 差距」
+        let income_at = screen.find("收入计划").unwrap();
+        let expense_at = screen.find("开销计划").unwrap();
+        let goal_at = screen.find("目标").unwrap();
+        let limit_at = screen.find("上限").unwrap();
+        assert!(income_at < goal_at && goal_at < expense_at, "收入的列名要落在收入框里：\n{screen}");
+        assert!(expense_at < limit_at, "上限是开销的列名：\n{screen}");
+        assert!(!screen[income_at..expense_at].contains("剩余"), "收入段不该有「剩余」：\n{screen}");
+        // 收入计划超额也算好事，不写「剩余」也不写负数；没额度的话术是「不设」
+        assert!(screen.contains("不设"), "收入没目标的计划要说「不设」：\n{screen}");
+        // 没被选中的那块给的是「怎么进来」的提示，不是全局的换页签
+        assert!(
+            screen.contains("共 1 个 · ↑ ↓ 切换"),
+            "未选中的开销框要提示怎么切过去：\n{screen}"
+        );
     }
 
     #[test]
@@ -3199,7 +3545,7 @@ mod tests {
             println!("\n===== {} @120x40 =====\n{rendered}", page.title());
         }
 
-        // 概览：本月一块条 / 日历 / 今日两块数字 / 最近动账
+        // 概览：本月一块条 / 日历 / 今日两块数字 / 当日动账
         app.page = Page::Overview;
         let screen = render_screen(&app, 120, 40);
         for needle in [
@@ -3209,7 +3555,7 @@ mod tests {
             "s 同步今日",
             "今日额度",
             "支出日历",
-            "最近动账",
+            "当日动账 · 1 笔",
         ] {
             assert!(screen.contains(needle), "概览缺少「{needle}」：\n{screen}");
         }
@@ -3233,6 +3579,72 @@ mod tests {
                 "设置页缺少「{needle}」：\n{screen}"
             );
         }
+    }
+
+    /// 概览右下的动账只列选中那天：换一天内容就换，没账的那天给空状态。
+    #[test]
+    fn day_panel_follows_the_selected_day() {
+        let mut app = sample_app();
+        app.page = Page::Overview;
+        let day_bill = |id: u64, day: u32, remark: &str| BillEntity {
+            id,
+            kind: BillKind::Expense,
+            amount: 100 * id as i64,
+            book: BillBook {
+                id: 1,
+                name: "微信".into(),
+            },
+            category: Category {
+                id: 1,
+                parent_id: None,
+                name: "餐饮".into(),
+            },
+            created_at: Utc.with_ymd_and_hms(2026, 10, day, 12, 30, 0).unwrap(),
+            remark: Some(remark.into()),
+            excluded: false,
+        };
+
+        app.bills = vec![
+            day_bill(7, 5, "早饭"),
+            day_bill(8, 5, "午饭"),
+            day_bill(9, 5, "晚饭"),
+            day_bill(10, 6, "宵夜"),
+        ];
+
+        app.selected_day = 5;
+        let screen = render_screen(&app, 120, 40);
+        assert!(screen.contains("当日动账 · 3 笔"), "{screen}");
+        for needle in ["早饭", "午饭", "晚饭"] {
+            assert!(screen.contains(needle), "5 号该列出「{needle}」：\n{screen}");
+        }
+        assert!(!screen.contains("宵夜"), "6 号的账不该混进 5 号：\n{screen}");
+
+        app.selected_day = 6;
+        let screen = render_screen(&app, 120, 40);
+        assert!(screen.contains("当日动账 · 1 笔"), "{screen}");
+        assert!(screen.contains("宵夜"), "{screen}");
+        assert!(!screen.contains("午饭"), "{screen}");
+
+        app.selected_day = 7;
+        let screen = render_screen(&app, 120, 40);
+        assert!(screen.contains("这一天没有账单"), "{screen}");
+        assert!(screen.contains("↑ ↓ 换一天"), "{screen}");
+        assert!(!screen.contains("午饭"), "{screen}");
+
+        // 放不下时最后一行交代还剩几笔，别让硬裁后的列表看着像全貌
+        app.selected_day = 5;
+        app.bills = (7..15)
+            .map(|id| {
+                let remarks = [
+                    "第一笔", "第二笔", "第三笔", "第四笔", "第五笔", "第六笔", "第七笔", "第八笔",
+                ];
+                day_bill(id, 5, remarks[(id - 7) as usize])
+            })
+            .collect();
+        let screen = render_screen(&app, 80, 16);
+        assert!(screen.contains("当日动账 · 8 笔"), "{screen}");
+        assert!(screen.contains("笔没放下"), "该提示还有没显示的账：\n{screen}");
+        assert!(!screen.contains("第八笔"), "放不下的不该硬塞：\n{screen}");
     }
 
     /// 空列表要给引导语，而不是一块白板。
