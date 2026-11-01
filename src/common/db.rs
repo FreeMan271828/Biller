@@ -388,6 +388,11 @@ const SQLITE_ADDED_COLUMNS: &[(&str, &str, &str)] = &[
         "plan_kind",
         "ALTER TABLE bill_books ADD COLUMN plan_kind TEXT NOT NULL DEFAULT 'expense'",
     ),
+    (
+        "bill_books",
+        "in_calendar",
+        "ALTER TABLE bill_books ADD COLUMN in_calendar INTEGER NOT NULL DEFAULT 1",
+    ),
 ];
 
 /// 给老 SQLite 库补上后加的列（幂等：先查 `pragma_table_info`，有就跳过）。

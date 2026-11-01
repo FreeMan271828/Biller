@@ -12,6 +12,8 @@ struct BookRow {
     name: String,
     plan_limit: Option<i64>,
     plan_kind: String,
+    /// 0/1：SQLite 本来就是整数，PG 侧用 CASE 转成整数，sqlx::Any 才能统一解。
+    in_calendar: i64,
 }
 
 impl From<BookRow> for BillBook {
@@ -32,6 +34,7 @@ impl From<BookRow> for Plan {
             },
             limit: row.plan_limit,
             kind: PlanKind::from_code(&row.plan_kind),
+            in_calendar: row.in_calendar != 0,
         }
     }
 }
@@ -64,7 +67,7 @@ impl BookDao {
         let rows = sqlx::query_as::<_, BookRow>(
             &self
                 .pool
-                .shared("SELECT id, name, plan_limit, plan_kind FROM bill_books ORDER BY id"),
+                .shared("SELECT id, name, plan_limit, plan_kind, CASE WHEN in_calendar THEN 1 ELSE 0 END AS in_calendar FROM bill_books ORDER BY id"),
         )
         .fetch_all(self.pool.any())
         .await?;
@@ -76,7 +79,7 @@ impl BookDao {
         let rows = sqlx::query_as::<_, BookRow>(
             &self
                 .pool
-                .shared("SELECT id, name, plan_limit, plan_kind FROM bill_books ORDER BY id"),
+                .shared("SELECT id, name, plan_limit, plan_kind, CASE WHEN in_calendar THEN 1 ELSE 0 END AS in_calendar FROM bill_books ORDER BY id"),
         )
         .fetch_all(self.pool.any())
         .await?;
@@ -87,7 +90,7 @@ impl BookDao {
         let row = sqlx::query_as::<_, BookRow>(
             &self
                 .pool
-                .shared("SELECT id, name, plan_limit, plan_kind FROM bill_books WHERE id = ?"),
+                .shared("SELECT id, name, plan_limit, plan_kind, CASE WHEN in_calendar THEN 1 ELSE 0 END AS in_calendar FROM bill_books WHERE id = ?"),
         )
         .bind(id as i64)
         .fetch_optional(self.pool.any())
@@ -99,13 +102,28 @@ impl BookDao {
         let row = sqlx::query_as::<_, BookRow>(
             &self
                 .pool
-                .shared("SELECT id, name, plan_limit, plan_kind FROM bill_books WHERE name = ?"),
+                .shared("SELECT id, name, plan_limit, plan_kind, CASE WHEN in_calendar THEN 1 ELSE 0 END AS in_calendar FROM bill_books WHERE name = ?"),
         )
         .bind(name)
         .fetch_optional(self.pool.any())
         .await?;
         Ok(row.map(BillBook::from))
     }
+
+    /// 设置「是否计入日历」；返回受影响行数。
+    pub async fn set_in_calendar(&self, id: BookId, in_calendar: bool) -> Result<u64> {
+        let result = sqlx::query(
+            &self
+                .pool
+                .shared("UPDATE bill_books SET in_calendar = (? = 1) WHERE id = ?"),
+        )
+        .bind(if in_calendar { 1_i64 } else { 0_i64 })
+        .bind(id as i64)
+        .execute(self.pool.any())
+        .await?;
+        Ok(result.rows_affected())
+    }
+
 
     /// 设置上限（`None` = 不设上限）；返回受影响行数。
     pub async fn set_limit(&self, id: BookId, limit: Option<i64>) -> Result<u64> {
@@ -167,6 +185,20 @@ impl BookDao {
             .bind(id as i64)
             .execute(self.pool.any())
             .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// 把某个计划名下的账单整批挪到另一个计划；返回挪走的账单数。
+    pub async fn move_bills(&self, from: BookId, to: BookId) -> Result<u64> {
+        let result = sqlx::query(
+            &self
+                .pool
+                .shared("UPDATE bills SET book_id = ? WHERE book_id = ?"),
+        )
+        .bind(to as i64)
+        .bind(from as i64)
+        .execute(self.pool.any())
+        .await?;
         Ok(result.rows_affected())
     }
 }

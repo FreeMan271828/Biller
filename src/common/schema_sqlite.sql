@@ -14,7 +14,9 @@ CREATE TABLE IF NOT EXISTS bill_books (
     -- 计划的额度（分）。NULL = 不设额度：这个计划只从 0 开始累计
     plan_limit INTEGER,
     -- 计划类型：income = 收入计划（如工资），expense = 开销计划（如房租）
-    plan_kind  TEXT NOT NULL DEFAULT 'expense'
+    plan_kind  TEXT NOT NULL DEFAULT 'expense',
+    -- 这个计划的支出算不算进支出日历（日额度 / 今日 / 本月已花）。账单一律跟着计划走
+    in_calendar INTEGER NOT NULL DEFAULT 1
 );
 
 CREATE TABLE IF NOT EXISTS categories (

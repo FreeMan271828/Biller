@@ -67,6 +67,15 @@ impl BookService {
         Ok(())
     }
 
+    /// 设置「是否计入日历」。
+    pub async fn set_in_calendar(&self, id: BookId, in_calendar: bool) -> Result<()> {
+        let affected = self.dao.set_in_calendar(id, in_calendar).await?;
+        if affected == 0 {
+            bail!("计划 id={id} 不存在");
+        }
+        Ok(())
+    }
+
     /// 改计划类型（收入 / 开销）。
     pub async fn set_kind(&self, id: BookId, kind: PlanKind) -> Result<()> {
         let affected = self.dao.set_kind(id, kind).await?;
@@ -172,6 +181,16 @@ impl BookService {
             bail!("账本「{}」不存在", book.name);
         }
         Ok(book)
+    }
+
+    /// 某个计划名下有多少账单。
+    pub async fn count_bills(&self, id: BookId) -> Result<i64> {
+        self.dao.count_bills(id).await
+    }
+
+    /// 把某个计划名下的账单整批挪到另一个计划；返回挪走的账单数。
+    pub async fn move_bills(&self, from: BookId, to: BookId) -> Result<u64> {
+        self.dao.move_bills(from, to).await
     }
 
     /// 供其他领域把 id 还原成名称。

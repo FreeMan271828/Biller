@@ -212,10 +212,15 @@ impl Field {
 
     /// 金额字段：内容可写成算式（`+ - * /` 与括号），按 `=` 求值。
     fn amount(label: &'static str, hint: &'static str) -> Self {
+        Self::amount_with(label, "", hint)
+    }
+
+    /// 带初值的金额字段（编辑表单预填用）：算式求值规则和输入框完全一样。
+    fn amount_with(label: &'static str, value: impl Into<String>, hint: &'static str) -> Self {
         Self {
             label,
             kind: FieldKind::Text,
-            value: String::new(),
+            value: value.into(),
             hint,
             role: FieldRole::Amount,
         }
@@ -455,17 +460,7 @@ impl Form {
         set_field_value(&mut form.fields[3], &bill.book.name);
         form.fields[4].value = crate::common::time::format_datetime(bill.created_at);
         form.fields[5].value = bill.remark.clone().unwrap_or_default();
-        // 账单详情里也能改「计入日历」
-        form.fields.push(Field::choice_with(
-            "计入日历",
-            vec!["计入".to_string(), "不计入".to_string()],
-            if bill.excluded {
-                "不计入".to_string()
-            } else {
-                "计入".to_string()
-            },
-            "只影响支出日历；月报/年报与本月收入始终全额计入",
-        ));
+        // 账单没有自己的「计入日历」开关：跟着计划走，在计划页 / 计划详情里改
         form
     }
 
@@ -491,10 +486,10 @@ impl Form {
         Self {
             kind: FormKind::SetStartBalance,
             title: "本月设置（起始金额）",
-            fields: vec![Field::text(
+            fields: vec![Field::amount_with(
                 "起始金额",
                 money::format_amount(current),
-                "元，例如 1000 或 1000.50",
+                "元，可写算式（+ - * / 与括号），按 = 求值",
             )],
             focus: 0,
             target: Some(EditTarget::MonthBalance(month)),
@@ -509,6 +504,7 @@ impl Form {
     ///
     /// 「额度」留空 = 不设额度：开销计划只从 0 开始累计花了多少，不判超支；
     /// 收入计划则是只累计入账、不判达标。
+    /// 「计入日历」决定这个计划名下的支出进不进日历 —— 账单没有自己的开关。
     /// 账单记在哪个计划，就等于归到哪个计划——不再有「绑分类」这层映射。
     pub fn plan_item(rows: &[PlanRow], index: Option<usize>) -> Self {
         let mut form = Self {
@@ -522,6 +518,11 @@ impl Form {
                     "←/→ 或空格切换：开销看上限，收入看目标",
                 ),
                 Field::text("额度", "", "每月额度（元）；留空就是不设额度 / 目标"),
+                Field::choice(
+                    "计入日历",
+                    vec!["计入".to_string(), "不计入".to_string()],
+                    "只影响支出日历（日额度 / 今日 / 本月已花）；账单跟着计划走",
+                ),
             ],
             focus: 0,
             target: None,
@@ -544,6 +545,16 @@ impl Form {
                 .limit
                 .map(money::format_amount)
                 .unwrap_or_default();
+            form.fields[3] = Field::choice_with(
+                "计入日历",
+                vec!["计入".to_string(), "不计入".to_string()],
+                if row.plan.in_calendar {
+                    "计入".to_string()
+                } else {
+                    "不计入".to_string()
+                },
+                "只影响支出日历（日额度 / 今日 / 本月已花）；账单跟着计划走",
+            );
             // 名称/额度都可能改，但额度改动最多：焦点落在额度上
             form.focus = 2;
         }
@@ -714,8 +725,13 @@ pub enum Action {
     ShiftYear(i32),
     SubmitForm(Form),
     DeleteBill(u64),
-    /// 删除计划里的一块（位置，计划页 `d`）。
-    DeletePlanItem(usize),
+    /// 计划页按 `d`：先查名下账单数，再弹确认（有账单时整体搬去默认计划）。
+    PrepareDeletePlan(BookId),
+    /// 确认后的删除；`move_bills` 为真时名下账单先整体搬到默认计划。
+    DeletePlan {
+        id: BookId,
+        move_bills: bool,
+    },
     /// 删除分类；`recursive` 为真时连同子孙一起删（终端会先提示）。
     DeleteCategory {
         id: u64,
@@ -730,7 +746,8 @@ pub enum Action {
     /// 撤销最近一次删除。
     UndoDelete,
     /// 切换一条账单是否纳入统计（账单页 `x`）。
-    ToggleExcluded(u64),
+    /// 计划页 `x`：切换这个计划是否计入日历（账单跟着计划走）。
+    TogglePlanCalendar(BookId),
 }
 
 /// 设置页保存的连接目标：本地文件还是远程库。
@@ -1525,16 +1542,8 @@ impl App {
                         Action::DeleteBill(bill.id),
                     )
                 }),
-            Page::Plan => self.plans.get(self.selected_index(Page::Plan)).map(|row| {
-                (
-                    format!(
-                        "确定要删除计划「{}」（{}）吗？此操作不可撤销。",
-                        row.name(),
-                        row.plan.describe_limit()
-                    ),
-                    Action::DeletePlanItem(self.selected_index(Page::Plan)),
-                )
-            }),
+            // 计划页走 Action::PrepareDeletePlan：要先查名下的账单数
+            Page::Plan => None,
             Page::Settings => match self.settings_section {
                 // 连接分区没有可删的东西
                 SettingsSection::Connection => None,
@@ -1767,19 +1776,30 @@ impl App {
                 if self.page == Page::Reports && self.report_tab == ReportTab::Year {
                     self.year_expanded = !self.year_expanded;
                     Action::None
-                // 账单页：切「是否纳入统计」；报销、代付这类过手钱不该算进开销
-                } else if self.page == Page::Bills {
-                    self.bills
-                        .get(self.selected_index(Page::Bills))
-                        .map(|bill| Action::ToggleExcluded(bill.id))
+                // 计划页：切这个计划进不进日历；账单没有自己的开关
+                } else if self.page == Page::Plan {
+                    self.plans
+                        .get(self.selected_index(Page::Plan))
+                        .map(|row| Action::TogglePlanCalendar(row.plan.id()))
                         .unwrap_or(Action::None)
                 } else {
                     Action::None
                 }
             }
             Key::Char('d') | Key::Delete => {
-                self.request_delete();
-                Action::None
+                if self.page == Page::Plan {
+                    // 计划带账单时得先查数、再决定要不要搬，不能同步弹框
+                    match self.plans.get(self.selected_index(Page::Plan)) {
+                        Some(row) => Action::PrepareDeletePlan(row.plan.id()),
+                        None => {
+                            self.set_info("当前页没有可删除的内容");
+                            Action::None
+                        }
+                    }
+                } else {
+                    self.request_delete();
+                    Action::None
+                }
             }
             // 报表页按 y：切到年报（此时 `[` `]` 换的是年份）
             Key::Char('y') => {
@@ -2073,20 +2093,60 @@ impl App {
                 self.set_info(format!("已删除账单 #{id}（按 u 撤销）"));
                 self.reload(services).await?;
             }
-            Action::DeletePlanItem(index) => {
-                let name = self
-                    .plans
-                    .get(index)
-                    .map(|row| row.name().to_string())
-                    .unwrap_or_default();
+            Action::PrepareDeletePlan(id) => {
+                let plan = services.plans.by_id(id).await?;
+                let bills = services.plans.bill_count(id).await?;
 
-                if name.is_empty() {
-                    self.set_info("计划里没有这个");
+                if bills > 0 && plan.name() == DEFAULT_BOOK {
+                    self.modal = Some(Modal::Notice {
+                        title: "不能删除".to_string(),
+                        message: format!(
+                            "「{}」是默认计划，名下 {} 笔账单没处可移，先把它们改到别的计划再删。",
+                            plan.name(),
+                            bills
+                        ),
+                    });
                 } else {
-                    services.plans.remove(&name).await?;
-                    self.set_info(format!("已删除计划「{name}」"));
-                    self.reload(services).await?;
+                    let message = if bills > 0 {
+                        format!(
+                            "计划「{}」（{}）下有 {} 笔账单，删除后全部移到「{}」计划，收支归属随之改变。此操作不可撤销。",
+                            plan.name(),
+                            plan.describe_limit(),
+                            bills,
+                            DEFAULT_BOOK
+                        )
+                    } else {
+                        format!(
+                            "确定要删除计划「{}」（{}）吗？此操作不可撤销。",
+                            plan.name(),
+                            plan.describe_limit()
+                        )
+                    };
+                    self.modal = Some(Modal::Confirm {
+                        title: "确认删除".to_string(),
+                        message,
+                        action: Action::DeletePlan {
+                            id,
+                            move_bills: bills > 0,
+                        },
+                    });
                 }
+            }
+            Action::DeletePlan { id, move_bills } => {
+                if move_bills {
+                    let (plan, moved) =
+                        services.plans.remove_moving_bills(&id.to_string(), DEFAULT_BOOK).await?;
+                    self.set_info(format!(
+                        "已删除计划「{}」，{} 笔账单移到「{}」",
+                        plan.name(),
+                        moved,
+                        DEFAULT_BOOK
+                    ));
+                } else {
+                    let plan = services.plans.remove(&id.to_string()).await?;
+                    self.set_info(format!("已删除计划「{}」", plan.name()));
+                }
+                self.reload(services).await?;
             }
             Action::DeleteCategory { id, recursive } => {
                 let removed = services
@@ -2109,22 +2169,22 @@ impl App {
                 self.last_deleted = Some(record);
                 self.reload(services).await?;
             }
-            Action::ToggleExcluded(id) => {
+            Action::TogglePlanCalendar(id) => {
                 let next = self
-                    .bills
+                    .plans
                     .iter()
-                    .find(|bill| bill.id == id)
-                    .map(|bill| !bill.excluded);
+                    .find(|row| row.plan.id() == id)
+                    .map(|row| !row.plan.in_calendar);
 
                 match next {
-                    None => self.set_error(format!("账单 #{id} 不在当前列表里")),
+                    None => self.set_error(format!("计划 id={id} 不在当前列表里")),
                     Some(next) => {
-                        services.bills.set_excluded(id, next).await?;
+                        let plan = services.plans.set_in_calendar(&id.to_string(), next).await?;
                         self.reload(services).await?;
                         self.set_info(if next {
-                            format!("账单 #{id} 已标为「不计入日历」")
+                            format!("计划「{}」已恢复计入日历", plan.name())
                         } else {
-                            format!("账单 #{id} 已恢复计入日历")
+                            format!("计划「{}」已标为「不计入日历」", plan.name())
                         });
                     }
                 }
@@ -2363,12 +2423,6 @@ async fn submit(form: Form, services: &Services) -> Result<String> {
         (FormKind::NewBill, Some(EditTarget::Bill(id))) => {
             let bill = services.bills.update(id, bill_from_form(&form)?).await?;
 
-            // 「计入统计」在编辑表单里也能改，单独落一次（幂等）
-            services
-                .bills
-                .set_excluded(id, form.value("计入日历") == "不计入")
-                .await?;
-
             Ok(format!(
                 "已更新账单 #{} 为 {} {} 元",
                 bill.id,
@@ -2386,8 +2440,8 @@ async fn submit(form: Form, services: &Services) -> Result<String> {
             Ok(format!("分类「{}」已更新", category.name))
         }
         (FormKind::SetStartBalance, Some(EditTarget::MonthBalance(month))) => {
-            let amount =
-                money::parse_amount(form.value("起始金额")).map_err(|error| anyhow!("{error}"))?;
+            // 和账单金额同一条路：纯数字照旧，带运算符就先求值
+            let amount = amount_from_field(form.value("起始金额"))?;
 
             services.months.set_start_balance(month, amount).await?;
 
@@ -2401,6 +2455,7 @@ async fn submit(form: Form, services: &Services) -> Result<String> {
             let name = plan_name(&form)?;
             let limit = plan_limit_from_form(&form)?;
             let kind = plan_kind_from_form(&form);
+            let in_calendar = plan_calendar_from_form(&form);
 
             // 按 id 取原记录：列表顺序是「先收入后开销」，与库里顺序不同，不能按位置找
             let current = services.plans.by_id(id).await?;
@@ -2408,7 +2463,8 @@ async fn submit(form: Form, services: &Services) -> Result<String> {
                 services.plans.rename(current.name(), &name).await?;
             }
             services.plans.set_limit(&name, limit).await?;
-            let plan = services.plans.set_kind(&name, kind).await?;
+            services.plans.set_kind(&name, kind).await?;
+            let plan = services.plans.set_in_calendar(&name, in_calendar).await?;
 
             Ok(format!(
                 "计划「{}」已改为{}计划 · {}",
@@ -2421,13 +2477,21 @@ async fn submit(form: Form, services: &Services) -> Result<String> {
             let name = plan_name(&form)?;
             let limit = plan_limit_from_form(&form)?;
             let kind = plan_kind_from_form(&form);
+            let in_calendar = plan_calendar_from_form(&form);
             let plan = services.plans.add(&name, limit, kind).await?;
+            // 新建默认计入日历；只有明确选「不计入」才多写一次
+            let plan = if in_calendar {
+                plan
+            } else {
+                services.plans.set_in_calendar(&name, false).await?
+            };
 
             Ok(format!(
-                "已新增{}计划「{}」 · {}",
+                "已新增{}计划「{}」 · {}{}",
                 plan.kind.label(),
                 plan.name(),
-                plan.describe_limit()
+                plan.describe_limit(),
+                if plan.in_calendar { "" } else { " · 不计入日历" }
             ))
         }
         (FormKind::NewBill, None) => {
@@ -2517,6 +2581,11 @@ fn plan_name(form: &Form) -> Result<String> {
     Ok(name.to_string())
 }
 
+/// 计划是否计入日历：表单里选「计入 / 不计入」，默认计入。
+fn plan_calendar_from_form(form: &Form) -> bool {
+    form.value("计入日历") != "不计入"
+}
+
 /// 计划类型：表单里选的是「开销 / 收入」，落库用 `PlanKind`。
 fn plan_kind_from_form(form: &Form) -> PlanKind {
     match form.value("类型") {
@@ -2543,6 +2612,18 @@ fn plan_limit_from_form(form: &Form) -> Result<Option<AmountType>> {
     Ok(Some(amount))
 }
 
+/// 金额输入框 → 分：带运算符先求值（等价于按过 `=`），纯数字保留两位小数校验。
+///
+/// 账单金额和本月起始金额共用这一条路，别让两个输入框的算法跑偏。
+fn amount_from_field(raw: &str) -> Result<AmountType> {
+    let text = if raw.chars().any(|character| "+-*/()".contains(character)) {
+        money::evaluate_expression(raw).map_err(|error| anyhow!("{error}"))?
+    } else {
+        raw.to_string()
+    };
+    money::parse_amount(&text).map_err(|error| anyhow!("{error}"))
+}
+
 /// 从表单构造账单入参。
 fn bill_from_form(form: &Form) -> Result<NewBill> {
     let kind = match form.value("方向") {
@@ -2550,17 +2631,7 @@ fn bill_from_form(form: &Form) -> Result<NewBill> {
         _ => BillKind::Expense,
     };
     // 直接提交算式也等价于按过 `=`；纯数字仍走原解析，保留「最多两位小数」的校验
-    let raw_amount = form.value("金额");
-    let amount = if raw_amount
-        .chars()
-        .any(|character| "+-*/()".contains(character))
-    {
-        let evaluated =
-            money::evaluate_expression(raw_amount).map_err(|error| anyhow!("{error}"))?;
-        money::parse_amount(&evaluated).map_err(|error| anyhow!("{error}"))?
-    } else {
-        money::parse_amount(raw_amount).map_err(|error| anyhow!("{error}"))?
-    };
+    let amount = amount_from_field(form.value("金额"))?;
 
     let date = form.value("日期");
     let created_at = if date.is_empty() {
@@ -3969,13 +4040,18 @@ mod tests {
     }
 
     #[test]
-    fn x_toggles_included_flag_on_bills_page_only() {
+    fn x_toggles_plan_calendar_on_plan_page_only() {
         let mut app = sample_app();
-        app.page = Page::Bills;
+        app.page = Page::Plan;
+        app.plans = vec![PlanRow::new(plan_row("房租", Some(1_000_00)), 0)];
         assert!(matches!(
             app.on_key(Key::Char('x')),
-            Action::ToggleExcluded(7)
+            Action::TogglePlanCalendar(1)
         ));
+
+        // 账单页不再有「单笔账单计不计入」这回事
+        app.page = Page::Bills;
+        assert!(matches!(app.on_key(Key::Char('x')), Action::None));
 
         app.page = Page::Settings;
         app.settings_section = SettingsSection::Categories;
@@ -4032,6 +4108,52 @@ mod tests {
                 assert_eq!(form.target, Some(EditTarget::PlanItem(1)));
             }
             other => panic!("计划页按 e 应打开编辑计划，实际 {other:?}"),
+        }
+    }
+
+    /// 计划页按 d 不是直接弹确认框：得先去服务层查名下账单数，带账单才提示会搬去默认计划。
+    #[test]
+    fn delete_on_plan_page_asks_for_a_bill_count_first() {
+        let mut app = sample_app();
+        app.page = Page::Plan;
+        app.plans = vec![PlanRow::new(plan_row("房租", Some(1_000_00)), 0)];
+
+        match app.on_key(Key::Char('d')) {
+            Action::PrepareDeletePlan(id) => assert_eq!(id, 1, "按计划 id 定位，不是列表下标"),
+            other => panic!("计划页 d 应先查账单数，实际 {other:?}"),
+        }
+        assert!(app.modal.is_none(), "查数没回来之前不该弹确认框");
+    }
+
+    /// 金额输入框 → 分：带运算符先求值，纯数字保留千分位/两位小数的宽容度。
+    #[test]
+    fn amount_field_evaluates_arithmetic_for_both_forms() {
+        assert_eq!(amount_from_field("1000+500").unwrap(), 150_000);
+        assert_eq!(amount_from_field("(2500+300)*2").unwrap(), 560_000);
+        assert_eq!(amount_from_field("1,000.50").unwrap(), 100_050);
+        assert!(amount_from_field("abc").is_err());
+        assert!(amount_from_field("12+").is_err());
+    }
+
+    /// 本月设置的起始金额也是金额字段：算式照样按 = 求值。
+    #[test]
+    fn month_settings_accepts_arithmetic() {
+        let mut app = sample_app();
+        app.page = Page::Overview;
+        app.on_key(Key::Char('e'));
+
+        // 清掉预填的 1,000.00，再输 1000+500
+        for _ in "1,000.00".chars() {
+            app.on_key(Key::Backspace);
+        }
+        for character in "1000+500".chars() {
+            app.on_key(Key::Char(character));
+        }
+        app.on_key(Key::Char('='));
+
+        match &app.modal {
+            Some(Modal::Form(form)) => assert_eq!(form.value("起始金额"), "1,500.00"),
+            other => panic!("本月设置应打开起始金额表单，实际 {other:?}"),
         }
     }
 
@@ -4187,8 +4309,12 @@ mod tests {
         assert_eq!(form.fields[2].label, "额度");
         assert!(!form.fields[2].is_choice(), "额度是手填，不是选项");
         assert_eq!(form.value("额度"), "", "新建时额度留空");
+        assert_eq!(form.fields[3].label, "计入日历");
+        assert!(form.fields[3].is_choice(), "计入日历是选项：计入 / 不计入");
+        assert_eq!(form.value("计入日历"), "计入", "新建默认计入日历");
         assert_eq!(plan_limit_from_form(&form).unwrap(), None, "留空就是不设额度");
         assert_eq!(plan_kind_from_form(&form), PlanKind::Expense);
+        assert!(plan_calendar_from_form(&form));
     }
 
     #[test]
@@ -4202,6 +4328,7 @@ mod tests {
         assert_eq!(form.value("名称"), "吃喝");
         assert_eq!(form.value("类型"), "开销");
         assert_eq!(form.value("额度"), "30.00");
+        assert_eq!(form.value("计入日历"), "计入");
         assert_eq!(form.focus, 2, "编辑时焦点落在额度上");
 
         let mut empty = Form::plan_item(&rows, Some(1));
@@ -4227,6 +4354,28 @@ mod tests {
         assert_eq!(form.value("类型"), "收入", "收入计划打开就是收入，不要回落到默认");
         assert_eq!(form.value("额度"), "8,000.00");
         assert_eq!(plan_kind_from_form(&form), PlanKind::Income);
+        assert!(plan_calendar_from_form(&form));
+    }
+
+    /// 不计入日历的计划，编辑表单要把「不计入」预填出来。
+    #[test]
+    fn plan_form_prefills_an_out_of_calendar_plan() {
+        let row = PlanRow::new(
+            Plan::new(
+                BillBook {
+                    id: 3,
+                    name: "报销".into(),
+                },
+                Some(1_000_00),
+                PlanKind::Expense,
+            )
+            .with_calendar(false),
+            0,
+        );
+
+        let form = Form::plan_item(&[row], Some(0));
+        assert_eq!(form.value("计入日历"), "不计入");
+        assert!(!plan_calendar_from_form(&form));
     }
 
     #[test]

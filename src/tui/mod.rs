@@ -82,6 +82,8 @@ pub async fn run(
                 // 1.4 之前计划存成 app_state 里的一串 JSON：开界面时顺手搬进计划列表。
                 // 迁移自己写 `plan.migrated` 标记，重复打开只会白跑一次查询。
                 let migrated = services.plans.migrate_items_into_plans().await?;
+                // 1.8 之前「计不计入日历」是记在单笔账单上的：把整块都被排除的计划搬到计划级。
+                services.plans.migrate_calendar_flags().await?;
                 app.reload(services).await?;
                 if migrated > 0 {
                     app.status = Some(app::Status::Info(format!(

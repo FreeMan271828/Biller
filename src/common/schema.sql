@@ -11,12 +11,15 @@ CREATE TABLE IF NOT EXISTS bill_books (
     -- 计划的额度（分）。NULL = 不设额度：这个计划只从 0 开始累计
     plan_limit BIGINT,
     -- 计划类型：income = 收入计划（如工资），expense = 开销计划（如房租）
-    plan_kind  TEXT NOT NULL DEFAULT 'expense'
+    plan_kind  TEXT NOT NULL DEFAULT 'expense',
+    -- 这个计划的支出算不算进支出日历（日额度 / 今日 / 本月已花）。账单一律跟着计划走
+    in_calendar BOOLEAN NOT NULL DEFAULT TRUE
 );
 
--- 老库补列：账本并入计划后，一个账本可以选择带额度、并且分收入/开销两类
+-- 老库补列：账本并入计划后，一个账本可以选择带额度、分收入/开销两类，并决定进不进日历
 ALTER TABLE bill_books ADD COLUMN IF NOT EXISTS plan_limit BIGINT;
 ALTER TABLE bill_books ADD COLUMN IF NOT EXISTS plan_kind TEXT NOT NULL DEFAULT 'expense';
+ALTER TABLE bill_books ADD COLUMN IF NOT EXISTS in_calendar BOOLEAN NOT NULL DEFAULT TRUE;
 
 -- 分类支持父子层级；parent_id 为空表示顶层分类。
 CREATE TABLE IF NOT EXISTS categories (

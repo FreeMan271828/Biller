@@ -345,7 +345,24 @@ impl BillDao {
         Ok(result.rows_affected())
     }
 
+    /// 某个计划名下被标记成「不计入日历」的账单数（老版本的字段，只用于一次性迁移）。
+    pub async fn count_legacy_excluded(&self, book_id: BookId) -> Result<i64> {
+        let (count,): (i64,) = sqlx::query_as(
+            &self
+                .pool
+                // 不写 `excluded = 1`：PG 那列是 BOOLEAN，裸列在两种库里都是「真值」判断
+                .shared("SELECT COUNT(*) FROM bills WHERE book_id = ? AND excluded"),
+        )
+        .bind(book_id as i64)
+        .fetch_one(self.pool.any())
+        .await?;
+        Ok(count)
+    }
+
     /// 只切换「是否计入日历」，不动账单本身。
+    ///
+    /// 新版本已经不用「单笔账单计不计入」了：日历口径跟着计划走。
+    /// 这个写入口只留给老数据迁移与测试，不对外暴露。
     pub async fn set_excluded(&self, id: BillId, excluded: bool) -> Result<u64> {
         // `(? = 1)` 让 PostgreSQL 的 boolean 与 SQLite 的 0/1 INTEGER 都吃得下，
         // 不必为「绑 bool 还是绑整数」分叉。

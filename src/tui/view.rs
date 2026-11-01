@@ -48,10 +48,10 @@ const TEXT: Color = Color::Reset;
 const MUTED: Color = Color::Rgb(86, 95, 137);
 /// 非焦点面板边框。
 const BORDER: Color = Color::Rgb(59, 66, 97);
-/// 选中行 / 选中格的底色：深蓝。亮底配浅字最容易糊，所以选中态要压暗。
-const SELECT_BG: Color = Color::Rgb(45, 58, 92);
-/// 选中行 / 选中格的字色：近白，压得住深蓝底。
-const SELECT_FG: Color = Color::Rgb(226, 233, 255);
+/// 选中行 / 选中格的底色：一块明显的蓝。太暗会找不到光标，太亮又压不住白字。
+const SELECT_BG: Color = Color::Rgb(61, 89, 161);
+/// 选中行 / 选中格的字色：纯白 + 加粗，深蓝底上最扎眼的组合。
+const SELECT_FG: Color = Color::Rgb(255, 255, 255);
 
 /// 面板左右内边距（列）。
 const PAD: u16 = 1;
@@ -265,6 +265,34 @@ fn plain() -> Style {
 fn pad_left(text: &str, width: usize) -> String {
     let used = display_width(text);
     format!("{}{}", " ".repeat(width.saturating_sub(used)), text)
+}
+
+/// 按显示宽度折行：中文没有空格，ratatui 的按词折行会整段溢出，这里自己按字符切。
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![text.to_string()];
+    }
+
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut used = 0;
+
+    for character in text.chars() {
+        let character_width = display_width(&character.to_string());
+        if used > 0 && used + character_width > width {
+            lines.push(std::mem::take(&mut current));
+            used = 0;
+        }
+        current.push(character);
+        used += character_width;
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
 }
 
 /// 超宽截断并补 `…`；不超宽就原样返回。
@@ -1247,9 +1275,9 @@ fn render_plan_group(
         None
     };
     let width = area.width.saturating_sub(2) as usize;
-    // 名称 8 + 三列金额 12×3 + 列间距 4，剩下给用量条
+    // 名称 8 + 三列金额 12×3 + 「计」列 2 + 列间距 5，剩下给用量条
     let bar_width = width
-        .saturating_sub(8 + 12 * 3 + 4)
+        .saturating_sub(8 + 12 * 3 + 2 + 5)
         .clamp(MIN_BAR_WIDTH, 16);
 
     let table_rows = rows
@@ -1281,6 +1309,7 @@ fn render_plan_group(
 
             let name_text = row.name().to_string();
             let spent_text = money::format_amount(row.spent);
+            let calendar_text = if row.plan.in_calendar { "✓" } else { "×" };
 
             let cells = if chosen {
                 // 选中行一个前景色都不给：底色由行样式刷成深蓝，字由行样式刷成近白。
@@ -1290,6 +1319,7 @@ fn render_plan_group(
                     Cell::from(Line::from(limit_text).right_aligned()),
                     Cell::from(Line::from(spent_text).right_aligned()),
                     Cell::from(Line::from(left_text).right_aligned()),
+                    Cell::from(calendar_text),
                     Cell::from(bar),
                 ]
             } else {
@@ -1307,6 +1337,14 @@ fn render_plan_group(
                         Line::from(Span::styled(left_text, Style::default().fg(left_style)))
                             .right_aligned(),
                     ),
+                    Cell::from(Span::styled(
+                        calendar_text,
+                        if row.plan.in_calendar {
+                            muted()
+                        } else {
+                            Style::default().fg(WARN)
+                        },
+                    )),
                     Cell::from(Span::styled(bar, Style::default().fg(bar_style))),
                 ]
             };
@@ -1332,6 +1370,7 @@ fn render_plan_group(
             Constraint::Length(12),
             Constraint::Length(12),
             Constraint::Length(12),
+            Constraint::Length(2),
             Constraint::Length(bar_width as u16),
         ],
     )
@@ -1341,6 +1380,7 @@ fn render_plan_group(
             header_cell_at(limit_head, Alignment::Right),
             header_cell_at(spent_head, Alignment::Right),
             header_cell_at(left_head, Alignment::Right),
+            header_cell("计"),
             header_cell(bar_head),
         ])
         .style(header_style()),
@@ -1358,7 +1398,11 @@ fn render_plan_group(
             height: 1,
         };
         let hint = match local {
-            Some(local) => format!("第 {} / {} 个 · Enter 编辑 · d 删除", local + 1, rows.len()),
+            Some(local) => format!(
+                "第 {} / {} 个 · Enter 编辑 · d 删除 · x 计入日历",
+                local + 1,
+                rows.len()
+            ),
             None => format!("共 {} 个 · ↑ ↓ 切换", rows.len()),
         };
         frame.render_widget(
@@ -1368,24 +1412,26 @@ fn render_plan_group(
     }
 }
 
-/// 覆盖校验：收入 / 开销额度合计 / 剩余（或缺口）一句话结论 —— 开销额度盖不盖得住工资，看这里。
+/// 覆盖校验：收入计划目标 / 开销额度合计 / 剩余（或缺口）一句话结论 ——
+/// 开销额度盖不盖得住收入目标，看这里。收入取**所有收入计划的目标合计**，
+/// 不是本月已记账的工资：月初还没记工资时也得有数。
 fn render_plan_check(frame: &mut Frame, area: Rect, app: &App) {
     let block = block_with_title(false, "覆盖校验");
     let inner = block.inner(area);
     let width = inner.width as usize;
     let total = total_limit(&app.plans);
+    let income = app
+        .coverage
+        .as_ref()
+        .map(|coverage| coverage.income)
+        .unwrap_or(0);
 
     let mut lines = vec![
         stat_row(
             &[
                 (
-                    "收入",
-                    money::format_amount(
-                        app.coverage
-                            .as_ref()
-                            .map(|coverage| coverage.income)
-                            .unwrap_or(0),
-                    ),
+                    "收入目标",
+                    money::format_amount(income),
                     plain(),
                 ),
                 ("额度", money::format_amount(total), bold(TEXT)),
@@ -1401,6 +1447,9 @@ fn render_plan_check(frame: &mut Frame, area: Rect, app: &App) {
             "留空额度的开销计划只累计，不参与校验",
             muted(),
         )));
+    } else if income <= 0 {
+        lines.push(Line::from(Span::styled("收入计划还没设目标", muted())));
+        lines.push(Line::from(Span::styled("按 a 新建，类型选「收入」", muted())));
     } else {
         match app.coverage.as_ref() {
             Some(coverage) if coverage.covers() => {
@@ -1408,17 +1457,38 @@ fn render_plan_check(frame: &mut Frame, area: Rect, app: &App) {
                     "✔ 开销额度盖得住收入",
                     bold(GOOD),
                 )]));
-                lines.push(Line::from(vec![
+                let mut line = vec![
                     Span::styled("还剩 ", muted()),
                     Span::styled(money::format_amount(coverage.remaining()), bold(GOOD)),
-                ]));
+                ];
+                if coverage.uncapped_spent > 0 {
+                    // 不写清楚的话，用户会奇怪「还剩」为什么比 收入目标 − 额度 少
+                    line.push(Span::styled(
+                        format!(
+                            "（已扣未设上限的已花 {}）",
+                            money::format_amount(coverage.uncapped_spent)
+                        ),
+                        muted(),
+                    ));
+                }
+                lines.push(Line::from(line));
             }
             Some(coverage) => {
                 lines.push(Line::from(Span::styled("✖ 开销额度盖不住收入", bold(BAD))));
-                lines.push(Line::from(vec![
+                let mut line = vec![
                     Span::styled("差 ", muted()),
                     Span::styled(money::format_amount(coverage.shortfall()), bold(BAD)),
-                ]));
+                ];
+                if coverage.uncapped_spent > 0 {
+                    line.push(Span::styled(
+                        format!(
+                            "（已扣未设上限的已花 {}）",
+                            money::format_amount(coverage.uncapped_spent)
+                        ),
+                        muted(),
+                    ));
+                }
+                lines.push(Line::from(line));
             }
             None => {
                 lines.push(Line::from(Span::styled("收入待汇总", muted())));
@@ -1587,7 +1657,7 @@ fn weekday_label(date: chrono::NaiveDate) -> &'static str {
     LABELS[date.weekday().num_days_from_monday() as usize]
 }
 
-/// 账单页一行：方向 · 金额 · 计划 · 分类 · 备注 · 计列。
+/// 账单页一行：方向 · 金额 · 计划 · 分类 · 备注。日历口径跟着计划走，不再有「计列」列。
 fn bill_line(bill: &BillEntity, selected: bool, width: usize) -> Line<'static> {
     let kind_style = match bill.kind {
         BillKind::Income => bold(GOOD),
@@ -1598,8 +1668,8 @@ fn bill_line(bill: &BillEntity, selected: bool, width: usize) -> Line<'static> {
         BillKind::Expense => "-",
     };
     let amount = format!("{sign}{}", money::format_amount(bill.amount));
-    let flag = if bill.excluded { "×" } else { "✓" };
-    let room = width.saturating_sub(5 + 13 + 11 + 11 + 3);
+    // 账单没有「计列」这一列了：进不进日历由它所属的计划决定
+    let room = width.saturating_sub(5 + 13 + 11 + 11 + 2);
     let remark = truncate(bill.remark.as_deref().unwrap_or_default(), room);
 
     let mut spans = vec![
@@ -1619,14 +1689,7 @@ fn bill_line(bill: &BillEntity, selected: bool, width: usize) -> Line<'static> {
         Span::styled(pad_right(&truncate(&bill.category.name, 10), 10), plain()),
         Span::raw(" "),
         Span::styled(pad_right(&remark, room), muted()),
-        Span::styled(flag, muted()),
     ];
-    if bill.excluded {
-        spans = spans
-            .into_iter()
-            .map(|span| span.style(Style::default().fg(MUTED)))
-            .collect();
-    }
     if selected {
         // 选中行只留底色：方向色和备注灰压在深蓝底上都会糊，统一交给行样式
         spans = select_spans(spans);
@@ -2370,6 +2433,7 @@ fn hotkeys_for(app: &App) -> Vec<(&'static str, &'static str)> {
             ("Enter", "改这块"),
             ("a", "新增一块"),
             ("d", "删除"),
+            ("x", "计入日历"),
             ("?","帮助"),
         ],
         Page::Bills => vec![
@@ -2377,7 +2441,6 @@ fn hotkeys_for(app: &App) -> Vec<(&'static str, &'static str)> {
             ("a", "记一笔"),
             ("Enter", "编辑"),
             ("d", "删除"),
-            ("x", "计列"),
             ("?","帮助"),
         ],
         Page::Reports => match app.report_tab {
@@ -2607,13 +2670,16 @@ fn render_confirm_modal(frame: &mut Frame, title: &str, message: &str) {
     let width = (display_width(message) + 10) as u16;
     let width = width.clamp(34, 60).min(screen.width.saturating_sub(4));
 
-    let lines = vec![
-        Line::from(Span::styled(message.to_string(), bold(TEXT))).centered(),
-        Line::from(""),
-        Line::from(Span::styled("Enter / y 确认 · Esc / n 取消", muted())).centered(),
-    ];
+    // 删除计划的确认文案会很长（带账单数、默认计划名），按宽度折行，别让后半句被裁掉
+    let inner_width = width.saturating_sub(2 + 2 * PAD) as usize;
+    let mut lines: Vec<Line<'static>> = wrap_text(message, inner_width)
+        .into_iter()
+        .map(|line| Line::from(Span::styled(line, bold(TEXT))).centered())
+        .collect();
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled("Enter / y 确认 · Esc / n 取消", muted())).centered());
 
-    let height = lines.len() as u16 + 2;
+    let height = (lines.len() as u16 + 2).min(screen.height.saturating_sub(2));
     let rect = centered_rect(screen, width, height);
     frame.render_widget(Clear, rect);
     frame.render_widget(
@@ -2628,19 +2694,19 @@ fn render_notice_modal(frame: &mut Frame, title: &str, message: &str) {
     let width = (display_width(message) + 10) as u16;
     let width = width.clamp(34, 64).min(screen.width.saturating_sub(4));
 
-    let lines = vec![
-        Line::from(Span::styled(message.to_string(), plain())),
-        Line::from(""),
-        Line::from(Span::styled("按 Enter 关闭", muted())),
-    ];
+    let inner_width = width.saturating_sub(2 + 2 * PAD) as usize;
+    let mut lines: Vec<Line<'static>> = wrap_text(message, inner_width)
+        .into_iter()
+        .map(|line| Line::from(Span::styled(line, plain())))
+        .collect();
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled("按 Enter 关闭", muted())));
 
-    let height = lines.len() as u16 + 2;
+    let height = (lines.len() as u16 + 2).min(screen.height.saturating_sub(2));
     let rect = centered_rect(screen, width, height);
     frame.render_widget(Clear, rect);
     frame.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .block(block_with_title(true, title.to_string())),
+        Paragraph::new(lines).block(block_with_title(true, title.to_string())),
         rect,
     );
 }
@@ -2894,7 +2960,9 @@ mod tests {
     use crate::month::model::{BillMonthCollection, YearCollection};
     use crate::month::service::{MonthReport, YearReport};
     use crate::bill_book::model::Plan;
-    use crate::plan::model::{PlanProgress, PlanRow};
+    use crate::plan::model::{
+        PlanCoverage, PlanProgress, PlanRow, total_income, total_limit, uncapped_spent,
+    };
     use crate::tui::app::{Action, Form, Modal, Page, SettingsSection};
     use crate::tui::input::Key;
     use chrono::{NaiveDate, TimeZone, Utc};
@@ -3005,6 +3073,13 @@ mod tests {
         let mut spending = HashMap::new();
         spending.insert(5, 1234);
         app.progress = Some(PlanProgress::build(month, 4_000_00, None, &spending));
+
+        // 覆盖校验和真实 reload 一样给上：收入取收入计划目标合计（样本里没有收入计划，正好走空状态）
+        app.coverage = Some(PlanCoverage::new(
+            total_income(&app.plans),
+            total_limit(&app.plans),
+            uncapped_spent(&app.plans),
+        ));
 
         // 概览的「今日」和「当日动账」都跟 selected_day 走，钉死到 5 号，
         // 基线就不会因为跑测试那天是几号而漂
@@ -3534,6 +3609,29 @@ mod tests {
         assert!(screen.contains("Esc / n 取消"), "{screen}");
     }
 
+    /// 删计划的确认文案会很长：要按宽度折行，不能把「此操作不可撤销」裁掉。
+    #[test]
+    fn long_confirm_message_wraps_instead_of_being_cut() {
+        let mut app = sample_app();
+        app.modal = Some(Modal::Confirm {
+            title: "确认删除".to_string(),
+            message: "计划「房租」（每月 2,500.00 元）下有 12 笔账单，删除后全部移到「默认」计划，收支归属随之改变。此操作不可撤销。".to_string(),
+            action: Action::DeletePlan {
+                id: 1,
+                move_bills: true,
+            },
+        });
+
+        let screen = render_screen(&app, 120, 40);
+        assert!(screen.contains("计划「房租」"), "开头要在：\n{screen}");
+        assert!(screen.contains("部移到「默认」计划"), "后半句要在：\n{screen}");
+        assert!(
+            screen.contains("此操作不可撤销"),
+            "长文案不能被截断：\n{screen}"
+        );
+        assert!(screen.contains("Esc / n 取消"), "{screen}");
+    }
+
     /// 120x40 下的整页快照 + 关键区块断言（也可人工核对排版）。
     #[test]
     fn wide_layout_keeps_its_panels() {
@@ -3645,6 +3743,139 @@ mod tests {
         assert!(screen.contains("当日动账 · 8 笔"), "{screen}");
         assert!(screen.contains("笔没放下"), "该提示还有没显示的账：\n{screen}");
         assert!(!screen.contains("第八笔"), "放不下的不该硬塞：\n{screen}");
+    }
+
+    /// 覆盖校验的「收入」必须是收入计划的目标合计，而不是本月实际收入账单。
+    #[test]
+    fn plan_check_counts_income_plan_targets() {
+        let mut app = sample_app();
+        app.page = Page::Plan;
+        app.plans = vec![
+            PlanRow::new(
+                Plan::new(
+                    BillBook {
+                        id: 3,
+                        name: "工资".into(),
+                    },
+                    Some(8_000_00),
+                    PlanKind::Income,
+                ),
+                0,
+            ),
+            // 没设目标的收入计划不参与合计，但它存在，面板就不该退回空状态
+            PlanRow::new(
+                Plan::new(
+                    BillBook {
+                        id: 4,
+                        name: "外快".into(),
+                    },
+                    None,
+                    PlanKind::Income,
+                ),
+                300_00,
+            ),
+            PlanRow::new(
+                Plan::new(
+                    BillBook {
+                        id: 1,
+                        name: "房租".into(),
+                    },
+                    Some(2_500_00),
+                    PlanKind::Expense,
+                ),
+                0,
+            ),
+        ];
+        app.coverage = Some(PlanCoverage::new(
+            total_income(&app.plans),
+            total_limit(&app.plans),
+            uncapped_spent(&app.plans),
+        ));
+
+        let screen = render_screen(&app, 120, 40);
+        assert!(screen.contains("收入目标"), "{screen}");
+        assert!(
+            screen.contains("8,000.00"),
+            "收入要取收入计划的目标合计：\n{screen}"
+        );
+        assert!(
+            screen.contains("开销额度盖得住收入"),
+            "8,000 的目标盖得住 2,500 的额度：\n{screen}"
+        );
+        assert!(screen.contains("5,500.00"), "还剩 8,000 − 2,500：\n{screen}");
+        assert!(!screen.contains("收入计划还没设目标"), "{screen}");
+    }
+
+    /// 没设额度的开销计划已经花掉的钱，要从「还剩」里扣掉，并且面板要说清为什么少了。
+    #[test]
+    fn plan_check_deducts_spending_on_uncapped_plans() {
+        let mut app = sample_app();
+        app.page = Page::Plan;
+        app.plans = vec![
+            PlanRow::new(
+                Plan::new(
+                    BillBook {
+                        id: 3,
+                        name: "工资".into(),
+                    },
+                    Some(8_000_00),
+                    PlanKind::Income,
+                ),
+                0,
+            ),
+            PlanRow::new(
+                Plan::new(
+                    BillBook {
+                        id: 1,
+                        name: "房租".into(),
+                    },
+                    Some(2_500_00),
+                    PlanKind::Expense,
+                ),
+                2_500_00,
+            ),
+            PlanRow::new(
+                Plan::new(
+                    BillBook {
+                        id: 2,
+                        name: "吃饭".into(),
+                    },
+                    None,
+                    PlanKind::Expense,
+                ),
+                1_200_00,
+            ),
+        ];
+        app.coverage = Some(PlanCoverage::new(
+            total_income(&app.plans),
+            total_limit(&app.plans),
+            uncapped_spent(&app.plans),
+        ));
+
+        let screen = render_screen(&app, 120, 40);
+        assert!(
+            screen.contains("还剩 4,300.00"),
+            "还剩 = 8,000 − 2,500 − 1,200：\n{screen}"
+        );
+        assert!(
+            screen.contains("已扣未设上限的已花 1,200.00"),
+            "要说明这 1,200 是怎么少的：\n{screen}"
+        );
+    }
+
+    /// 一条收入计划都没有（或都没设目标）时，面板要指路，而不是只显示 0。
+    #[test]
+    fn plan_check_asks_for_an_income_target_when_there_is_none() {
+        let mut app = sample_app();
+        app.page = Page::Plan;
+
+        let screen = render_screen(&app, 120, 40);
+        assert!(screen.contains("收入目标"), "{screen}");
+        assert!(screen.contains("收入计划还没设目标"), "{screen}");
+        assert!(
+            screen.contains("类型选「收入」"),
+            "空状态要指到「新建收入计划」：\n{screen}"
+        );
     }
 
     /// 空列表要给引导语，而不是一块白板。

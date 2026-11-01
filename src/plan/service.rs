@@ -16,8 +16,8 @@ use crate::common::money;
 use crate::common::state::StateStore;
 use crate::common::types::{AmountType, BookId};
 use crate::plan::model::{
-    PlanCoverage, PlanProgress, PlanRow, expense_by_day, expense_by_plan, income_by_plan, month_income,
-    total_limit,
+    PlanCoverage, PlanProgress, PlanRow, calendar_books, expense_by_day, expense_by_plan,
+    income_by_plan, total_income, total_limit, uncapped_spent,
 };
 
 /// 老版本把整份计划存成一行 JSON（`[{name, amount, category?}]`）；迁移完删掉。
@@ -28,6 +28,8 @@ const LEGACY_KEY_EXPECTED: &str = "plan.expected";
 const LEGACY_KEY_SAVINGS: &str = "plan.savings";
 /// 迁移只做一次：标记留着，之后新建的空计划不会被误判成「还没迁移」。
 const KEY_MIGRATED: &str = "plan.migrated";
+/// 老版本「单笔账单计不计入日历」→ 计划级标志，只迁一次。
+const KEY_CALENDAR_MIGRATED: &str = "plan.calendar_migrated";
 
 #[derive(Clone)]
 pub struct PlanService {
@@ -44,7 +46,7 @@ pub struct PlanSnapshot {
     pub rows: Vec<PlanRow>,
     /// 当月额度与日历状态；额度取所有有额度的开销计划之和。
     pub progress: PlanProgress,
-    /// 计划合计 vs 当月收入。
+    /// 收入计划目标合计 vs 开销额度合计（「还剩」再扣掉没额度计划的已花）。
     pub coverage: PlanCoverage,
 }
 
@@ -69,21 +71,29 @@ impl PlanService {
         Ok(Plan::new(book, limit, kind))
     }
 
-    /// 改某个计划的额度；`None` 表示取消额度。类型保持不变。
+    /// 改某个计划的额度；`None` 表示取消额度。类型与日历标志保持不变。
     pub async fn set_limit(&self, target: &str, limit: Option<AmountType>) -> Result<Plan> {
         let limit = clean_limit(limit)?;
         let book = self.books.find_target(target).await?;
-        let kind = self.by_id(book.id).await?.kind;
+        let current = self.by_id(book.id).await?;
         self.books.set_limit(book.id, limit).await?;
-        Ok(Plan::new(book, limit, kind))
+        Ok(Plan::new(book, limit, current.kind).with_calendar(current.in_calendar))
     }
 
-    /// 改类型（收入 / 开销）；额度原样保留。
+    /// 改类型（收入 / 开销）；额度与日历标志原样保留。
     pub async fn set_kind(&self, target: &str, kind: PlanKind) -> Result<Plan> {
         let book = self.books.find_target(target).await?;
         let plan = self.by_id(book.id).await?;
         self.books.set_kind(book.id, kind).await?;
-        Ok(Plan::new(book, plan.limit, kind))
+        Ok(Plan::new(book, plan.limit, kind).with_calendar(plan.in_calendar))
+    }
+
+    /// 改「是否计入日历」；额度与类型都不动。
+    pub async fn set_in_calendar(&self, target: &str, in_calendar: bool) -> Result<Plan> {
+        let book = self.books.find_target(target).await?;
+        let plan = self.by_id(book.id).await?;
+        self.books.set_in_calendar(book.id, in_calendar).await?;
+        Ok(Plan::new(book, plan.limit, plan.kind).with_calendar(in_calendar))
     }
 
     /// 改名。计划靠名字找，所以重名会被拒。
@@ -91,7 +101,30 @@ impl PlanService {
         let book = self.books.find_target(target).await?;
         let plan = self.by_id(book.id).await?;
         let book = self.books.rename(book.id, new_name).await?;
-        Ok(Plan::new(book, plan.limit, plan.kind))
+        Ok(Plan::new(book, plan.limit, plan.kind).with_calendar(plan.in_calendar))
+    }
+
+    /// 某个计划名下有多少账单：删除前给确认框报数。
+    pub async fn bill_count(&self, id: BookId) -> Result<i64> {
+        self.books.count_bills(id).await
+    }
+
+    /// 删计划：名下账单先整体搬到 `fallback`，再删。返回 (计划, 搬走的账单数)。
+    ///
+    /// 「默认」计划自己不能当搬运目标——它的账单没处可移，只能先手动改到别的计划。
+    pub async fn remove_moving_bills(&self, target: &str, fallback: &str) -> Result<(Plan, i64)> {
+        let book = self.books.find_target(target).await?;
+        if book.name == fallback {
+            bail!("「{fallback}」是默认计划，名下账单没处可移，先改到别的计划再删");
+        }
+        let plan = self.by_id(book.id).await?;
+        let moved = self.books.count_bills(book.id).await?;
+        if moved > 0 {
+            let fallback_book = self.books.resolve_or_create(fallback).await?.0;
+            self.books.move_bills(book.id, fallback_book.id).await?;
+        }
+        self.books.remove(&book.id.to_string()).await?;
+        Ok((plan, moved))
     }
 
     /// 删掉计划；名下还有账单时数据库会拒绝（外键 RESTRICT），这里翻译成人话。
@@ -128,6 +161,9 @@ impl PlanService {
     }
 
     /// TUI 每月的 reload 走这里：一次查询把列表、日历、覆盖都算好。
+    ///
+    /// 覆盖校验的「收入」取**收入计划的目标合计**，不是本月实际收入账单：
+    /// 月初还没记工资时，计划页也得能回答「这些开销额度分得完吗」。
     pub async fn snapshot(
         &self,
         month: NaiveDate,
@@ -139,15 +175,44 @@ impl PlanService {
 
         let rows = build_rows(plans, &bills, month);
         let limit = total_limit(&rows);
-        let spending = expense_by_day(month, &bills);
+        let income = total_income(&rows);
+        // 日历只认「计入日历」的计划名下的支出：账单跟着计划走
+        let calendar = calendar_books(&rows);
+        let spending = expense_by_day(month, &bills, &calendar);
         let progress = PlanProgress::build(month, limit, today, &spending);
-        let coverage = PlanCoverage::new(month_income(month, &bills), limit);
+        let coverage = PlanCoverage::new(income, limit, uncapped_spent(&rows));
 
         Ok(PlanSnapshot {
             rows,
             progress,
             coverage,
         })
+    }
+
+    /// 老版本是「单笔账单计不计入」；新版本按计划。
+    ///
+    /// 迁移规则：一个计划名下的账单**全部**被标成不计入时，把这个计划整体标成不计入；
+    /// 混合的保留计入（否则会把本来要算的钱也一起关掉）。只迁一次。
+    pub async fn migrate_calendar_flags(&self) -> Result<usize> {
+        if self.state.get(KEY_CALENDAR_MIGRATED).await?.is_some() {
+            return Ok(0);
+        }
+
+        let mut changed = 0;
+        for plan in self.list().await? {
+            let total = self.books.count_bills(plan.id()).await?;
+            if total == 0 {
+                continue;
+            }
+            let excluded = self.bills.count_legacy_excluded(plan.id()).await?;
+            if excluded == total && plan.in_calendar {
+                self.books.set_in_calendar(plan.id(), false).await?;
+                changed += 1;
+            }
+        }
+
+        self.state.set(KEY_CALENDAR_MIGRATED, "1").await?;
+        Ok(changed)
     }
 
     /// 把老版本那行 JSON 里的小块搬成「带上限的计划」，只做一次。
@@ -406,6 +471,55 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 老版本把「不计入日历」记在单笔账单上：整块都被排除的计划，迁移时整块关掉，且只迁一次。
+    #[tokio::test]
+    async fn legacy_bill_exclusions_become_a_plan_flag_once() {
+        use crate::bill::dao::BillDao;
+        use crate::bill::model::BillKind;
+        use crate::bill::service::{BillService, NewBill};
+        use chrono::{TimeZone, Utc};
+
+        let (pool, dir) = setup().await;
+        let plans = PlanService::new(pool.clone());
+        let bills = BillService::new(pool.clone());
+        let bill_dao = BillDao::new(pool.clone());
+
+        plans
+            .add("报销", Some(1_000_00), PlanKind::Expense)
+            .await
+            .unwrap();
+        let (bill, _) = bills
+            .add(NewBill {
+                kind: BillKind::Expense,
+                amount: 300_00,
+                book: "报销".into(),
+                category: "默认".into(),
+                created_at: Utc.with_ymd_and_hms(2026, 10, 5, 12, 0, 0).unwrap(),
+                remark: None,
+            })
+            .await
+            .unwrap();
+        // 老版本的单笔排除：整个计划名下只有这一笔，且被排除
+        bill_dao.set_excluded(bill.id, true).await.unwrap();
+
+        assert_eq!(
+            plans.migrate_calendar_flags().await.unwrap(),
+            1,
+            "整块都被排除 → 计划整体关掉"
+        );
+        assert!(
+            !plans.get("报销").await.unwrap().in_calendar,
+            "迁移后计划跟着不计入日历"
+        );
+        assert_eq!(
+            plans.migrate_calendar_flags().await.unwrap(),
+            0,
+            "迁移只做一次"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// `plan_kind` 必须真的落在库里：建的时候是收入，读回来还得是收入；
     /// 改额度不能把类型带走，改类型也不能动额度。
     #[tokio::test]
@@ -457,6 +571,154 @@ mod tests {
             service.get("工资").await.unwrap().limit,
             Some(9_000_00),
             "改类型后额度还在库里"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 覆盖校验不能把「不计入日历」的计划漏掉：关掉的是支出统计，不是额度分配。
+    #[tokio::test]
+    async fn coverage_counts_plans_out_of_calendar() {
+        let (pool, dir) = setup().await;
+        let service = PlanService::new(pool.clone());
+
+        service
+            .add("工资", Some(8_000_00), PlanKind::Income)
+            .await
+            .unwrap();
+        service
+            .add("房租", Some(2_500_00), PlanKind::Expense)
+            .await
+            .unwrap();
+        service
+            .add("报销", Some(1_000_00), PlanKind::Expense)
+            .await
+            .unwrap();
+        service.set_in_calendar("报销", false).await.unwrap();
+
+        let month = NaiveDate::from_ymd_opt(2026, 10, 1).expect("2026-10");
+        let snapshot = service.snapshot(month, None).await.unwrap();
+
+        assert_eq!(
+            snapshot.coverage.allocated, 3_500_00,
+            "不计入日历的额度也要算进覆盖校验"
+        );
+        assert_eq!(snapshot.coverage.remaining(), 4_500_00);
+        // 本月额度同样按全部计划摊（1.7 的既有口径）
+        assert_eq!(snapshot.progress.limit, 3_500_00);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 覆盖校验的「收入」来自收入计划的目标合计，不来自当月账单：
+    /// 月初一分钱没记，也得能回答「这些开销额度分得完吗」。
+    #[tokio::test]
+    async fn coverage_uses_income_plan_targets_not_bills() {
+        let (pool, dir) = setup().await;
+        let service = PlanService::new(pool.clone());
+
+        service
+            .add("房租", Some(2_500_00), PlanKind::Expense)
+            .await
+            .unwrap();
+        service
+            .add("工资", Some(8_000_00), PlanKind::Income)
+            .await
+            .unwrap();
+        // 没设目标的收入计划不参与合计
+        service.add("外快", None, PlanKind::Income).await.unwrap();
+
+        let month = NaiveDate::from_ymd_opt(2026, 10, 1).expect("2026-10");
+        let snapshot = service.snapshot(month, None).await.unwrap();
+
+        // 这个月一笔账单都没有，收入照样有数
+        assert_eq!(
+            snapshot.coverage.income, 8_000_00,
+            "收入 = 收入计划目标合计，不是当月账单"
+        );
+        assert_eq!(snapshot.coverage.allocated, 2_500_00, "额度 = 开销计划额度合计");
+        assert_eq!(snapshot.coverage.remaining(), 5_500_00);
+        assert!(snapshot.coverage.covers());
+        // 日历额度仍然只摊开销计划
+        assert_eq!(snapshot.progress.limit, 2_500_00);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 删计划带账单：账单整体搬到「默认」计划，计划本身删掉。
+    #[tokio::test]
+    async fn removing_a_plan_moves_its_bills_to_default() {
+        use crate::bill::model::BillKind;
+        use crate::bill::service::{BillService, NewBill};
+        use chrono::{TimeZone, Utc};
+
+        let (pool, dir) = setup().await;
+        let plans = PlanService::new(pool.clone());
+        let books = BookService::new(pool.clone());
+        let bills = BillService::new(pool.clone());
+
+        plans
+            .add("房租", Some(2_500_00), PlanKind::Expense)
+            .await
+            .unwrap();
+        bills
+            .add(NewBill {
+                kind: BillKind::Expense,
+                amount: 500_00,
+                book: "房租".into(),
+                category: "默认".into(),
+                created_at: Utc.with_ymd_and_hms(2026, 10, 5, 12, 0, 0).unwrap(),
+                remark: None,
+            })
+            .await
+            .unwrap();
+
+        let (plan, moved) = plans.remove_moving_bills("房租", "默认").await.unwrap();
+        assert_eq!(plan.name(), "房租");
+        assert_eq!(moved, 1, "名下 1 笔账单被搬走");
+
+        // 计划没了，账单还在「默认」计划名下
+        assert!(
+            plans.list().await.unwrap().iter().all(|p| p.name() != "房租"),
+            "计划本身要删掉"
+        );
+        let default = books.resolve("默认").await.unwrap();
+        assert_eq!(
+            books.count_bills(default.id).await.unwrap(),
+            1,
+            "账单不该跟着计划一起消失"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 「默认」计划自己的账单没处可移：拒绝，别删出一批无主账单。
+    #[tokio::test]
+    async fn default_plan_with_bills_is_not_moved_onto_itself() {
+        use crate::bill::model::BillKind;
+        use crate::bill::service::{BillService, NewBill};
+        use chrono::{TimeZone, Utc};
+
+        let (pool, dir) = setup().await;
+        let plans = PlanService::new(pool.clone());
+        let bills = BillService::new(pool.clone());
+
+        bills
+            .add(NewBill {
+                kind: BillKind::Expense,
+                amount: 100_00,
+                book: "默认".into(),
+                category: "默认".into(),
+                created_at: Utc.with_ymd_and_hms(2026, 10, 5, 12, 0, 0).unwrap(),
+                remark: None,
+            })
+            .await
+            .unwrap();
+
+        let error = plans.remove_moving_bills("默认", "默认").await.unwrap_err();
+        assert!(
+            format!("{error:#}").contains("默认计划"),
+            "要说清为什么删不了：{error:#}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

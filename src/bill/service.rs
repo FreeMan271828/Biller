@@ -283,14 +283,11 @@ impl BillService {
         Ok(())
     }
 
-    /// 切换一条账单「是否纳入统计」。
+    /// 某个计划名下有多少账单被老版本标成了「不计入日历」。
     ///
-    /// 不纳入统计的账单仍然存在、仍能在列表里看到，只是不参与支出日历的口径。
-    pub async fn set_excluded(&self, id: BillId, excluded: bool) -> Result<()> {
-        if self.dao.set_excluded(id, excluded).await? == 0 {
-            bail!("账单 id={id} 不存在");
-        }
-        Ok(())
+    /// 只给一次性迁移用：新版本里账单没有这个开关，日历口径由计划决定。
+    pub async fn count_legacy_excluded(&self, book_id: crate::common::types::BookId) -> Result<i64> {
+        self.dao.count_legacy_excluded(book_id).await
     }
 
     /// 把「名称」条件解析成 id，再交给 dao。

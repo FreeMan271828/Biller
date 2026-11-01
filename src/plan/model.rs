@@ -6,12 +6,12 @@
 //!
 //! 两种类型共用一套结构，口径只差一个方向：
 //!
-//! * **收入计划**（`plan.kind == Income`）：累计这个月进账多少，跟「目标」比；
-//!   「不计入」的账单照样算收入，和 [`month_income`] 一个口径；
+//! * **收入计划**（`plan.kind == Income`）：累计这个月进账多少，跟「目标」比，
+//!   目标合计就是覆盖校验里的「收入」；「不计入」的账单照样算收入；
 //! * **开销计划**（`Expense`）：累计这个月花掉多少，跟「上限」比，能上色日历；
 //!   「不计入」的账单不算支出。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use chrono::{Datelike, NaiveDate};
 
@@ -59,10 +59,12 @@ impl PlanRow {
     }
 }
 
-/// 所有**开销计划**的额度合计：日历与概览的「本月额度」都取这个数。
+/// 所有**开销计划**的额度合计：日历的「本月额度」与覆盖校验的「开销额度」都取这个数。
 ///
 /// 收入计划不参与：日历摊的是能花多少钱，把收入目标摊进日额度等于凭空多给钱。
-/// 没额度的计划也不参与——它们没有额度可摊，摊进去会把日额度算虚。
+/// **不计入日历的计划照样参与**：不计入日历关掉的是「这笔支出算不算进日历」，
+/// 不是「这笔钱有没有被分出去」——覆盖校验回答的是「这些额度分得完吗」，必须看全部计划。
+/// 没额度的计划不参与——它们没有额度可摊，摊进去会把日额度算虚。
 pub fn total_limit(rows: &[PlanRow]) -> AmountType {
     rows.iter()
         .filter(|row| row.plan.kind == PlanKind::Expense)
@@ -71,23 +73,63 @@ pub fn total_limit(rows: &[PlanRow]) -> AmountType {
         .sum()
 }
 
-/// 计划合计 vs 当月收入：这张卡回答「钱分完了吗、分超了吗」。
+/// 计入日历的计划 id 集合：算日历 / 进度时按它筛账单。
+///
+/// 账单自己没有「计入日历」开关，一律跟着计划走。
+pub fn calendar_books(rows: &[PlanRow]) -> HashSet<BookId> {
+    rows.iter()
+        .filter(|row| row.plan.in_calendar)
+        .map(|row| row.plan.id())
+        .collect()
+}
+
+/// 所有**收入计划**的目标合计：覆盖校验的「收入」取这个数。
+///
+/// 不拿账单去凑：收入计划是「这个月打算进来多少」，月初还没记账时也得有数，
+/// 否则覆盖校验永远是一片空白。没设目标的收入计划不参与——它没有承诺可对照。
+pub fn total_income(rows: &[PlanRow]) -> AmountType {
+    rows.iter()
+        .filter(|row| row.plan.kind == PlanKind::Income)
+        .filter_map(|row| row.plan.limit)
+        .filter(|limit| *limit > 0)
+        .sum()
+}
+
+/// 没设额度的开销计划，本月已经花掉多少。
+///
+/// 覆盖校验的「还剩」必须把它扣掉：没额度不等于没花钱，
+/// 否则「还剩」会把已经花出去、只是没预算的那部分钱重新算成可用。
+/// 同样不看「是否计入日历」——覆盖校验算的是全部计划。
+pub fn uncapped_spent(rows: &[PlanRow]) -> AmountType {
+    rows.iter()
+        .filter(|row| row.plan.kind == PlanKind::Expense && !row.plan.has_limit())
+        .map(|row| row.spent)
+        .sum()
+}
+
+/// 收入目标 vs 开销额度：这张卡回答「钱分完了吗、分超了吗」。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlanCoverage {
-    /// 当月收入（工资）。
+    /// 收入计划的目标合计（不是本月实际收入账单）。
     pub income: AmountType,
     /// 开销计划额度合计。
     pub allocated: AmountType,
+    /// 没设额度的开销计划本月已花（从「还剩」里扣掉）。
+    pub uncapped_spent: AmountType,
 }
 
 impl PlanCoverage {
-    pub fn new(income: AmountType, allocated: AmountType) -> Self {
-        Self { income, allocated }
+    pub fn new(income: AmountType, allocated: AmountType, uncapped_spent: AmountType) -> Self {
+        Self {
+            income,
+            allocated,
+            uncapped_spent,
+        }
     }
 
-    /// 收入减计划：正数=还有没分配的钱，负数=分超了。
+    /// 收入目标减开销额度、再减没额度计划的已花：正数=还有没分配的，负数=分超了。
     pub fn remaining(&self) -> AmountType {
-        self.income - self.allocated
+        self.income - self.allocated - self.uncapped_spent
     }
 
     /// 分超的部分（没超就是 0）。
@@ -100,26 +142,13 @@ impl PlanCoverage {
         self.remaining() >= 0
     }
 
-    /// 计划占收入的比例；收入为 0 时给 0，避免除零。
+    /// 开销额度占收入目标的比例；收入目标为 0 时给 0，避免除零。
     pub fn ratio(&self) -> f64 {
         if self.income <= 0 {
             return 0.0;
         }
         self.allocated as f64 / self.income as f64
     }
-}
-
-/// 当月收入合计。`excluded` 只影响支出日历与计划执行，不影响收入口径。
-pub fn month_income(month: NaiveDate, bills: &[BillEntity]) -> AmountType {
-    bills
-        .iter()
-        .filter(|bill| bill.kind == BillKind::Income)
-        .filter(|bill| {
-            let date = bill.created_at.date_naive();
-            date.year() == month.year() && date.month() == month.month()
-        })
-        .map(|bill| bill.amount)
-        .sum()
 }
 
 /// 某月有多少天。
@@ -272,11 +301,17 @@ impl PlanProgress {
     }
 }
 
-/// 某月每天花了多少（不含「不计入日历」的支出）。
-pub fn expense_by_day(month: NaiveDate, bills: &[BillEntity]) -> HashMap<u32, AmountType> {
+/// 某月每天花了多少：只算**计入日历的计划**名下的支出。
+///
+/// `calendar` 就是 [`calendar_books`] 的结果 —— 账单跟着计划走，自己不存这个开关。
+pub fn expense_by_day(
+    month: NaiveDate,
+    bills: &[BillEntity],
+    calendar: &HashSet<BookId>,
+) -> HashMap<u32, AmountType> {
     let mut by_day: HashMap<u32, AmountType> = HashMap::new();
     for bill in bills {
-        if bill.kind != BillKind::Expense || bill.excluded {
+        if bill.kind != BillKind::Expense || !calendar.contains(&bill.book.id) {
             continue;
         }
         let date = bill.created_at.date_naive();
@@ -290,8 +325,8 @@ pub fn expense_by_day(month: NaiveDate, bills: &[BillEntity]) -> HashMap<u32, Am
 
 /// 某月每个收入计划进账多少：`book_id -> 收入合计`。
 ///
-/// 与 [`month_income`] 同口径：`excluded` 只影响支出（日历、开销计划），
-/// 不影响收入，所以这里不过滤「不计入」。
+/// 收入不进日历，所以这里不按「是否计入日历」筛，也不看账单上的历史
+/// `excluded` 标记：收入口径只认方向和日期。
 pub fn income_by_plan(month: NaiveDate, bills: &[BillEntity]) -> HashMap<BookId, AmountType> {
     let mut by_plan: HashMap<BookId, AmountType> = HashMap::new();
     for bill in bills {
@@ -307,11 +342,14 @@ pub fn income_by_plan(month: NaiveDate, bills: &[BillEntity]) -> HashMap<BookId,
     by_plan
 }
 
-/// 某月每个开销计划花了多少：`book_id -> 支出合计`（不含「不计入日历」的支出）。
+/// 某月每个开销计划花了多少：`book_id -> 支出合计`。
+///
+/// 计划自己那一行始终展示它名下的全部支出（哪怕它被标成不计入日历）——
+/// 关掉的只是「进不进日历」，不是「记没记账」。
 pub fn expense_by_plan(month: NaiveDate, bills: &[BillEntity]) -> HashMap<BookId, AmountType> {
     let mut by_plan: HashMap<BookId, AmountType> = HashMap::new();
     for bill in bills {
-        if bill.kind != BillKind::Expense || bill.excluded {
+        if bill.kind != BillKind::Expense {
             continue;
         }
         let date = bill.created_at.date_naive();
@@ -413,19 +451,49 @@ mod tests {
 
     #[test]
     fn coverage_compares_allocated_to_income() {
-        let coverage = PlanCoverage::new(10_000_00, 12_000_00);
+        let coverage = PlanCoverage::new(10_000_00, 12_000_00, 0);
         assert!(!coverage.covers());
         assert_eq!(coverage.shortfall(), 2000_00);
         assert_eq!(coverage.remaining(), -2000_00);
 
-        let exact = PlanCoverage::new(10_000_00, 10_000_00);
+        let exact = PlanCoverage::new(10_000_00, 10_000_00, 0);
         assert!(exact.covers());
         assert_eq!(exact.ratio(), 1.0);
     }
 
     #[test]
+    fn coverage_deducts_uncapped_spending() {
+        // 收入 10,000、额度 6,000、没上限的计划已经花了 1,500 → 还剩 2,500
+        let coverage = PlanCoverage::new(10_000_00, 6_000_00, 1_500_00);
+        assert_eq!(coverage.remaining(), 2_500_00);
+        assert!(coverage.covers());
+
+        // 扣掉之后不够分 → 算盖不住
+        let short = PlanCoverage::new(10_000_00, 6_000_00, 5_000_00);
+        assert_eq!(short.remaining(), -1_000_00);
+        assert_eq!(short.shortfall(), 1_000_00);
+        assert!(!short.covers());
+    }
+
+    #[test]
+    fn uncapped_spent_sums_only_expense_plans_without_limit() {
+        let rows = [
+            // 没上限的开销计划：算
+            PlanRow::new(plan("吃饭", None), 1_200_00),
+            // 有上限的开销计划：额度已经覆盖，不重复扣
+            PlanRow::new(plan("房租", Some(3_000_00)), 2_000_00),
+            // 收入计划没有「已花」这回事
+            PlanRow::new(income_plan("工资", Some(8_000_00)), 6_000_00),
+            // 没目标也没进账，本来就是 0
+            PlanRow::new(income_plan("外快", None), 300_00),
+        ];
+        assert_eq!(uncapped_spent(&rows), 1_200_00);
+        assert_eq!(uncapped_spent(&[]), 0);
+    }
+
+    #[test]
     fn coverage_without_income_does_not_divide_by_zero() {
-        let coverage = PlanCoverage::new(0, 5_000_00);
+        let coverage = PlanCoverage::new(0, 5_000_00, 0);
         assert_eq!(coverage.ratio(), 0.0);
         assert!(!coverage.covers());
     }
@@ -482,39 +550,76 @@ mod tests {
     }
 
     #[test]
-    fn expense_by_day_skips_excluded_and_other_months() {
+    fn expense_by_day_skips_plans_out_of_calendar_and_other_months() {
         let bills = vec![
             bill(1, 30_00, 1, false),
             bill(1, 20_00, 1, false),
-            bill(1, 99_00, 1, true),
+            // 计划 2 不计入日历：它名下的支出不该进日历
+            bill(2, 99_00, 2, false),
             bill(2, 10_00, 1, false),
         ];
-        let by_day = expense_by_day(month(), &bills);
+        let calendar: HashSet<BookId> = [1].into_iter().collect();
+
+        let by_day = expense_by_day(month(), &bills, &calendar);
         assert_eq!(by_day.get(&1).copied(), Some(50_00));
         assert_eq!(by_day.get(&2).copied(), Some(10_00));
 
         let other = NaiveDate::from_ymd_opt(2026, 9, 1).expect("合法月份");
-        assert!(expense_by_day(other, &bills).is_empty());
+        assert!(expense_by_day(other, &bills, &calendar).is_empty());
     }
 
     #[test]
-    fn expense_by_plan_splits_by_book_and_skips_excluded() {
+    fn expense_by_plan_counts_every_bill_of_the_plan() {
+        // 计划自己那一行始终展示名下全部支出：关掉的只是「进不进日历」
         let bills = vec![
             bill(1, 30_00, 1, false),
             bill(2, 70_00, 2, false),
-            bill(3, 99_00, 2, true),
+            bill(3, 99_00, 2, false),
         ];
         let by_plan = expense_by_plan(month(), &bills);
         assert_eq!(by_plan.get(&1).copied(), Some(30_00));
-        assert_eq!(by_plan.get(&2).copied(), Some(70_00));
+        assert_eq!(by_plan.get(&2).copied(), Some(169_00));
     }
 
     #[test]
-    fn month_income_sums_only_income_bills() {
-        let mut income = bill(5, 500_00, 1, false);
-        income.kind = BillKind::Income;
-        let bills = vec![income, bill(6, 100_00, 1, false)];
-        assert_eq!(month_income(month(), &bills), 500_00);
+    fn calendar_books_only_takes_plans_in_calendar() {
+        let rows = [
+            PlanRow::new(plan("房租", Some(2500_00)), 0),
+            PlanRow::new(plan("报销", Some(1000_00)).with_calendar(false), 0),
+            PlanRow::new(income_plan("工资", Some(8000_00)), 0),
+        ];
+        let books = calendar_books(&rows);
+        assert!(books.contains(&1), "计入日历的计划要在集合里");
+        assert_eq!(books.len(), 1, "不计入日历的计划不进集合");
+    }
+
+    #[test]
+    fn coverage_still_counts_plans_out_of_calendar() {
+        // 覆盖校验看的是「钱怎么分」，跟这笔支出进不进日历无关：
+        // 不计入日历的计划，额度也要算进开销额度，没上限的已花也要从还剩里扣。
+        let rows = [
+            PlanRow::new(plan("房租", Some(2_500_00)), 1_000_00),
+            PlanRow::new(plan("报销", Some(1_000_00)).with_calendar(false), 800_00),
+            PlanRow::new(plan("吃饭", None).with_calendar(false), 300_00),
+        ];
+        assert_eq!(total_limit(&rows), 3_500_00, "不计入日历的额度也要算");
+        assert_eq!(uncapped_spent(&rows), 300_00, "不计入日历的已花也要扣");
+        // 但日历的支出口径仍旧只认计入日历的计划
+        let calendar = calendar_books(&rows);
+        assert_eq!(calendar.len(), 1, "日历只筛出房租");
+    }
+
+    #[test]
+    fn total_income_sums_only_income_plan_targets() {
+        let rows = [
+            PlanRow::new(income_plan("工资", Some(8000_00)), 0),
+            // 没设目标的收入计划不参与：它没有承诺可对照
+            PlanRow::new(income_plan("外快", None), 0),
+            // 开销计划的额度不能算进收入
+            PlanRow::new(plan("房租", Some(2500_00)), 0),
+        ];
+        assert_eq!(total_income(&rows), 8000_00);
+        assert_eq!(total_income(&[]), 0);
     }
 
     #[test]

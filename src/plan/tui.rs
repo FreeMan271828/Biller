@@ -30,6 +30,9 @@ pub enum PlanCmd {
         /// 计划类型：income（收入，如工资）/ expense（开销，如房租）
         #[arg(long, default_value = "expense")]
         kind: String,
+        /// 这个计划不计入支出日历（报销、代付这类过手钱）
+        #[arg(long)]
+        no_calendar: bool,
     },
     /// 改某个计划的额度或类型；--limit 传 - 表示取消额度，两个都不给就没什么可改
     Set {
@@ -42,6 +45,12 @@ pub enum PlanCmd {
         /// 改成 income（收入）或 expense（开销）
         #[arg(long)]
         kind: Option<String>,
+        /// 恢复计入支出日历
+        #[arg(long, conflicts_with = "no_calendar")]
+        calendar: bool,
+        /// 改成不计入支出日历
+        #[arg(long, conflicts_with = "calendar")]
+        no_calendar: bool,
     },
     /// 删掉一个计划（名下还有账单时会被拒）
     Remove {
@@ -67,19 +76,36 @@ pub async fn run(service: &PlanService, cmd: PlanCmd) -> Result<()> {
             let coverage = service.snapshot(month, None).await?.coverage;
             print_coverage(month, &coverage);
         }
-        PlanCmd::Add { name, limit, kind } => {
+        PlanCmd::Add {
+            name,
+            limit,
+            kind,
+            no_calendar,
+        } => {
             let limit = limit_of(limit.as_deref())?;
             let plan = service.add(&name, limit, kind_of(&kind)?).await?;
+            let plan = if no_calendar {
+                service.set_in_calendar(&name, false).await?
+            } else {
+                plan
+            };
             println!(
-                "已新增{}计划「{}」 · {}",
+                "已新增{}计划「{}」 · {}{}",
                 plan.kind.label(),
                 plan.name(),
-                plan.describe_limit()
+                plan.describe_limit(),
+                calendar_suffix(&plan)
             );
         }
-        PlanCmd::Set { name, limit, kind } => {
-            if limit.is_none() && kind.is_none() {
-                bail!("至少给 --limit 或 --kind：一个都不给就没什么可改的");
+        PlanCmd::Set {
+            name,
+            limit,
+            kind,
+            calendar,
+            no_calendar,
+        } => {
+            if limit.is_none() && kind.is_none() && !calendar && !no_calendar {
+                bail!("至少给 --limit、--kind、--calendar 或 --no-calendar：一个都不给就没什么可改的");
             }
             let mut plan = service.get(&name).await?;
             if let Some(limit) = limit.as_deref() {
@@ -88,11 +114,17 @@ pub async fn run(service: &PlanService, cmd: PlanCmd) -> Result<()> {
             if let Some(kind) = kind.as_deref() {
                 plan = service.set_kind(&name, kind_of(kind)?).await?;
             }
+            if calendar || no_calendar {
+                plan = service
+                    .set_in_calendar(&name, !no_calendar)
+                    .await?;
+            }
             println!(
-                "计划「{}」已改为{}计划 · {}",
+                "计划「{}」已改为{}计划 · {}{}",
                 plan.name(),
                 plan.kind.label(),
-                plan.describe_limit()
+                plan.describe_limit(),
+                calendar_suffix(&plan)
             );
         }
         PlanCmd::Remove { name } => {
@@ -148,9 +180,10 @@ fn print_plan(rows: &[PlanRow], month: NaiveDate) {
     }
 
     // 中文占两列，必须按显示宽度对齐，不能按字符数
+    // 中文占两列，必须按显示宽度对齐；不计入日历的计划名字后面多一个「 ×」
     let name_width = rows
         .iter()
-        .map(|row| display_width(row.name()))
+        .map(|row| display_width(&plan_name_text(row)))
         .max()
         .unwrap_or(0)
         .max(8);
@@ -207,7 +240,7 @@ fn print_section(title: &str, rows: &[&PlanRow], kind: PlanKind, name_width: usi
         };
         println!(
             "  {}  {}  {}  {}",
-            pad_right(row.name(), name_width),
+            pad_right(&plan_name_text(row), name_width),
             pad_left(&limit_text, MONEY_WIDTH),
             pad_left(&money::format_amount(row.spent), MONEY_WIDTH),
             pad_left(&left_text, MONEY_WIDTH)
@@ -236,6 +269,24 @@ fn print_section(title: &str, rows: &[&PlanRow], kind: PlanKind, name_width: usi
     }
 }
 
+/// 计划名在 CLI 里的展示：不计入日历的后面带一个 ` ×`，和 TUI 的「计」列对应。
+fn plan_name_text(row: &PlanRow) -> String {
+    if row.plan.in_calendar {
+        row.name().to_string()
+    } else {
+        format!("{} ×", row.name())
+    }
+}
+
+/// 回执里补一句日历口径。
+fn calendar_suffix(plan: &crate::bill_book::model::Plan) -> &'static str {
+    if plan.in_calendar {
+        ""
+    } else {
+        " · 不计入日历"
+    }
+}
+
 fn print_rule(name_width: usize) {
     println!(
         "  {}  {}  {}  {}",
@@ -248,24 +299,31 @@ fn print_rule(name_width: usize) {
 
 fn print_coverage(month: NaiveDate, coverage: &PlanCoverage) {
     println!(
-        "{} 收入 {} · 开销额度 {}",
+        "{} 收入目标 {} · 开销额度 {}",
         time::format_month(month),
         money::format_amount(coverage.income),
         money::format_amount(coverage.allocated)
     );
 
+    if coverage.uncapped_spent > 0 {
+        println!(
+            "未设额度的开销计划本月已花 {}（已从「还剩」里扣掉）",
+            money::format_amount(coverage.uncapped_spent)
+        );
+    }
+
     if coverage.income <= 0 {
-        // 没有收入就没有分母，别拿 0.0% 糊弄人
-        println!("覆盖：· 这个月还没有收入账单，先记一笔工资再校验");
+        // 没有收入目标就没有分母，别拿 0.0% 糊弄人
+        println!("覆盖：· 收入计划还没设目标，先给收入计划填目标再校验");
     } else if coverage.covers() {
         println!(
-            "覆盖：✓ 还剩 {} 元没分配（计划占收入 {:.1}%）",
+            "覆盖：✓ 还剩 {} 元没分配（开销占收入目标 {:.1}%）",
             money::format_amount(coverage.remaining()),
             coverage.ratio() * 100.0
         );
     } else {
         println!(
-            "覆盖：✗ 分配超了收入 {} 元（计划占收入 {:.1}%）",
+            "覆盖：✗ 分配超了收入目标 {} 元（开销占收入目标 {:.1}%）",
             money::format_amount(coverage.shortfall()),
             coverage.ratio() * 100.0
         );

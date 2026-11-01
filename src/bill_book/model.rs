@@ -51,11 +51,14 @@ impl PlanKind {
     }
 }
 
-/// 计划 = 一个账本 + 可选额度 + 类型。
+/// 计划 = 一个账本 + 可选额度 + 类型 + 是否计入日历。
 ///
 /// * **收入计划**：`limit = Some(每月目标)` 时看「已入 / 差距」；不设目标就只累计入账；
 /// * **开销计划**：`limit = Some(每月上限)` 时超了要在概览和日历上提醒；
 ///   没上限就只从 0 开始累计「这个月花了多少」，不判超支。
+///
+/// `in_calendar` 在最外层：账单没有自己的「计入日历」开关，一律跟着计划走 ——
+/// 报销、代付这类计划整块关掉，计划页再也不会需要在每笔账单上点一次。
 ///
 /// 为什么是「账本 + 额度」而不是另建一张计划表：账单已经用 `book_id` 指向账本，
 /// 再建一张表就得让账单同时挂两处，账早晚对不上。
@@ -64,11 +67,25 @@ pub struct Plan {
     pub book: BillBook,
     pub limit: Option<AmountType>,
     pub kind: PlanKind,
+    /// 这个计划的支出算不算进支出日历（日额度 / 今日 / 本月已花）。
+    /// 账单一律跟计划走，没有自己的开关。
+    pub in_calendar: bool,
 }
 
 impl Plan {
     pub fn new(book: BillBook, limit: Option<AmountType>, kind: PlanKind) -> Self {
-        Self { book, limit, kind }
+        Self {
+            book,
+            limit,
+            kind,
+            in_calendar: true,
+        }
+    }
+
+    /// 指定是否计入日历；从库里读出来的计划用这个补上标志。
+    pub fn with_calendar(mut self, in_calendar: bool) -> Self {
+        self.in_calendar = in_calendar;
+        self
     }
 
     pub fn id(&self) -> BookId {
