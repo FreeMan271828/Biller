@@ -16,8 +16,8 @@ use crate::common::money;
 use crate::common::state::StateStore;
 use crate::common::types::{AmountType, BookId};
 use crate::plan::model::{
-    PlanCoverage, PlanProgress, PlanRow, calendar_books, expense_by_day, expense_by_plan,
-    income_by_plan, total_income, total_limit, uncapped_spent,
+    PlanCoverage, PlanProgress, PlanRow, calendar_books, calendar_limit, expense_by_day,
+    expense_by_plan, income_by_plan, total_income, total_limit, uncapped_spent,
 };
 
 /// 老版本把整份计划存成一行 JSON（`[{name, amount, category?}]`）；迁移完删掉。
@@ -174,13 +174,14 @@ impl PlanService {
         let bills = self.bills.list_in_month(month).await?;
 
         let rows = build_rows(plans, &bills, month);
-        let limit = total_limit(&rows);
         let income = total_income(&rows);
-        // 日历只认「计入日历」的计划名下的支出：账单跟着计划走
+        // 日历只认「计入日历」的计划：额度与支出两个口径要一致
         let calendar = calendar_books(&rows);
         let spending = expense_by_day(month, &bills, &calendar);
+        let limit = calendar_limit(&rows);
         let progress = PlanProgress::build(month, limit, today, &spending);
-        let coverage = PlanCoverage::new(income, limit, uncapped_spent(&rows));
+        // 覆盖校验看全部计划：不计入日历只是不进日历，不等于这笔钱没被分出去
+        let coverage = PlanCoverage::new(income, total_limit(&rows), uncapped_spent(&rows));
 
         Ok(PlanSnapshot {
             rows,
@@ -604,8 +605,8 @@ mod tests {
             "不计入日历的额度也要算进覆盖校验"
         );
         assert_eq!(snapshot.coverage.remaining(), 4_500_00);
-        // 本月额度同样按全部计划摊（1.7 的既有口径）
-        assert_eq!(snapshot.progress.limit, 3_500_00);
+        // 但概览的本月额度 / 日额度只摊计入日历的计划
+        assert_eq!(snapshot.progress.limit, 2_500_00, "不计入日历的额度不摊日额度");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

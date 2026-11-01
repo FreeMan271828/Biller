@@ -27,7 +27,7 @@ use crate::common::types::AmountType;
 use crate::common::{money, time};
 use crate::month::service::MonthReport;
 use crate::bill_book::model::PlanKind;
-use crate::plan::model::{DayStatus, PlanRow, total_limit};
+use crate::plan::model::{DayStatus, PlanRow, calendar_limit, total_limit};
 use crate::tui::app::{App, Form, Modal, Page, ReportTab, SettingsFocus, SettingsSection};
 
 // ---------------------------------------------------------------------------
@@ -781,7 +781,7 @@ fn render_month_bar(frame: &mut Frame, area: Rect, app: &App) {
         .unwrap_or(report.collection.total_expense);
     let limit = progress
         .map(|progress| progress.limit)
-        .unwrap_or_else(|| total_limit(&app.plans));
+        .unwrap_or_else(|| calendar_limit(&app.plans));
     let average = progress.map(|progress| progress.daily_average).unwrap_or(0);
     let days = month_shape(app.month.year(), app.month.month()).1;
 
@@ -1223,6 +1223,25 @@ fn plan_group_heights(income_rows: usize, expense_rows: usize, available: u16) -
         return (income_height, available - income_height);
     }
 
+    // 空间不够时也先保证「有行的那块至少留出 1 行数据」：
+    // 4 行只够边框 + 表头 + 提示，行会被挤没，看起来就像这块计划「没了」。
+    let income_floor: u32 = if income_rows > 0 { 5 } else { 4 };
+    let expense_floor: u32 = if expense_rows > 0 { 5 } else { 4 };
+    let floors = income_floor + expense_floor;
+
+    if u32::from(available) >= floors {
+        let extra = u32::from(available) - floors;
+        let extra_income = match (income_rows, expense_rows) {
+            (0, _) => 0,
+            (_, 0) => extra,
+            (income_rows, expense_rows) => {
+                extra * income_rows as u32 / (income_rows + expense_rows) as u32
+            }
+        };
+        let income_height = (income_floor + extra_income) as u16;
+        return (income_height, available - income_height);
+    }
+
     let share = u32::from(available) * need_income / total_need;
     let income_height = (share as u16).clamp(4, available - 4);
     (income_height, available - income_height)
@@ -1416,10 +1435,22 @@ fn render_plan_group(
 /// 开销额度盖不盖得住收入目标，看这里。收入取**所有收入计划的目标合计**，
 /// 不是本月已记账的工资：月初还没记工资时也得有数。
 fn render_plan_check(frame: &mut Frame, area: Rect, app: &App) {
-    let block = block_with_title(false, "覆盖校验");
+    let total = total_limit(&app.plans);
+    // 覆盖校验看全部计划；有「不计入日历」的额度时在标题里点明，
+    // 免得跟概览的「本月额度」（只摊计入日历的计划）对不上时看起来像 bug。
+    let calendar_total = app
+        .progress
+        .as_ref()
+        .map(|progress| progress.limit)
+        .unwrap_or(0);
+    let title = if total == calendar_total {
+        "覆盖校验".to_string()
+    } else {
+        "覆盖校验 · 全部计划".to_string()
+    };
+    let block = block_with_title(false, title);
     let inner = block.inner(area);
     let width = inner.width as usize;
-    let total = total_limit(&app.plans);
     let income = app
         .coverage
         .as_ref()
@@ -1430,7 +1461,8 @@ fn render_plan_check(frame: &mut Frame, area: Rect, app: &App) {
         stat_row(
             &[
                 (
-                    "收入目标",
+                    // 窄栏里「收入目标」四个字加金额会撑出边框，短标签优先保数字完整
+                    if width < 40 { "收入" } else { "收入目标" },
                     money::format_amount(income),
                     plain(),
                 ),
@@ -3347,6 +3379,53 @@ mod tests {
         let income_at = screen.find("收入计划").unwrap();
         let expense_at = screen.find("开销计划").unwrap();
         assert!(income_at < expense_at, "收入计划要排在开销计划前面：\n{screen}");
+    }
+
+    /// 矮终端下收入只有 1 行时，不能被挤成「只剩表头和提示」——那看起来就是收入计划没了。
+    #[test]
+    fn plan_page_keeps_income_rows_visible_when_height_is_tight() {
+        // 80x24 窄屏：14 行分给两块，收入 1 行也必须留出数据行
+        assert_eq!(plan_group_heights(1, 7, 14), (5, 9));
+
+        let mut app = sample_app();
+        app.page = Page::Plan;
+        app.plans = vec![
+            PlanRow::new(
+                Plan::new(
+                    BillBook {
+                        id: 3,
+                        name: "工资".into(),
+                    },
+                    Some(11_000_00),
+                    PlanKind::Income,
+                ),
+                0,
+            ),
+            PlanRow::new(
+                Plan::new(
+                    BillBook {
+                        id: 1,
+                        name: "房租".into(),
+                    },
+                    Some(2_500_00),
+                    PlanKind::Expense,
+                ),
+                2_500_00,
+            ),
+        ];
+        app.coverage = Some(PlanCoverage::new(11_000_00, 2_500_00, 0));
+
+        let screen = render_screen(&app, 80, 24);
+        assert!(
+            screen.contains("工资"),
+            "80x24 下收入行不能被挤没：\n{screen}"
+        );
+        assert!(screen.contains("第 1 / 1 个"), "{screen}");
+
+        // 100 宽时覆盖栏只有 ~36 列：金额不能被截成「3,380.0」
+        let screen = render_screen(&app, 100, 30);
+        assert!(screen.contains("11,000.00"), "覆盖栏金额要完整：\n{screen}");
+        assert!(screen.contains("2,500.00"), "额度也不能被截断：\n{screen}");
     }
 
     #[test]

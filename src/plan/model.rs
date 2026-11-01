@@ -59,15 +59,28 @@ impl PlanRow {
     }
 }
 
-/// 所有**开销计划**的额度合计：日历的「本月额度」与覆盖校验的「开销额度」都取这个数。
+/// 所有**开销计划**的额度合计：覆盖校验的「开销额度」取这个数（不分进不进日历）。
 ///
-/// 收入计划不参与：日历摊的是能花多少钱，把收入目标摊进日额度等于凭空多给钱。
-/// **不计入日历的计划照样参与**：不计入日历关掉的是「这笔支出算不算进日历」，
+/// 收入计划不参与：覆盖校验比的是「开销额度合计 vs 收入目标」。
+/// **不计入日历的计划照样参与**：关掉的是「这笔支出算不算进日历」，
 /// 不是「这笔钱有没有被分出去」——覆盖校验回答的是「这些额度分得完吗」，必须看全部计划。
-/// 没额度的计划不参与——它们没有额度可摊，摊进去会把日额度算虚。
+/// 日历 / 概览的「本月额度」要用另一把尺子，见 [`calendar_limit`]。
+/// 没额度的计划不参与——没有额度可摊。
 pub fn total_limit(rows: &[PlanRow]) -> AmountType {
     rows.iter()
         .filter(|row| row.plan.kind == PlanKind::Expense)
+        .filter_map(|row| row.plan.limit)
+        .filter(|limit| *limit > 0)
+        .sum()
+}
+
+/// **计入日历的**开销计划额度合计：概览「本月额度」、日额度、日历进度取这个数。
+///
+/// 不计入日历的计划不摊额度：它名下的支出本来就不进日历，额度再摊进来
+/// 等于凭空多出可用天数，日额度会被算虚。
+pub fn calendar_limit(rows: &[PlanRow]) -> AmountType {
+    rows.iter()
+        .filter(|row| row.plan.kind == PlanKind::Expense && row.plan.in_calendar)
         .filter_map(|row| row.plan.limit)
         .filter(|limit| *limit > 0)
         .sum()
@@ -602,7 +615,8 @@ mod tests {
             PlanRow::new(plan("报销", Some(1_000_00)).with_calendar(false), 800_00),
             PlanRow::new(plan("吃饭", None).with_calendar(false), 300_00),
         ];
-        assert_eq!(total_limit(&rows), 3_500_00, "不计入日历的额度也要算");
+        assert_eq!(total_limit(&rows), 3_500_00, "覆盖校验：不计入日历的额度也要算");
+        assert_eq!(calendar_limit(&rows), 2_500_00, "日历额度：只算计入日历的计划");
         assert_eq!(uncapped_spent(&rows), 300_00, "不计入日历的已花也要扣");
         // 但日历的支出口径仍旧只认计入日历的计划
         let calendar = calendar_books(&rows);
